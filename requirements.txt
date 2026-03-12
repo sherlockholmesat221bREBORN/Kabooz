@@ -2,3 +2,4 @@ pytest
 httpx
 respx
 pydantic
+mutagen
