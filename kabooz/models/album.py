@@ -1,4 +1,4 @@
-# models/album.py
+# kabooz/models/album.py
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -58,6 +58,34 @@ class TracksPage:
 
 
 @dataclass
+class Goodie:
+    """
+    A bonus file bundled with an album purchase — typically a booklet
+    PDF, but may also be a hi-res music video or other digital extra.
+
+    file_format_id is an opaque integer from the Qobuz API. The actual
+    file type is most reliably determined from the URL extension.
+    """
+    id: int
+    file_format_id: int
+    name: str
+    description: str
+    url: str
+    original_url: str
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Goodie:
+        return cls(
+            id             = data["id"],
+            file_format_id = data["file_format_id"],
+            name           = data.get("name", ""),
+            description    = data.get("description", ""),
+            url            = data.get("url", ""),
+            original_url   = data.get("original_url", ""),
+        )
+
+
+@dataclass
 class Album:
     id: str          # STRING — not int
     title: str
@@ -90,6 +118,7 @@ class Album:
     maximum_technical_specifications: Optional[str] = None
     article_ids: Optional[dict[str, Any]] = None
     articles: list[Article] = field(default_factory=list)
+    goodies: list[Goodie] = field(default_factory=list)
     purchasable: bool = False
     streamable: bool = False
     previewable: bool = False
@@ -132,6 +161,7 @@ class Album:
             maximum_technical_specifications=data.get("maximum_technical_specifications"),
             article_ids=data.get("article_ids"),
             articles=_parse_list(Article, data.get("articles")),
+            goodies=_parse_list(Goodie, data.get("goodies")),
             purchasable=data.get("purchasable", False),
             streamable=data.get("streamable", False),
             previewable=data.get("previewable", False),

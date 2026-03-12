@@ -1,36 +1,34 @@
 # kabooz/download/downloader.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+import shlex
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, IO, Optional
 
 import httpx
 
 from ..models.track import Track
-from ..models.album import Album
-from .naming import resolve_track_path
+from ..models.album import Album, Goodie
+from .naming import resolve_track_path, sanitize
 
 
-# ── Result object ──────────────────────────────────────────────────────────
+# ── Result objects ─────────────────────────────────────────────────────────
 
 @dataclass
 class DownloadResult:
     """
-    Returned by every download method. Carries enough information for
-    the caller to decide what to do next — tag the file, log it, skip
-    taggering if it was a resume, etc.
+    Returned by every track download method.
 
     Attributes:
-        path:          The absolute path where the file was written.
-        bytes_written: How many bytes were written in this session.
-                       For a resumed download this is only the new bytes,
-                       not the total file size.
-        total_bytes:   Total file size in bytes. For a fresh download this
-                       equals bytes_written. For a resume it's larger.
-        skipped:       True if the file already existed with the correct
-                       size and was not re-downloaded.
-        resumed:       True if the download was resumed from a partial file.
+        path:          Absolute path where the file was written.
+        bytes_written: Bytes written this session (partial for resumes).
+        total_bytes:   Total file size in bytes.
+        skipped:       File was already complete — not re-downloaded.
+        resumed:       Download was resumed from a partial file.
     """
     path: Path
     bytes_written: int
@@ -39,50 +37,92 @@ class DownloadResult:
     resumed: bool = False
 
 
+@dataclass
+class GoodieResult:
+    """Result of downloading a single goodie (bonus file)."""
+    path: Path
+    goodie: Goodie
+    skipped: bool = False
+    error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+@dataclass
+class AlbumDownloadResult:
+    """Aggregate result of downloading a full album."""
+    tracks:  list[DownloadResult]       = field(default_factory=list)
+    goodies: list[GoodieResult]         = field(default_factory=list)
+    failed:  list[tuple[int, str]]      = field(default_factory=list)  # (track_id, reason)
+
+    @property
+    def succeeded(self) -> int:
+        return sum(1 for r in self.tracks if not r.skipped)
+
+    @property
+    def skipped(self) -> int:
+        return sum(1 for r in self.tracks if r.skipped)
+
+
 # ── Downloader ─────────────────────────────────────────────────────────────
 
 class Downloader:
     """
-    Downloads audio files from Qobuz CDN URLs to the local filesystem.
+    Downloads audio files and goodies from Qobuz CDN URLs.
 
-    Handles three cases automatically:
-      - Fresh download: file doesn't exist yet
-      - Skip: file exists and its size matches Content-Length
-      - Resume: file exists but is smaller than Content-Length
-        (uses HTTP Range header to continue from where it left off)
+    Features
+    ────────
+    - Skip / resume logic based on Content-Length matching.
+    - Optional multithreaded album/playlist downloads via max_workers.
+    - Optional external downloader (e.g. aria2c) via a shell template.
+    - Naming template support (passed through to resolve_track_path).
+    - Goodie (bonus file) downloading into the album folder.
 
-    Progress is reported via an optional callback function with the
-    signature: (bytes_downloaded: int, total_bytes: int) -> None.
-    The callback receives cumulative bytes, not per-chunk bytes, so
-    you can wire it directly to a progress bar.
+    External downloader template
+    ────────────────────────────
+    Set external_downloader to a shell command with {url} and {output}
+    placeholders. Examples:
 
-    Usage:
-        downloader = Downloader()
+        "aria2c -x 16 -s 16 -d {dir} -o {filename} {url}"
+        "wget -O {output} {url}"
 
-        result = downloader.download_track(
-            track=track,
-            url_info=url_info,       # dict from client.get_track_url()
-            dest_dir=Path("/music"),
-            album=album,             # optional, for album folder structure
-            on_progress=lambda done, total: print(f"{done}/{total}"),
-        )
+    When set, the built-in httpx streaming is bypassed entirely for file
+    downloads. Skip/resume logic still runs via a HEAD request first.
+
+    Threading
+    ─────────
+    max_workers=1 (default) is sequential. Higher values parallelise
+    track downloads within an album or playlist. Each worker uses its
+    own httpx.Client to avoid connection sharing issues.
     """
 
     def __init__(
         self,
         http_client: Optional[httpx.Client] = None,
         chunk_size: int = 8192,
-        # Read timeout is generous by default — large FLAC files on slow
-        # mobile connections can stall between chunks for several seconds.
-        # Connect timeout stays short so bad hosts fail fast.
         read_timeout: float = 300.0,
         connect_timeout: float = 10.0,
+        max_workers: int = 1,
+        external_downloader: str = "",
+        naming_template: Optional[str] = None,
     ) -> None:
-        self._http = http_client or httpx.Client(
-            timeout=httpx.Timeout(read_timeout, connect=connect_timeout),
+        self._chunk_size         = chunk_size
+        self._read_timeout       = read_timeout
+        self._connect_timeout    = connect_timeout
+        self._max_workers        = max(1, max_workers)
+        self._external_downloader = external_downloader.strip()
+        self._naming_template    = naming_template
+        # Shared client for HEAD requests and sequential downloads.
+        # Each thread in the pool creates its own client.
+        self._http = http_client or self._make_client()
+
+    def _make_client(self) -> httpx.Client:
+        return httpx.Client(
+            timeout=httpx.Timeout(self._read_timeout, connect=self._connect_timeout),
             follow_redirects=True,
         )
-        self._chunk_size = chunk_size
 
     # ── Public interface ───────────────────────────────────────────────────
 
@@ -92,39 +132,30 @@ class Downloader:
         url_info: dict,
         dest_dir: str | Path,
         album: Optional[Album] = None,
-        filename_template: Optional[Callable[[Track], str]] = None,
         on_progress: Optional[Callable[[int, int], None]] = None,
+        playlist_name: Optional[str] = None,
+        playlist_index: Optional[int] = None,
     ) -> DownloadResult:
         """
-        Download a track to the filesystem using the naming conventions
-        defined in naming.py.
+        Download a single track.
 
         Parameters:
-            track:             The Track object (for metadata and naming).
-            url_info:          The dict returned by client.get_track_url().
-                               Must contain "url" and ideally "bit_depth",
-                               "sampling_rate", and "mime_type".
-            dest_dir:          Root directory to download into.
-            album:             If provided, the track is placed inside an
-                               album subfolder. For multi-disc albums the
-                               disc subfolder is added automatically when
-                               track.media_number > 1.
-            filename_template: Optional callable(Track) -> str to override
-                               the default filename logic.
-            on_progress:       Optional callback(bytes_done, total_bytes).
+            track:          Full Track object (not TrackSummary).
+            url_info:       Dict from client.get_track_url(). Must have "url";
+                            optionally "bit_depth", "sampling_rate", "mime_type".
+            dest_dir:       Root directory.
+            album:          Album context for folder structure and naming.
+            on_progress:    Callback(bytes_done, total_bytes).
+            playlist_name:  Passed to naming template as {playlist}.
+            playlist_index: Passed to naming template as {index}.
         """
         dest_dir = Path(dest_dir)
-        url = url_info["url"]
-
-        # Determine the file extension from the MIME type in url_info.
-        # Fall back to .flac if not present — Qobuz is almost always FLAC.
-        mime = url_info.get("mime_type", "audio/flac")
+        url      = url_info["url"]
+        mime     = url_info.get("mime_type", "audio/flac")
         extension = ".mp3" if "mpeg" in mime else ".flac"
-
-        bit_depth = url_info.get("bit_depth")
+        bit_depth     = url_info.get("bit_depth")
         sampling_rate = url_info.get("sampling_rate")
 
-        # Determine if this is a multi-disc album.
         is_multi_disc = (
             album is not None
             and album.media_count is not None
@@ -139,10 +170,138 @@ class Downloader:
             is_multi_disc=is_multi_disc,
             bit_depth=bit_depth,
             sampling_rate=sampling_rate,
-            filename_template=filename_template,
+            template=self._naming_template,
+            playlist_name=playlist_name,
+            playlist_index=playlist_index,
         )
 
+        if self._external_downloader:
+            return self._external_download(url, dest_path, on_progress)
+
         return self._download_to_path(url, dest_path, on_progress)
+
+    def download_album(
+        self,
+        tracks: list[tuple[Track, dict]],   # [(track, url_info), …]
+        dest_dir: str | Path,
+        album: Optional[Album] = None,
+        on_track_start: Optional[Callable[[Track, int, int], None]] = None,
+        on_track_done: Optional[Callable[[Track, DownloadResult], None]] = None,
+        on_track_error: Optional[Callable[[Track, Exception], None]] = None,
+        download_goodies: bool = True,
+    ) -> AlbumDownloadResult:
+        """
+        Download multiple tracks, optionally in parallel.
+
+        Callbacks receive the Track object so the caller can update a
+        progress display without inspecting the result list mid-flight.
+
+        When max_workers > 1 the callbacks may be called from worker
+        threads — make them thread-safe (e.g. use rich's thread-safe
+        Console rather than bare print).
+
+        When download_goodies is True and album has goodies, they are
+        downloaded sequentially after all tracks finish.
+        """
+        dest_dir = Path(dest_dir)
+        result   = AlbumDownloadResult()
+        total    = len(tracks)
+
+        def _do(item: tuple[Track, dict], index: int) -> DownloadResult:
+            track, url_info = item
+            if on_track_start:
+                on_track_start(track, index, total)
+            return self.download_track(
+                track=track,
+                url_info=url_info,
+                dest_dir=dest_dir,
+                album=album,
+            )
+
+        if self._max_workers == 1:
+            for i, item in enumerate(tracks, 1):
+                track, _ = item
+                try:
+                    r = _do(item, i)
+                    result.tracks.append(r)
+                    if on_track_done:
+                        on_track_done(track, r)
+                except Exception as exc:
+                    result.failed.append((track.id, str(exc)))
+                    if on_track_error:
+                        on_track_error(track, exc)
+        else:
+            futures = {}
+            with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+                for i, item in enumerate(tracks, 1):
+                    f = pool.submit(_do, item, i)
+                    futures[f] = item[0]  # track
+                for f in as_completed(futures):
+                    track = futures[f]
+                    try:
+                        r = f.result()
+                        result.tracks.append(r)
+                        if on_track_done:
+                            on_track_done(track, r)
+                    except Exception as exc:
+                        result.failed.append((track.id, str(exc)))
+                        if on_track_error:
+                            on_track_error(track, exc)
+
+        # ── Goodies ───────────────────────────────────────────────────────
+        if download_goodies and album and album.goodies:
+            # Determine the album folder from the first successfully
+            # downloaded track's path parent, falling back to dest_dir.
+            album_dir = dest_dir
+            if result.tracks:
+                # Go up from the track file to the album root.
+                # For multi-disc albums the track lives one level deeper.
+                candidate = result.tracks[0].path.parent
+                if album.media_count and album.media_count > 1:
+                    candidate = candidate.parent
+                if candidate.is_dir():
+                    album_dir = candidate
+
+            for goodie in album.goodies:
+                gr = self.download_goodie(goodie, album_dir)
+                result.goodies.append(gr)
+
+        return result
+
+    def download_goodie(
+        self,
+        goodie: Goodie,
+        dest_dir: Path,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> GoodieResult:
+        """
+        Download a single bonus file (booklet PDF, video, etc.).
+
+        The filename is derived from the goodie's URL — typically
+        something like "booklet.pdf". If that's unavailable the goodie
+        name is sanitized and used instead.
+        """
+        url = goodie.original_url or goodie.url
+        if not url:
+            return GoodieResult(
+                path=dest_dir / sanitize(goodie.name),
+                goodie=goodie,
+                error="No URL available for this goodie",
+            )
+
+        # Derive filename from the URL path, fall back to goodie.name.
+        url_filename = url.split("?")[0].rstrip("/").split("/")[-1]
+        filename = sanitize(url_filename) if url_filename else sanitize(goodie.name)
+        if not filename:
+            filename = f"goodie_{goodie.id}"
+
+        dest_path = dest_dir / filename
+
+        try:
+            result = self._download_to_path(url, dest_path, on_progress)
+            return GoodieResult(path=result.path, goodie=goodie, skipped=result.skipped)
+        except Exception as exc:
+            return GoodieResult(path=dest_path, goodie=goodie, error=str(exc))
 
     def download_to_file(
         self,
@@ -151,18 +310,12 @@ class Downloader:
         on_progress: Optional[Callable[[int, int], None]] = None,
     ) -> DownloadResult:
         """
-        Low-level download: stream a URL into any file-like object.
-        No skip/resume logic here — the caller controls the destination.
-        Useful for downloading into a BytesIO buffer or a temp file.
-
-        Parameters:
-            url:         The CDN URL to download from.
-            dest:        Any writable binary file-like object.
-            on_progress: Optional callback(bytes_done, total_bytes).
+        Low-level: stream a URL into any writable binary file-like object.
+        No skip/resume logic — the caller controls the destination.
         """
         with self._http.stream("GET", url) as response:
             response.raise_for_status()
-            total = int(response.headers.get("content-length", 0))
+            total   = int(response.headers.get("content-length", 0))
             written = 0
             for chunk in response.iter_bytes(chunk_size=self._chunk_size):
                 dest.write(chunk)
@@ -171,12 +324,20 @@ class Downloader:
                     on_progress(written, total)
 
         return DownloadResult(
-            path=Path(),   # no path in this context
+            path=Path(),
             bytes_written=written,
             total_bytes=total or written,
         )
 
     # ── Internal download logic ────────────────────────────────────────────
+
+    def _head(self, url: str) -> int:
+        """Return Content-Length from a HEAD request, or 0 on failure."""
+        try:
+            head  = self._http.head(url)
+            return int(head.headers.get("content-length", 0))
+        except Exception:
+            return 0
 
     def _download_to_path(
         self,
@@ -184,47 +345,23 @@ class Downloader:
         path: Path,
         on_progress: Optional[Callable[[int, int], None]],
     ) -> DownloadResult:
-        """
-        Stream a URL to a specific path, with skip and resume support.
-
-        Skip logic:
-            If the file exists, we first make a HEAD request to get the
-            Content-Length without downloading the body. If the existing
-            file size matches, we skip entirely.
-
-        Resume logic:
-            If the file exists but is smaller than Content-Length, we
-            send a Range request starting from the current file size.
-            The server responds with the remaining bytes (HTTP 206),
-            and we append them to the existing file.
-        """
-        # HEAD request to check what's on the server without downloading.
-        head = self._http.head(url)
-        total = int(head.headers.get("content-length", 0))
-
+        """Skip / resume / fresh download to a specific path."""
+        total         = self._head(url)
         existing_size = path.stat().st_size if path.exists() else 0
 
-        # ── Skip ──────────────────────────────────────────────────────────
+        # Skip.
         if existing_size > 0 and existing_size == total:
             if on_progress:
                 on_progress(total, total)
             return DownloadResult(
-                path=path,
-                bytes_written=0,
-                total_bytes=total,
-                skipped=True,
+                path=path, bytes_written=0, total_bytes=total, skipped=True,
             )
 
-        # ── Resume or fresh download ───────────────────────────────────────
-        resumed = existing_size > 0 and existing_size < total
-        headers = {}
-        if resumed:
-            headers["Range"] = f"bytes={existing_size}-"
-
+        # Resume or fresh.
+        resumed = existing_size > 0 and (total == 0 or existing_size < total)
+        headers = {"Range": f"bytes={existing_size}-"} if resumed else {}
         written = 0
-        # "ab" = append binary. For a fresh download the file doesn't
-        # exist yet so append is equivalent to write. For a resume it
-        # correctly continues from the end of the existing content.
+
         with open(path, "ab") as f:
             with self._http.stream("GET", url, headers=headers) as response:
                 response.raise_for_status()
@@ -239,6 +376,62 @@ class Downloader:
             bytes_written=written,
             total_bytes=total or written,
             resumed=resumed,
+        )
+
+    def _external_download(
+        self,
+        url: str,
+        path: Path,
+        on_progress: Optional[Callable[[int, int], None]],
+    ) -> DownloadResult:
+        """
+        Invoke an external downloader instead of the built-in one.
+
+        Placeholders in the template:
+            {url}      — the CDN URL
+            {output}   — full destination path (str)
+            {dir}      — parent directory of {output}
+            {filename} — basename of {output}
+        """
+        total         = self._head(url)
+        existing_size = path.stat().st_size if path.exists() else 0
+
+        if existing_size > 0 and existing_size == total:
+            if on_progress:
+                on_progress(total, total)
+            return DownloadResult(
+                path=path, bytes_written=0, total_bytes=total, skipped=True,
+            )
+
+        cmd_str = self._external_downloader.format(
+            url      = url,
+            output   = str(path),
+            dir      = str(path.parent),
+            filename = path.name,
+        )
+
+        try:
+            subprocess.run(
+                shlex.split(cmd_str),
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode(errors="replace").strip()
+            raise RuntimeError(
+                f"External downloader failed (exit {exc.returncode}): {stderr}"
+            ) from exc
+
+        written = path.stat().st_size if path.exists() else 0
+
+        if on_progress:
+            on_progress(written, written)
+
+        return DownloadResult(
+            path=path,
+            bytes_written=written,
+            total_bytes=written,
         )
 
     # ── Resource management ────────────────────────────────────────────────

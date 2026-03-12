@@ -1,7 +1,6 @@
 # kabooz/cli.py
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -28,88 +27,66 @@ except ImportError:
     sys.exit(1)
 
 from .client import QobuzClient
-from .download.downloader import Downloader
+from .config import (
+    QobuzConfig,
+    _CONFIG_PATH,
+    _SESSION_PATH,
+    load_config,
+    save_config,
+    update_config,
+)
+from .download.downloader import Downloader, DownloadResult
 from .download.lyrics import fetch_lyrics
+from .download.musicbrainz import lookup_isrc, apply_mb_tags
+from .download.naming import sanitize
 from .download.tagger import Tagger
 from .exceptions import (
     APIError,
-    AuthError,
     InvalidCredentialsError,
     NoAuthError,
     NotFoundError,
     NotStreamableError,
     TokenExpiredError,
 )
+from .models.track import Track
+from .models.album import Album
 from .quality import Quality
 from .url import parse_url
 
-# ── App and shared paths ───────────────────────────────────────────────────
+# ── App ────────────────────────────────────────────────────────────────────
 
 app = typer.Typer(
     name="qobuz",
-    help="Unofficial Qobuz CLI — download tracks, albums, and search the catalog.",
+    help="Unofficial Qobuz CLI — download tracks, albums, playlists, and more.",
     add_completion=False,
 )
 console     = Console()
 err_console = Console(stderr=True)
 
-_CONFIG_DIR   = Path.home() / ".config" / "qobuz"
-_CONFIG_PATH  = _CONFIG_DIR / "config.json"
-_SESSION_PATH = _CONFIG_DIR / "session.json"
+
+# ── Config helpers ─────────────────────────────────────────────────────────
+
+def _cfg() -> QobuzConfig:
+    return load_config()
 
 
-# ── Config file helpers ────────────────────────────────────────────────────
+def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
+    cfg = cfg or _cfg()
+    creds = cfg.credentials
 
-def _read_config() -> dict:
-    if not _CONFIG_PATH.exists():
-        return {}
-    try:
-        return json.loads(_CONFIG_PATH.read_text())
-    except Exception:
-        return {}
-
-
-def _write_config(data: dict) -> None:
-    existing = _read_config()
-    existing.update(data)
-    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    _CONFIG_PATH.write_text(json.dumps(existing, indent=2))
-
-
-# ── Credential helpers ─────────────────────────────────────────────────────
-
-def _load_app_credentials() -> tuple[str, str]:
-    cfg        = _read_config()
-    app_id     = os.environ.get("QOBUZ_APP_ID")    or cfg.get("app_id")
-    app_secret = os.environ.get("QOBUZ_APP_SECRET") or cfg.get("app_secret")
+    app_id     = creds.app_id
+    app_secret = creds.app_secret
 
     if not app_id or not app_secret:
         err_console.print(
             "[red]App credentials not found.[/red]\n"
-            "Set [bold]QOBUZ_APP_ID[/bold] and [bold]QOBUZ_APP_SECRET[/bold] "
-            "environment variables, or run [bold]qobuz login[/bold] and supply "
-            "them when prompted."
+            "Run [bold]qobuz login[/bold] to configure them."
         )
         raise typer.Exit(code=1)
 
-    return app_id, app_secret
-
-
-def _build_client() -> QobuzClient:
-    """
-    Construct an authenticated QobuzClient.
-
-    Authentication source priority:
-      1. Token pool (if `pool` key is present in config.json)
-      2. Session file (if ~/.config/qobuz/session.json exists)
-    """
-    app_id, app_secret = _load_app_credentials()
-    cfg = _read_config()
-
-    pool_source = cfg.get("pool")
-    if pool_source:
+    if creds.pool:
         try:
-            return QobuzClient.from_token_pool(pool_source)
+            return QobuzClient.from_token_pool(creds.pool)
         except Exception as exc:
             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
             raise typer.Exit(code=1)
@@ -130,6 +107,16 @@ def _build_client() -> QobuzClient:
     return client
 
 
+def _build_downloader(cfg: QobuzConfig, template: Optional[str] = None) -> Downloader:
+    return Downloader(
+        read_timeout        = cfg.download.read_timeout,
+        connect_timeout     = cfg.download.connect_timeout,
+        max_workers         = cfg.download.max_workers,
+        external_downloader = cfg.download.external_downloader,
+        naming_template     = template or None,
+    )
+
+
 def _handle_auth_error(exc: Exception) -> None:
     err_console.print(
         f"[red]Authentication error:[/red] {exc}\n"
@@ -138,52 +125,116 @@ def _handle_auth_error(exc: Exception) -> None:
     raise typer.Exit(code=1)
 
 
-# ── Metadata verification ──────────────────────────────────────────────────
+# ── Metadata helpers ───────────────────────────────────────────────────────
 
 def _needs_tagging(path: Path, check_cover: bool = True) -> bool:
-    """
-    Return True if the file at path is missing essential tags or cover art.
-
-    For FLAC: checks for TITLE and ARTIST Vorbis comments, and at least
-    one embedded picture when check_cover is True.
-
-    For MP3: checks for TIT2 (title) and TPE1 (artist) ID3 frames, and
-    at least one APIC frame when check_cover is True.
-
-    Returns True (needs tagging) on any read error so we always err on
-    the side of re-tagging rather than silently leaving a bare file.
-    """
+    """Return True if the file is missing title/artist tags or cover art."""
     try:
         suffix = path.suffix.lower()
         if suffix == ".flac":
             from mutagen.flac import FLAC
             audio = FLAC(path)
-            has_title  = bool(audio.get("title"))
-            has_artist = bool(audio.get("artist"))
-            has_cover  = len(audio.pictures) > 0
+            return (
+                not audio.get("title") or
+                not audio.get("artist") or
+                (check_cover and not audio.pictures)
+            )
         elif suffix == ".mp3":
             from mutagen.id3 import ID3, ID3NoHeaderError
             try:
                 tags = ID3(path)
             except ID3NoHeaderError:
                 return True
-            has_title  = "TIT2" in tags
-            has_artist = "TPE1" in tags
-            has_cover  = any(k.startswith("APIC") for k in tags.keys())
-        else:
-            # Unsupported format — don't attempt to re-tag.
-            return False
+            return (
+                "TIT2" not in tags or
+                "TPE1" not in tags or
+                (check_cover and not any(k.startswith("APIC") for k in tags))
+            )
     except Exception:
-        return True
-
-    if not has_title or not has_artist:
-        return True
-    if check_cover and not has_cover:
         return True
     return False
 
 
-# ── Utility helpers ────────────────────────────────────────────────────────
+def _fetch_lyrics_for(track_obj: Track, album_obj: Optional[Album] = None):
+    artist = (
+        track_obj.performer.name if track_obj.performer
+        else (album_obj.artist.name if album_obj and album_obj.artist else "")
+    )
+    return fetch_lyrics(
+        title=track_obj.title,
+        artist=artist,
+        album=album_obj.title if album_obj else None,
+        duration=track_obj.duration,
+    )
+
+
+def _post_download(
+    result: DownloadResult,
+    track_obj: Track,
+    album_obj: Optional[Album],
+    cfg: QobuzConfig,
+    embed_cover: bool,
+    fetch_lyrics_flag: bool,
+    save_cover_file: bool,
+) -> None:
+    """Tag, optionally fetch lyrics, optionally run MusicBrainz lookup."""
+    if not cfg.tagging.enabled:
+        return
+
+    lyrics_result = None
+    if fetch_lyrics_flag:
+        lyrics_result = _fetch_lyrics_for(track_obj, album_obj)
+
+    tagger = Tagger()
+    tagger.tag(
+        path=result.path,
+        track=track_obj,
+        album=album_obj,
+        lyrics=lyrics_result,
+        embed_cover=embed_cover,
+    )
+
+    if save_cover_file and album_obj and album_obj.image:
+        _save_cover_file(result.path.parent, album_obj)
+
+    if cfg.musicbrainz.enabled and track_obj.isrc:
+        mb = lookup_isrc(track_obj.isrc)
+        apply_mb_tags(result.path, mb)
+
+
+def _save_cover_file(folder: Path, album: Album) -> None:
+    """Download cover art as cover.jpg into the given folder."""
+    url = None
+    if album.image:
+        url = album.image.large or album.image.small
+    if not url:
+        return
+    cover_path = folder / "cover.jpg"
+    if cover_path.exists():
+        return
+    try:
+        import httpx as _httpx
+        with _httpx.Client(follow_redirects=True, timeout=30) as c:
+            r = c.get(url)
+            r.raise_for_status()
+            cover_path.write_bytes(r.content)
+    except Exception:
+        pass
+
+
+# ── Shared UI helpers ──────────────────────────────────────────────────────
+
+def _make_progress() -> Progress:
+    return Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+    )
+
 
 def _resolve_id(url_or_id: str, expected_type: Optional[str] = None) -> str:
     if url_or_id.startswith("http"):
@@ -201,116 +252,63 @@ def _resolve_id(url_or_id: str, expected_type: Optional[str] = None) -> str:
     return url_or_id
 
 
-def _make_progress() -> Progress:
-    return Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=True,
-    )
-
-
-def _fetch_lyrics_for(track_obj, album_obj=None):
-    artist_name = (
-        track_obj.performer.name if track_obj.performer
-        else (album_obj.artist.name if album_obj and album_obj.artist else "")
-    )
-    return fetch_lyrics(
-        title=track_obj.title,
-        artist=artist_name,
-        album=album_obj.title if album_obj else None,
-        duration=track_obj.duration,
-    )
-
-
 # ── Commands ───────────────────────────────────────────────────────────────
 
 @app.command()
 def login(
-    username: Optional[str] = typer.Option(
-        None, "--username", "-u", help="Qobuz account email"
-    ),
-    password: Optional[str] = typer.Option(
-        None, "--password", "-p", help="Qobuz account password"
-    ),
-    token: Optional[str] = typer.Option(
-        None, "--token", help="Use a pre-existing user auth token directly"
-    ),
-    user_id: Optional[str] = typer.Option(
-        None, "--user-id", help="User ID (required when using --token)"
-    ),
-    pool: Optional[str] = typer.Option(
-        None, "--pool",
-        help="Path or URL to a token pool file. Saved to config for all future commands."
-    ),
-    app_id: Optional[str] = typer.Option(
-        None, "--app-id", help="Qobuz App ID (saved to config if provided)"
-    ),
-    app_secret: Optional[str] = typer.Option(
-        None, "--app-secret", help="Qobuz App Secret (saved to config if provided)"
-    ),
+    username:   Optional[str] = typer.Option(None, "--username", "-u"),
+    password:   Optional[str] = typer.Option(None, "--password", "-p", hide_input=True),
+    token:      Optional[str] = typer.Option(None, "--token"),
+    user_id:    Optional[str] = typer.Option(None, "--user-id"),
+    pool:       Optional[str] = typer.Option(None, "--pool"),
+    app_id:     Optional[str] = typer.Option(None, "--app-id"),
+    app_secret: Optional[str] = typer.Option(None, "--app-secret", hide_input=True),
 ) -> None:
     """
     Authenticate with Qobuz. Three modes:
 
     \b
-    1. Username + password (default interactive mode):
+    1. Username + password (interactive):
          qobuz login
-         qobuz login --username me@example.com --password secret
+         qobuz login -u me@example.com -p secret
 
     \b
     2. Direct auth token:
-         qobuz login --token MY_TOKEN --user-id 12345
+         qobuz login --token TOKEN --user-id 12345
 
     \b
     3. Token pool file or URL:
          qobuz login --pool ~/.config/qobuz/pool.txt
          qobuz login --pool https://example.com/pool.txt
-
-    App credentials (app_id + app_secret) can be passed via --app-id /
-    --app-secret, set as QOBUZ_APP_ID / QOBUZ_APP_SECRET environment
-    variables, or entered interactively.
     """
-    cfg = _read_config()
+    cfg = _cfg()
 
-    resolved_app_id     = app_id     or os.environ.get("QOBUZ_APP_ID")     or cfg.get("app_id")
-    resolved_app_secret = app_secret or os.environ.get("QOBUZ_APP_SECRET")  or cfg.get("app_secret")
+    resolved_app_id     = app_id     or os.environ.get("QOBUZ_APP_ID")     or cfg.credentials.app_id
+    resolved_app_secret = app_secret or os.environ.get("QOBUZ_APP_SECRET")  or cfg.credentials.app_secret
 
     if not resolved_app_id:
         resolved_app_id = typer.prompt("App ID")
     if not resolved_app_secret:
         resolved_app_secret = typer.prompt("App Secret", hide_input=True)
 
-    config_update: dict = {
-        "app_id":     resolved_app_id,
-        "app_secret": resolved_app_secret,
-    }
+    cfg.credentials.app_id     = resolved_app_id
+    cfg.credentials.app_secret = resolved_app_secret
 
     # ── Token pool mode ────────────────────────────────────────────────────
     if pool:
-        config_update["pool"] = pool
-        _write_config(config_update)
         try:
             QobuzClient.from_token_pool(pool)
         except Exception as exc:
             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
             raise typer.Exit(code=1)
-        console.print(
-            f"[green]Token pool loaded.[/green] "
-            f"Pool path/URL saved to [bold]{_CONFIG_PATH}[/bold]."
-        )
+        cfg.credentials.pool = pool
+        save_config(cfg)
+        console.print(f"[green]Token pool saved.[/green] Config at [bold]{_CONFIG_PATH}[/bold].")
         return
 
-    # Remove any previously stored pool when switching to session auth.
-    config_update["pool"] = None
-    _write_config({**cfg, **config_update})
-
+    cfg.credentials.pool = ""
     client = QobuzClient.from_credentials(
-        app_id=resolved_app_id,
-        app_secret=resolved_app_secret,
+        app_id=resolved_app_id, app_secret=resolved_app_secret,
     )
 
     # ── Direct token mode ──────────────────────────────────────────────────
@@ -323,7 +321,7 @@ def login(
             err_console.print(f"[red]Login failed:[/red] {exc}")
             raise typer.Exit(code=1)
 
-    # ── Username + password mode ───────────────────────────────────────────
+    # ── Username + password ────────────────────────────────────────────────
     else:
         if not username:
             username = typer.prompt("Qobuz username (email)")
@@ -335,6 +333,7 @@ def login(
             err_console.print(f"[red]Login failed:[/red] {exc}")
             raise typer.Exit(code=1)
 
+    save_config(cfg)
     try:
         client.save_session(_SESSION_PATH)
     except Exception as exc:
@@ -348,29 +347,102 @@ def login(
 
 
 @app.command()
-def track(
-    url_or_id: str = typer.Argument(..., help="Track ID or Qobuz URL"),
-    output: Path = typer.Option(
-        Path("."), "--output", "-o", help="Directory to download into"
-    ),
-    quality: Quality = typer.Option(
-        Quality.HI_RES, "--quality", "-q", help="Download quality"
-    ),
-    lyrics: bool = typer.Option(
-        False, "--lyrics", help="Fetch and embed lyrics from LRCLib"
-    ),
-    cover: bool = typer.Option(
-        True, "--cover/--no-cover", help="Embed album cover art"
+def config(
+    show: bool = typer.Option(False, "--show", help="Print current config"),
+    set_: Optional[str] = typer.Option(
+        None, "--set",
+        help="Set a config value. Format: section.key=value  e.g. download.max_workers=4"
     ),
 ) -> None:
     """
-    Download a single track by ID or URL.
+    View or update the configuration file.
 
-    The track is treated as a standalone single — placed directly in the
-    output directory with no album subfolder.
+    \b
+    Examples:
+        qobuz config --show
+        qobuz config --set download.max_workers=4
+        qobuz config --set download.external_downloader="aria2c -x 16 -s 16 -d {dir} -o {filename} {url}"
+        qobuz config --set naming.album="{albumartist}/{album} [{quality}]/{track:02d}. {title}"
+        qobuz config --set tagging.save_cover_file=true
+        qobuz config --set musicbrainz.enabled=true
     """
+    if show:
+        cfg = _cfg()
+        import tomli_w, dataclasses
+        console.print_json(
+            __import__("json").dumps(dataclasses.asdict(cfg), indent=2)
+        )
+        return
+
+    if set_:
+        if "=" not in set_:
+            err_console.print("[red]Format must be section.key=value[/red]")
+            raise typer.Exit(code=1)
+        key_path, _, value = set_.partition("=")
+        parts = key_path.strip().split(".")
+        if len(parts) != 2:
+            err_console.print("[red]Key must be in section.key format[/red]")
+            raise typer.Exit(code=1)
+        section, key = parts
+
+        # Coerce common types.
+        coerced: object = value
+        if value.lower() in ("true", "yes", "1"):
+            coerced = True
+        elif value.lower() in ("false", "no", "0"):
+            coerced = False
+        else:
+            try:
+                coerced = int(value)
+            except ValueError:
+                try:
+                    coerced = float(value)
+                except ValueError:
+                    coerced = value  # keep as string
+
+        update_config({section: {key: coerced}})
+        console.print(f"[green]Set[/green] {section}.{key} = {coerced!r}")
+        return
+
+    # No flags — print help.
+    console.print("Use [bold]--show[/bold] to view config or [bold]--set section.key=value[/bold] to update it.")
+    console.print(f"Config file: [bold]{_CONFIG_PATH}[/bold]")
+
+
+@app.command()
+def track(
+    url_or_id:   str          = typer.Argument(..., help="Track ID or Qobuz URL"),
+    output:      Optional[Path] = typer.Option(None,  "-o", "--output"),
+    quality:     Optional[str]  = typer.Option(None,  "-q", "--quality"),
+    lyrics:      Optional[bool] = typer.Option(None,  "--lyrics/--no-lyrics"),
+    cover:       Optional[bool] = typer.Option(None,  "--cover/--no-cover"),
+    save_cover:  Optional[bool] = typer.Option(None,  "--save-cover/--no-save-cover"),
+    workers:     Optional[int]  = typer.Option(None,  "--workers", "-j"),
+    downloader:  Optional[str]  = typer.Option(None,  "--downloader"),
+    template:    Optional[str]  = typer.Option(None,  "--template", help="Naming template override"),
+) -> None:
+    """
+    Download a single track. Treated as a standalone single — no album
+    subfolder regardless of what album it belongs to on Qobuz.
+    """
+    cfg = _cfg()
+
+    dest_dir     = output      or Path(cfg.download.output_dir)
+    q_str        = quality     or cfg.download.quality
+    embed_cover  = cover       if cover     is not None else cfg.tagging.embed_cover
+    save_cov     = save_cover  if save_cover is not None else cfg.tagging.save_cover_file
+    do_lyrics    = lyrics      if lyrics    is not None else cfg.tagging.fetch_lyrics
+    n_workers    = workers     or cfg.download.max_workers
+    ext_dl       = downloader  or cfg.download.external_downloader
+
+    try:
+        q = Quality[q_str.upper()]
+    except KeyError:
+        err_console.print(f"[red]Unknown quality:[/red] {q_str}")
+        raise typer.Exit(code=1)
+
     track_id = _resolve_id(url_or_id, expected_type="track")
-    client   = _build_client()
+    client   = _build_client(cfg)
 
     try:
         track_obj = client.get_track(track_id)
@@ -384,7 +456,7 @@ def track(
         raise typer.Exit(code=1)
 
     try:
-        url_info = client.get_track_url(track_id, quality=quality)
+        url_info = client.get_track_url(track_id, quality=q)
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
         _handle_auth_error(exc)
     except NotStreamableError as exc:
@@ -396,66 +468,74 @@ def track(
 
     console.print(f"[cyan]Downloading[/cyan] {track_obj.title}")
 
+    # Use single template for standalone track downloads.
+    tmpl = template or cfg.naming.single
+
     with _make_progress() as progress:
         task = progress.add_task(track_obj.title, total=None)
 
         def on_progress(done: int, total: int) -> None:
             progress.update(task, completed=done, total=total or None)
 
-        with Downloader() as dl:
+        with Downloader(
+            read_timeout=cfg.download.read_timeout,
+            connect_timeout=cfg.download.connect_timeout,
+            max_workers=n_workers,
+            external_downloader=ext_dl,
+            naming_template=tmpl,
+        ) as dl:
             result = dl.download_track(
                 track=track_obj,
                 url_info=url_info,
-                dest_dir=output,
-                album=None,
+                dest_dir=dest_dir,
+                album=None,         # single — no album context
                 on_progress=on_progress,
             )
 
-    # Even if the file was skipped, verify it has tags and cover art.
-    if result.skipped and not _needs_tagging(result.path, check_cover=cover):
+    if result.skipped and not _needs_tagging(result.path, check_cover=embed_cover):
         console.print(f"[yellow]Skipped[/yellow] (complete + tagged): {result.path}")
         return
 
     if result.skipped:
-        console.print(f"    [yellow]File complete but missing tags — re-tagging.[/yellow]")
+        console.print("    [yellow]File complete but missing tags — re-tagging.[/yellow]")
 
-    lyrics_result = None
-    if lyrics:
-        lyrics_result = _fetch_lyrics_for(track_obj)
-        if lyrics_result and lyrics_result.found:
-            console.print("[green]Lyrics found[/green]")
-
-    tagger = Tagger()
-    tagger.tag(
-        path=result.path,
-        track=track_obj,
-        album=None,
-        lyrics=lyrics_result,
-        embed_cover=cover,
-    )
-
+    _post_download(result, track_obj, None, cfg, embed_cover, do_lyrics, save_cov)
     console.print(f"[green]Done:[/green] {result.path}")
 
 
 @app.command()
 def album(
-    url_or_id: str = typer.Argument(..., help="Album ID or Qobuz URL"),
-    output: Path = typer.Option(
-        Path("."), "--output", "-o", help="Directory to download into"
-    ),
-    quality: Quality = typer.Option(
-        Quality.HI_RES, "--quality", "-q", help="Download quality"
-    ),
-    lyrics: bool = typer.Option(
-        False, "--lyrics", help="Fetch and embed lyrics for each track"
-    ),
-    cover: bool = typer.Option(
-        True, "--cover/--no-cover", help="Embed album cover art"
-    ),
+    url_or_id:   str           = typer.Argument(..., help="Album ID or Qobuz URL"),
+    output:      Optional[Path] = typer.Option(None,  "-o", "--output"),
+    quality:     Optional[str]  = typer.Option(None,  "-q", "--quality"),
+    lyrics:      Optional[bool] = typer.Option(None,  "--lyrics/--no-lyrics"),
+    cover:       Optional[bool] = typer.Option(None,  "--cover/--no-cover"),
+    save_cover:  Optional[bool] = typer.Option(None,  "--save-cover/--no-save-cover"),
+    goodies:     Optional[bool] = typer.Option(None,  "--goodies/--no-goodies", help="Download bonus files"),
+    workers:     Optional[int]  = typer.Option(None,  "--workers", "-j"),
+    downloader:  Optional[str]  = typer.Option(None,  "--downloader"),
+    template:    Optional[str]  = typer.Option(None,  "--template"),
 ) -> None:
     """Download a full album by ID or URL."""
+    cfg = _cfg()
+
+    dest_dir    = output      or Path(cfg.download.output_dir)
+    q_str       = quality     or cfg.download.quality
+    embed_cover = cover       if cover      is not None else cfg.tagging.embed_cover
+    save_cov    = save_cover  if save_cover is not None else cfg.tagging.save_cover_file
+    do_lyrics   = lyrics      if lyrics     is not None else cfg.tagging.fetch_lyrics
+    do_goodies  = goodies     if goodies    is not None else True
+    n_workers   = workers     or cfg.download.max_workers
+    ext_dl      = downloader  or cfg.download.external_downloader
+
+    try:
+        q = Quality[q_str.upper()]
+    except KeyError:
+        err_console.print(f"[red]Unknown quality:[/red] {q_str}")
+        raise typer.Exit(code=1)
+
     album_id = _resolve_id(url_or_id, expected_type="album")
-    client   = _build_client()
+    client   = _build_client(cfg)
 
     try:
         album_obj = client.get_album(album_id)
@@ -472,11 +552,23 @@ def album(
         err_console.print("[red]Album has no tracks.[/red]")
         raise typer.Exit(code=1)
 
+    release_type = (album_obj.release_type or "album").lower()
+    if release_type in ("single",):
+        tmpl = template or cfg.naming.single
+    elif release_type == "ep":
+        tmpl = template or cfg.naming.ep
+    elif release_type == "compilation":
+        tmpl = template or cfg.naming.compilation
+    else:
+        tmpl = template or cfg.naming.album
+
     artist_name = album_obj.artist.name if album_obj.artist else "Unknown Artist"
     console.print(
         f"[cyan]Downloading album:[/cyan] {album_obj.title} "
         f"by {artist_name} ({album_obj.tracks.total} tracks)"
     )
+    if album_obj.goodies and do_goodies:
+        console.print(f"  [dim]+{len(album_obj.goodies)} goodie(s)[/dim]")
 
     tagger    = Tagger()
     total     = album_obj.tracks.total
@@ -484,48 +576,52 @@ def album(
     skipped   = 0
     failed    = 0
 
-    for i, track_summary in enumerate(album_obj.tracks.items, 1):
-        console.print(f"  [{i}/{total}] {track_summary.title}")
+    with Downloader(
+        read_timeout=cfg.download.read_timeout,
+        connect_timeout=cfg.download.connect_timeout,
+        max_workers=n_workers,
+        external_downloader=ext_dl,
+        naming_template=tmpl,
+    ) as dl:
+        for i, track_summary in enumerate(album_obj.tracks.items, 1):
+            console.print(f"  [{i}/{total}] {track_summary.title}")
 
-        # Fetch the full Track object — TrackSummary is too lightweight for
-        # tagging (missing copyright, performers, composer, etc.).
-        try:
-            track_obj = client.get_track(str(track_summary.id))
-        except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
-            _handle_auth_error(exc)
-        except Exception as exc:
-            err_console.print(f"    [red]Could not fetch track metadata: {exc}[/red]")
-            failed += 1
-            continue
+            try:
+                track_obj = client.get_track(str(track_summary.id))
+            except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+                _handle_auth_error(exc)
+            except Exception as exc:
+                err_console.print(f"    [red]Could not fetch track metadata: {exc}[/red]")
+                failed += 1
+                continue
 
-        try:
-            url_info = client.get_track_url(str(track_obj.id), quality=quality)
-        except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
-            _handle_auth_error(exc)
-        except NotStreamableError:
-            err_console.print("    [yellow]Not streamable, skipping.[/yellow]")
-            failed += 1
-            continue
-        except APIError as exc:
-            err_console.print(f"    [red]API error: {exc}[/red]")
-            failed += 1
-            continue
+            try:
+                url_info = client.get_track_url(str(track_obj.id), quality=q)
+            except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+                _handle_auth_error(exc)
+            except NotStreamableError:
+                err_console.print("    [yellow]Not streamable, skipping.[/yellow]")
+                failed += 1
+                continue
+            except APIError as exc:
+                err_console.print(f"    [red]API error: {exc}[/red]")
+                failed += 1
+                continue
 
-        with _make_progress() as progress:
-            task = progress.add_task(track_obj.title, total=None)
+            with _make_progress() as progress:
+                task = progress.add_task(track_obj.title, total=None)
 
-            def on_progress(
-                done: int, total_bytes: int,
-                _task=task, _progress=progress,
-            ) -> None:
-                _progress.update(_task, completed=done, total=total_bytes or None)
+                def on_progress(
+                    done: int, total_bytes: int,
+                    _task=task, _progress=progress,
+                ) -> None:
+                    _progress.update(_task, completed=done, total=total_bytes or None)
 
-            with Downloader() as dl:
                 try:
                     result = dl.download_track(
                         track=track_obj,
                         url_info=url_info,
-                        dest_dir=output,
+                        dest_dir=dest_dir,
                         album=album_obj,
                         on_progress=on_progress,
                     )
@@ -534,30 +630,186 @@ def album(
                     failed += 1
                     continue
 
-        # File size matched — but verify tags and cover before skipping.
-        if result.skipped:
-            if not _needs_tagging(result.path, check_cover=cover):
-                console.print("    [yellow]Already complete, skipped.[/yellow]")
-                skipped += 1
+            if result.skipped:
+                if not _needs_tagging(result.path, check_cover=embed_cover):
+                    console.print("    [yellow]Already complete, skipped.[/yellow]")
+                    skipped += 1
+                    continue
+                console.print("    [yellow]File complete but missing tags — re-tagging.[/yellow]")
+
+            _post_download(result, track_obj, album_obj, cfg, embed_cover, do_lyrics, save_cov)
+            succeeded += 1
+
+        # ── Goodies ───────────────────────────────────────────────────────
+        if do_goodies and album_obj.goodies:
+            # Resolve album dir from first downloaded/skipped track.
+            album_dir = dest_dir
+            all_results = [r for r in (locals().get("result"),) if r is not None]
+            # Walk to find actual album folder.
+            for r in all_results:
+                candidate = r.path.parent
+                if album_obj.media_count and album_obj.media_count > 1:
+                    candidate = candidate.parent
+                if candidate.is_dir():
+                    album_dir = candidate
+                    break
+
+            console.print(f"  [dim]Downloading {len(album_obj.goodies)} goodie(s)…[/dim]")
+            for goodie in album_obj.goodies:
+                gr = dl.download_goodie(goodie, album_dir)
+                if gr.ok:
+                    status = "[yellow]skipped[/yellow]" if gr.skipped else "[green]ok[/green]"
+                    console.print(f"    {goodie.name}: {status} → {gr.path.name}")
+                else:
+                    err_console.print(f"    {goodie.name}: [red]{gr.error}[/red]")
+
+    console.print(
+        f"\n[green]Done.[/green] "
+        f"{succeeded} downloaded, {skipped} skipped, {failed} failed."
+    )
+
+
+@app.command()
+def playlist(
+    url_or_id:  str            = typer.Argument(..., help="Playlist ID or Qobuz URL"),
+    output:     Optional[Path] = typer.Option(None, "-o", "--output"),
+    quality:    Optional[str]  = typer.Option(None, "-q", "--quality"),
+    lyrics:     Optional[bool] = typer.Option(None, "--lyrics/--no-lyrics"),
+    cover:      Optional[bool] = typer.Option(None, "--cover/--no-cover"),
+    save_cover: Optional[bool] = typer.Option(None, "--save-cover/--no-save-cover"),
+    workers:    Optional[int]  = typer.Option(None, "--workers", "-j"),
+    downloader: Optional[str]  = typer.Option(None, "--downloader"),
+    template:   Optional[str]  = typer.Option(None, "--template"),
+    m3u:        bool           = typer.Option(False, "--m3u", help="Write an .m3u8 playlist file"),
+) -> None:
+    """Download a full playlist by ID or URL."""
+    cfg = _cfg()
+
+    dest_dir    = output     or Path(cfg.download.output_dir)
+    q_str       = quality    or cfg.download.quality
+    embed_cover = cover      if cover      is not None else cfg.tagging.embed_cover
+    save_cov    = save_cover if save_cover is not None else cfg.tagging.save_cover_file
+    do_lyrics   = lyrics     if lyrics     is not None else cfg.tagging.fetch_lyrics
+    n_workers   = workers    or cfg.download.max_workers
+    ext_dl      = downloader or cfg.download.external_downloader
+    tmpl        = template   or cfg.naming.playlist
+
+    try:
+        q = Quality[q_str.upper()]
+    except KeyError:
+        err_console.print(f"[red]Unknown quality:[/red] {q_str}")
+        raise typer.Exit(code=1)
+
+    playlist_id = _resolve_id(url_or_id, expected_type="playlist")
+    client      = _build_client(cfg)
+
+    try:
+        pl = client.get_playlist(playlist_id)
+    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+        _handle_auth_error(exc)
+    except NotFoundError:
+        err_console.print(f"[red]Playlist not found:[/red] {playlist_id}")
+        raise typer.Exit(code=1)
+    except APIError as exc:
+        err_console.print(f"[red]API error:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if not pl.tracks or not pl.tracks.items:
+        err_console.print("[red]Playlist is empty.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[cyan]Downloading playlist:[/cyan] {pl.name} ({pl.tracks_count} tracks)"
+    )
+
+    succeeded  = 0
+    skipped    = 0
+    failed     = 0
+    m3u_lines: list[str] = ["#EXTM3U"]
+
+    with Downloader(
+        read_timeout=cfg.download.read_timeout,
+        connect_timeout=cfg.download.connect_timeout,
+        max_workers=n_workers,
+        external_downloader=ext_dl,
+        naming_template=tmpl,
+    ) as dl:
+        for i, pl_track in enumerate(pl.tracks.items, 1):
+            console.print(f"  [{i}/{pl.tracks_count}] {pl_track.title}")
+
+            try:
+                track_obj = client.get_track(str(pl_track.id))
+            except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+                _handle_auth_error(exc)
+            except Exception as exc:
+                err_console.print(f"    [red]Could not fetch track metadata: {exc}[/red]")
+                failed += 1
                 continue
-            console.print("    [yellow]File complete but missing tags — re-tagging.[/yellow]")
 
-        lyrics_result = None
-        if lyrics:
-            lyrics_result = _fetch_lyrics_for(track_obj, album_obj)
+            # Fetch album for cover and full metadata.
+            album_obj = None
+            if track_obj.album:
+                try:
+                    album_obj = client.get_album(track_obj.album.id)
+                except Exception:
+                    pass
 
-        try:
-            tagger.tag(
-                path=result.path,
-                track=track_obj,
-                album=album_obj,
-                lyrics=lyrics_result,
-                embed_cover=cover,
-            )
-        except Exception as exc:
-            err_console.print(f"    [red]Tagging failed: {exc}[/red]")
+            try:
+                url_info = client.get_track_url(str(track_obj.id), quality=q)
+            except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+                _handle_auth_error(exc)
+            except NotStreamableError:
+                err_console.print("    [yellow]Not streamable, skipping.[/yellow]")
+                failed += 1
+                continue
+            except APIError as exc:
+                err_console.print(f"    [red]API error: {exc}[/red]")
+                failed += 1
+                continue
 
-        succeeded += 1
+            with _make_progress() as progress:
+                task = progress.add_task(track_obj.title, total=None)
+
+                def on_progress(
+                    done: int, total_bytes: int,
+                    _task=task, _progress=progress,
+                ) -> None:
+                    _progress.update(_task, completed=done, total=total_bytes or None)
+
+                try:
+                    result = dl.download_track(
+                        track=track_obj,
+                        url_info=url_info,
+                        dest_dir=dest_dir,
+                        album=None,         # playlist uses flat structure via template
+                        on_progress=on_progress,
+                        playlist_name=pl.name,
+                        playlist_index=i,
+                    )
+                except Exception as exc:
+                    err_console.print(f"    [red]Download failed: {exc}[/red]")
+                    failed += 1
+                    continue
+
+            if result.skipped:
+                if not _needs_tagging(result.path, check_cover=embed_cover):
+                    console.print("    [yellow]Already complete, skipped.[/yellow]")
+                    skipped += 1
+                    m3u_lines.append(str(result.path))
+                    continue
+                console.print("    [yellow]File complete but missing tags — re-tagging.[/yellow]")
+
+            _post_download(result, track_obj, album_obj, cfg, embed_cover, do_lyrics, save_cov)
+            m3u_lines.append(str(result.path))
+            succeeded += 1
+
+    # ── Write .m3u8 ───────────────────────────────────────────────────────
+    if m3u and len(m3u_lines) > 1:
+        pl_dir  = dest_dir / sanitize(pl.name)
+        pl_dir.mkdir(parents=True, exist_ok=True)
+        m3u_path = pl_dir / f"{sanitize(pl.name)}.m3u8"
+        m3u_path.write_text("\n".join(m3u_lines), encoding="utf-8")
+        console.print(f"  [dim]M3U8 written: {m3u_path}[/dim]")
 
     console.print(
         f"\n[green]Done.[/green] "
@@ -567,20 +819,16 @@ def album(
 
 @app.command()
 def search(
-    query: str = typer.Argument(..., help="Search query"),
-    type: str = typer.Option(
-        "tracks", "--type", "-t",
-        help="Entity type: tracks, albums, artists, playlists"
-    ),
-    limit: int = typer.Option(10, "--limit", "-n", help="Maximum results to show"),
+    query: str  = typer.Argument(..., help="Search query"),
+    type:  str  = typer.Option("tracks", "--type", "-t",
+                               help="tracks, albums, artists, playlists"),
+    limit: int  = typer.Option(10, "--limit", "-n"),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON"),
 ) -> None:
-    """Search the Qobuz catalog and print results as a table."""
+    """Search the Qobuz catalog."""
     valid_types = {"tracks", "albums", "artists", "playlists"}
     if type not in valid_types:
-        err_console.print(
-            f"[red]Invalid type:[/red] {type!r}. "
-            f"Choose from: {', '.join(sorted(valid_types))}"
-        )
+        err_console.print(f"[red]Invalid type:[/red] {type!r}. Choose from: {', '.join(sorted(valid_types))}")
         raise typer.Exit(code=1)
 
     client = _build_client()
@@ -593,6 +841,11 @@ def search(
         err_console.print(f"[red]Search failed:[/red] {exc}")
         raise typer.Exit(code=1)
 
+    if json_output:
+        import json
+        console.print(json.dumps(results, indent=2, ensure_ascii=False))
+        return
+
     items = results.get(type, {}).get("items", [])
     if not items:
         console.print(f"No results for [bold]{query!r}[/bold].")
@@ -601,17 +854,17 @@ def search(
     table = Table(title=f'Search: "{query}" ({type})', show_lines=False)
 
     if type == "tracks":
-        table.add_column("ID",     style="dim",  no_wrap=True)
-        table.add_column("Title",  style="bold")
+        table.add_column("ID",    style="dim", no_wrap=True)
+        table.add_column("Title", style="bold")
         table.add_column("Artist")
-        table.add_column("Album",  style="dim")
+        table.add_column("Album", style="dim")
         for item in items:
             artist = (item.get("performer") or {}).get("name", "")
             alb    = (item.get("album") or {}).get("title", "")
             table.add_row(str(item.get("id", "")), item.get("title", ""), artist, alb)
 
     elif type == "albums":
-        table.add_column("ID",     style="dim",  no_wrap=True)
+        table.add_column("ID",     style="dim", no_wrap=True)
         table.add_column("Title",  style="bold")
         table.add_column("Artist")
         table.add_column("Year",   style="dim")
@@ -621,29 +874,20 @@ def search(
             table.add_row(str(item.get("id", "")), item.get("title", ""), artist, year)
 
     elif type == "artists":
-        table.add_column("ID",           style="dim",  no_wrap=True)
-        table.add_column("Name",         style="bold")
-        table.add_column("Albums count", style="dim")
+        table.add_column("ID",     style="dim", no_wrap=True)
+        table.add_column("Name",   style="bold")
+        table.add_column("Albums", style="dim")
         for item in items:
-            table.add_row(
-                str(item.get("id", "")),
-                item.get("name", ""),
-                str(item.get("albums_count", "")),
-            )
+            table.add_row(str(item.get("id", "")), item.get("name", ""), str(item.get("albums_count", "")))
 
     elif type == "playlists":
-        table.add_column("ID",     style="dim",  no_wrap=True)
+        table.add_column("ID",     style="dim", no_wrap=True)
         table.add_column("Name",   style="bold")
         table.add_column("Tracks", style="dim")
         table.add_column("Owner")
         for item in items:
             owner = (item.get("owner") or {}).get("name", "")
-            table.add_row(
-                str(item.get("id", "")),
-                item.get("name", ""),
-                str(item.get("tracks_count", "")),
-                owner,
-            )
+            table.add_row(str(item.get("id", "")), item.get("name", ""), str(item.get("tracks_count", "")), owner)
 
     console.print(table)
 

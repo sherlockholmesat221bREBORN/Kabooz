@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "mutagen>=1.47",
+    "tomli-w>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -32,4 +33,3 @@ packages = ["kabooz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
