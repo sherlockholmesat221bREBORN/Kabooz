@@ -87,8 +87,8 @@ def _load_app_credentials() -> tuple[str, str]:
     Exits with a clear message if neither source provides both values.
     """
     cfg        = _read_config()
-    app_id     = os.environ.get("QOBUZ_APP_ID")     or cfg.get("app_id")
-    app_secret = os.environ.get("QOBUZ_APP_SECRET")  or cfg.get("app_secret")
+    app_id     = os.environ.get("QOBUZ_APP_ID")    or cfg.get("app_id")
+    app_secret = os.environ.get("QOBUZ_APP_SECRET") or cfg.get("app_secret")
 
     if not app_id or not app_secret:
         err_console.print(
@@ -121,13 +121,11 @@ def _build_client() -> QobuzClient:
 
     if pool_source:
         try:
-            client = QobuzClient.from_token_pool(pool_source)
+            return QobuzClient.from_token_pool(pool_source)
         except Exception as exc:
             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
             raise typer.Exit(code=1)
-        return client
 
-    # Fall back to saved session.
     if not _SESSION_PATH.exists():
         err_console.print(
             "[red]Not logged in.[/red] Run [bold]qobuz login[/bold] first."
@@ -184,6 +182,20 @@ def _make_progress() -> Progress:
     )
 
 
+def _fetch_lyrics_for(track_obj, album_obj=None):
+    """Fetch lyrics for a track, returning a LyricsResult or None."""
+    artist_name = (
+        track_obj.performer.name if track_obj.performer
+        else (album_obj.artist.name if album_obj and album_obj.artist else "")
+    )
+    return fetch_lyrics(
+        title=track_obj.title,
+        artist=artist_name,
+        album=album_obj.title if album_obj else None,
+        duration=track_obj.duration,
+    )
+
+
 # ── Commands ───────────────────────────────────────────────────────────────
 
 @app.command()
@@ -232,7 +244,6 @@ def login(
     --app-secret, set as QOBUZ_APP_ID / QOBUZ_APP_SECRET environment
     variables, or entered interactively.
     """
-    # ── Collect and save app credentials ──────────────────────────────────
     cfg = _read_config()
 
     resolved_app_id     = app_id     or os.environ.get("QOBUZ_APP_ID")     or cfg.get("app_id")
@@ -243,7 +254,6 @@ def login(
     if not resolved_app_secret:
         resolved_app_secret = typer.prompt("App Secret", hide_input=True)
 
-    # Persist app credentials and optional pool path to config.
     config_update: dict = {
         "app_id":     resolved_app_id,
         "app_secret": resolved_app_secret,
@@ -254,7 +264,7 @@ def login(
         config_update["pool"] = pool
         _write_config(config_update)
         try:
-            client = QobuzClient.from_token_pool(pool)
+            QobuzClient.from_token_pool(pool)
         except Exception as exc:
             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
             raise typer.Exit(code=1)
@@ -265,9 +275,8 @@ def login(
         return
 
     # Remove any previously stored pool when switching to session auth.
-    config_update.pop("pool", None)
-    cfg.pop("pool", None)
-    _write_config({**cfg, **config_update, "pool": None})
+    config_update["pool"] = None
+    _write_config({**cfg, **config_update})
 
     client = QobuzClient.from_credentials(
         app_id=resolved_app_id,
@@ -292,9 +301,6 @@ def login(
             password = typer.prompt("Password", hide_input=True)
         try:
             session = client.login(username=username, password=password)
-        except (InvalidCredentialsError, AuthError) as exc:
-            err_console.print(f"[red]Login failed:[/red] {exc}")
-            raise typer.Exit(code=1)
         except Exception as exc:
             err_console.print(f"[red]Login failed:[/red] {exc}")
             raise typer.Exit(code=1)
@@ -327,7 +333,13 @@ def track(
         True, "--cover/--no-cover", help="Embed album cover art"
     ),
 ) -> None:
-    """Download a single track by ID or URL."""
+    """
+    Download a single track by ID or URL.
+
+    The track is treated as a standalone single — it is placed directly
+    in the output directory with no album subfolder, regardless of what
+    album it belongs to on Qobuz.
+    """
     track_id = _resolve_id(url_or_id, expected_type="track")
     client   = _build_client()
 
@@ -341,13 +353,6 @@ def track(
     except APIError as exc:
         err_console.print(f"[red]API error:[/red] {exc}")
         raise typer.Exit(code=1)
-
-    album_obj = None
-    if track_obj.album:
-        try:
-            album_obj = client.get_album(track_obj.album.id)
-        except Exception:
-            pass  # Non-fatal — tag with whatever we have.
 
     try:
         url_info = client.get_track_url(track_id, quality=quality)
@@ -369,11 +374,12 @@ def track(
             progress.update(task, completed=done, total=total or None)
 
         with Downloader() as dl:
+            # album=None intentionally — single track goes flat into output dir.
             result = dl.download_track(
                 track=track_obj,
                 url_info=url_info,
                 dest_dir=output,
-                album=album_obj,
+                album=None,
                 on_progress=on_progress,
             )
 
@@ -383,16 +389,7 @@ def track(
 
     lyrics_result = None
     if lyrics:
-        artist_name = (
-            track_obj.performer.name if track_obj.performer
-            else (album_obj.artist.name if album_obj and album_obj.artist else "")
-        )
-        lyrics_result = fetch_lyrics(
-            title=track_obj.title,
-            artist=artist_name,
-            album=album_obj.title if album_obj else None,
-            duration=track_obj.duration,
-        )
+        lyrics_result = _fetch_lyrics_for(track_obj)
         if lyrics_result.found:
             console.print("[green]Lyrics found[/green]")
 
@@ -400,7 +397,7 @@ def track(
     tagger.tag(
         path=result.path,
         track=track_obj,
-        album=album_obj,
+        album=None,
         lyrics=lyrics_result,
         embed_cover=cover,
     )
@@ -455,8 +452,19 @@ def album(
     skipped   = 0
     failed    = 0
 
-    for i, track_obj in enumerate(album_obj.tracks.items, 1):
-        console.print(f"  [{i}/{total}] {track_obj.title}")
+    for i, track_summary in enumerate(album_obj.tracks.items, 1):
+        console.print(f"  [{i}/{total}] {track_summary.title}")
+
+        # Fetch the full Track object — TrackSummary is too lightweight for
+        # tagging (missing copyright, performers, composer, etc.).
+        try:
+            track_obj = client.get_track(str(track_summary.id))
+        except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+            _handle_auth_error(exc)
+        except Exception as exc:
+            err_console.print(f"    [red]Could not fetch track metadata: {exc}[/red]")
+            failed += 1
+            continue
 
         try:
             url_info = client.get_track_url(str(track_obj.id), quality=quality)
@@ -501,12 +509,7 @@ def album(
 
         lyrics_result = None
         if lyrics:
-            lyrics_result = fetch_lyrics(
-                title=track_obj.title,
-                artist=artist_name,
-                album=album_obj.title,
-                duration=track_obj.duration,
-            )
+            lyrics_result = _fetch_lyrics_for(track_obj, album_obj)
 
         try:
             tagger.tag(
@@ -614,4 +617,3 @@ def search(
 
 if __name__ == "__main__":
     app()
-

@@ -72,10 +72,14 @@ class Downloader:
         self,
         http_client: Optional[httpx.Client] = None,
         chunk_size: int = 8192,
+        # Read timeout is generous by default — large FLAC files on slow
+        # mobile connections can stall between chunks for several seconds.
+        # Connect timeout stays short so bad hosts fail fast.
+        read_timeout: float = 300.0,
+        connect_timeout: float = 10.0,
     ) -> None:
-        # Accept an injected client for testability, same pattern as QobuzClient.
         self._http = http_client or httpx.Client(
-            timeout=httpx.Timeout(60.0, connect=10.0),
+            timeout=httpx.Timeout(read_timeout, connect=connect_timeout),
             follow_redirects=True,
         )
         self._chunk_size = chunk_size
@@ -247,4 +251,3 @@ class Downloader:
 
     def __exit__(self, *args: object) -> None:
         self.close()
-
