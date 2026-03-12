@@ -247,4 +247,197 @@ class QobuzClient:
                 body.get("message", f"API error: HTTP {status}"),
                 status_code=status,
             )
-        return body    
+        return body   
+        
+    # ── Request signing ────────────────────────────────────────────────────────
+
+    def _sign_track_url_request(
+        self,
+        track_id: str,
+        format_id: int,
+    ) -> tuple[str, str]:
+        """
+        Compute the timestamp + MD5 signature required by getFileUrl.
+    
+        Qobuz assembles a canonical string from the request parameters
+        and the App Secret, then MD5-hashes it. The timestamp is included
+        to prevent replay attacks — the same request sent 10 minutes later
+        will have a different signature and be rejected.
+
+        The exact field order and concatenation was determined by
+        reverse-engineering the Qobuz web player JavaScript.
+        """
+        ts = str(int(time.time()))
+        canonical = (
+            f"trackgetFileUrl"
+            f"format_id{format_id}"
+            f"intentstream"
+            f"track_id{track_id}"
+            f"{ts}"
+            f"{self._credentials.app_secret}"
+        )
+        sig = hashlib.md5(canonical.encode("utf-8")).hexdigest()
+        return ts, sig
+        
+        
+    # ── Catalog endpoints ──────────────────────────────────────────────────────
+
+    def get_track(self, track_id: str | int) -> dict:
+        """Fetch full metadata for a single track."""
+        return self._request(
+            "GET", "/track/get",
+            params={"track_id": str(track_id)},
+        )
+    
+    def get_album(self, album_id: str) -> dict:
+        """Fetch full metadata for an album including its track listing."""
+        return self._request(
+            "GET", "/album/get",
+            params={"album_id": album_id},
+        )
+
+    def get_artist(
+        self,
+        artist_id: str | int,
+        extras: str = "albums",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Fetch artist info and optionally their discography.
+        extras controls what extra data is included — common values are
+        "albums", "tracks", "playlists", "focusAll".
+        """
+        return self._request(
+                "GET", "/artist/get",
+            params={
+                "artist_id": str(artist_id),
+                "extra":     extras,
+                "limit":     limit,
+                "offset":    offset,
+            },
+        )
+
+    def search(
+        self,
+        query: str,
+        type: str = "tracks",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Search the Qobuz catalog.
+        type is one of: "tracks", "albums", "artists", "playlists".
+        """
+        return self._request(
+            "GET", "/catalog/search",
+            params={
+                "query":  query,
+                "type":   type,
+                "limit":  limit,
+                "offset": offset,
+            },
+        )
+    
+
+    # ── User library endpoints ─────────────────────────────────────────────────
+
+    def get_user_favorites(
+        self,
+        type: str = "tracks",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Fetch the authenticated user's favorites.
+        type is one of: "tracks", "albums", "artists"."""
+        return self._request(
+            "GET", "/favorite/getUserFavorites",
+            params={"type": type, "limit": limit, "offset": offset},
+        )
+
+    def get_user_playlists(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Fetch playlists owned by the authenticated user."""
+        return self._request(
+            "GET", "/playlist/getUserPlaylists",
+            params={"limit": limit, "offset": offset},
+        )
+    
+    def get_playlist(
+        self,
+        playlist_id: str | int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Fetch a single playlist and its tracks."""
+        return self._request(
+            "GET", "/playlist/get",
+            params={
+                "playlist_id": str(playlist_id),
+                "extra":       "tracks",
+                "limit":       limit,
+                "offset":      offset,
+            },
+        )
+
+    def get_user_purchases(
+        self,
+        type: str = "albums",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict:
+        """Fetch albums or tracks the user has purchased outright."""
+        return self._request(
+            "GET", "/purchase/getUserPurchases",
+            params={"type": type, "limit": limit, "offset": offset},
+        )
+
+
+    # ── Stream endpoint ────────────────────────────────────────────────────────
+
+    def get_track_url(
+        self,
+        track_id: str | int,
+        quality: Quality = Quality.HI_RES,
+    ) -> dict:
+        """
+        Resolve a track to a signed CDN download URL.
+    
+        The returned dict contains "url" — a time-limited signed URL
+        pointing directly to the audio file — plus format metadata like
+        "bit_depth", "sampling_rate", and "mime_type".
+
+        The URL expires in roughly 30 minutes. Don't cache it — call
+        this method fresh each time you want to download a file.
+
+        Raises NotStreamableError if the track isn't available at the
+        requested quality or the user's subscription doesn't cover it.
+        """
+        if not self.session:
+            raise NoAuthError("get_track_url() requires authentication.")
+
+        ts, sig = self._sign_track_url_request(str(track_id), int(quality))
+
+        result = self._request(
+            "GET", "/track/getFileUrl",
+            params={
+                "track_id":    str(track_id),
+                "format_id":   int(quality),
+                "intent":      "stream",
+                "request_ts":  ts,
+                "request_sig": sig,
+            },
+        )
+
+        # Qobuz sometimes returns HTTP 200 with an error body instead of a
+        # proper 4xx. This is the one case where we have to inspect the body
+        # rather than trusting the status code alone.
+        if "url" not in result:
+            raise NotStreamableError(
+                result.get("message", "Track URL not available.")
+            )
+
+        return result    
