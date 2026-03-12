@@ -308,7 +308,12 @@ def login(
 
     cfg.credentials.app_id     = resolved_app_id
     cfg.credentials.app_secret = resolved_app_secret
-    cfg.credentials.pool       = ""
+    cfg.credentials.pool = ""
+
+    client = QobuzClient.from_credentials(          # ← add this
+        app_id=resolved_app_id,
+        app_secret=resolved_app_secret,
+    )
 
     # ── Direct token mode ──────────────────────────────────────────────────
     if token:

@@ -45,11 +45,6 @@ class QobuzClient:
         self,
         credentials: AppCredentials,
         token_pool: Optional[TokenPool] = None,
-        # Accepting an optional http_client here is the key to testability.
-        # In production, we create a real httpx.Client. In tests, we pass
-        # in a mock client that never touches the network. This pattern is
-        # called "dependency injection" — instead of creating your dependencies
-        # inside the class, you accept them from outside.
         http_client: Optional[httpx.Client] = None,
     ) -> None:
         self._credentials = credentials
@@ -85,11 +80,15 @@ class QobuzClient:
         source: str | Path,
         http_client: Optional[httpx.Client] = None,
         timeout: int = 10,
+        validate: bool = True,
     ) -> QobuzClient:
         """
-        Create a client from a token pool file or URL. The client is
-        immediately ready to make API calls — no need to call login().
-        The first token in the pool is used automatically.
+        Create a client from a token pool file or URL.
+
+        When validate=True (default), each token is tested with a cheap
+        catalog call to find the first one that returns real results.
+        Tokens from accounts without an active subscription pass auth
+        but return empty catalogs — this filters them out automatically.
         """
         pool = TokenPool.from_local_or_url(source, timeout=timeout)
         instance = cls(
@@ -97,9 +96,42 @@ class QobuzClient:
             token_pool=pool,
             http_client=http_client,
         )
-        # Bootstrap the session from the first token in the pool.
-        # We set user_id to "unknown" because we haven't hit the API yet —
-        # it will be populated if the caller later calls get_user_info().
+
+        if not validate:
+            instance.session = AuthSession(
+                user_auth_token=pool.current_token,
+                user_id="unknown",
+            )
+            return instance
+
+        # Try each token. Albums reliably populate for any active
+        # subscription — tracks can be empty depending on region.
+        for token in pool:
+            instance.session = AuthSession(
+                user_auth_token=token,
+                user_id="unknown",
+            )
+            try:
+                result = instance._request(
+                    "GET", "/catalog/search",
+                    params={"query": "beethoven", "limit": 1},
+                )
+                if result.get("albums", {}).get("total", 0) > 0:
+                    # Advance pool cursor to match the working token.
+                    while pool.current_token != token:
+                        try:
+                            pool.next_token()
+                        except TokenPoolExhaustedError:
+                            break
+                    return instance
+            except (TokenExpiredError, InvalidCredentialsError):
+                continue
+            except Exception:
+                continue
+
+        # No token passed validation — fall back to first and let real
+        # calls surface the error naturally.
+        pool.reset()
         instance.session = AuthSession(
             user_auth_token=pool.current_token,
             user_id="unknown",
@@ -126,7 +158,7 @@ class QobuzClient:
         auth = repr(self.session) if self.session else "not authenticated"
         return f"QobuzClient({auth})"
 
-    # ── Authentication ─────────────────────────────────────────────────────────
+    # ── Authentication ─────────────────────────────────────────────────────
 
     def login(
         self,
@@ -207,20 +239,14 @@ class QobuzClient:
         )
         return self.session
 
-    # ── Session persistence ────────────────────────────────────────────────────
+    # ── Session persistence ────────────────────────────────────────────────
 
     def save_session(self, path: str | Path) -> None:
         """
         Persist the current session to a JSON file.
+        Parent directories are created automatically.
 
-        Parent directories are created automatically. The file is
-        overwritten if it already exists.
-
-        Raises:
-            NoAuthError — if there is no active session to save.
-
-        Example:
-            client.save_session("~/.config/qobuz/session.json")
+        Raises NoAuthError if there is no active session to save.
         """
         if self.session is None:
             raise NoAuthError("No active session to save. Call login() first.")
@@ -233,24 +259,14 @@ class QobuzClient:
         Restore a previously saved session from a JSON file and set it
         as the active session on this client.
 
-        Returns the loaded AuthSession so callers can inspect it —
-        for example to check is_likely_expired before making calls.
-
-        Raises:
-            FileNotFoundError — if the file does not exist.
-            KeyError / ValueError — if the file is malformed.
-
-        Example:
-            session = client.load_session("~/.config/qobuz/session.json")
-            if session.is_likely_expired:
-                client.login(username=..., password=...)
+        Raises FileNotFoundError if the file does not exist.
         """
         src = Path(path).expanduser()
         data = json.loads(src.read_text())
         self.session = AuthSession.from_dict(data)
         return self.session
 
-    # ── HTTP layer ─────────────────────────────────────────────────────────────
+    # ── HTTP layer ─────────────────────────────────────────────────────────
 
     def _request(
         self,
@@ -264,10 +280,18 @@ class QobuzClient:
                 "This call requires authentication. Call login() first."
             )
         all_params = dict(params or {})
-        if require_auth and self.session:
-            all_params["user_auth_token"] = self.session.user_auth_token
+        headers = {}
 
-        response = self._http.request(method, endpoint, params=all_params)
+        if require_auth and self.session:
+            # Send token both ways — as a query param (required by stream/
+            # signing endpoints) and as a header (required by catalog
+            # endpoints to return populated results).
+            all_params["user_auth_token"] = self.session.user_auth_token
+            headers["X-User-Auth-Token"]  = self.session.user_auth_token
+
+        response = self._http.request(
+            method, endpoint, params=all_params, headers=headers,
+        )
         return self._handle_response(response)
 
     def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
@@ -297,7 +321,7 @@ class QobuzClient:
             )
         return body
 
-    # ── Request signing ────────────────────────────────────────────────────────
+    # ── Request signing ────────────────────────────────────────────────────
 
     def _sign_track_url_request(
         self,
@@ -311,9 +335,6 @@ class QobuzClient:
         and the App Secret, then MD5-hashes it. The timestamp is included
         to prevent replay attacks — the same request sent 10 minutes later
         will have a different signature and be rejected.
-
-        The exact field order and concatenation was determined by
-        reverse-engineering the Qobuz web player JavaScript.
         """
         ts = str(int(time.time()))
         canonical = (
@@ -327,7 +348,7 @@ class QobuzClient:
         sig = hashlib.md5(canonical.encode("utf-8")).hexdigest()
         return ts, sig
 
-    # ── Catalog endpoints ──────────────────────────────────────────────────────
+    # ── Catalog endpoints ──────────────────────────────────────────────────
 
     def get_track(self, track_id: str | int) -> Track:
         data = self._request(
@@ -406,7 +427,7 @@ class QobuzClient:
             },
         )
 
-    # ── User library endpoints ─────────────────────────────────────────────────
+    # ── User library endpoints ─────────────────────────────────────────────
 
     def get_user_favorites(
         self,
@@ -444,7 +465,7 @@ class QobuzClient:
             params={"type": type, "limit": limit, "offset": offset},
         )
 
-    # ── Stream endpoint ────────────────────────────────────────────────────────
+    # ── Stream endpoint ────────────────────────────────────────────────────
 
     def get_track_url(
         self,
@@ -454,12 +475,10 @@ class QobuzClient:
         """
         Resolve a track to a signed CDN download URL.
 
-        The returned dict contains "url" — a time-limited signed URL
-        pointing directly to the audio file — plus format metadata like
+        The returned dict contains "url" plus format metadata like
         "bit_depth", "sampling_rate", and "mime_type".
 
-        The URL expires in roughly 30 minutes. Don't cache it — call
-        this method fresh each time you want to download a file.
+        The URL expires in roughly 30 minutes — don't cache it.
 
         Raises NotStreamableError if the track isn't available at the
         requested quality or the user's subscription doesn't cover it.
@@ -480,9 +499,6 @@ class QobuzClient:
             },
         )
 
-        # Qobuz sometimes returns HTTP 200 with an error body instead of a
-        # proper 4xx. This is the one case where we have to inspect the body
-        # rather than trusting the status code alone.
         if "url" not in result:
             raise NotStreamableError(
                 result.get("message", "Track URL not available.")
