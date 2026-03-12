@@ -1,7 +1,8 @@
-# client.py
+# kabooz/client.py
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -24,6 +25,8 @@ from .exceptions import (
 from .quality import Quality
 from .models.track import Track
 from .models.album import Album
+from .models.artist import Artist
+from .models.playlist import Playlist
 
 _BASE_URL = "https://www.qobuz.com/api.json/0.2"
 
@@ -122,7 +125,7 @@ class QobuzClient:
     def __repr__(self) -> str:
         auth = repr(self.session) if self.session else "not authenticated"
         return f"QobuzClient({auth})"
-        
+
     # ── Authentication ─────────────────────────────────────────────────────────
 
     def login(
@@ -148,7 +151,7 @@ class QobuzClient:
         raise ValueError(
             "login() requires either (username + password) or (token + user_id)."
         )
-    
+
     def _login_with_token(
         self,
         token: str,
@@ -181,11 +184,11 @@ class QobuzClient:
             subscription=cred.get("description"),
         )
         return self.session
-    
+
     def logout(self) -> None:
         """Clear the session. You must call login() again after this."""
         self.session = None
-    
+
     def rotate_token(self) -> AuthSession:
         """
         Advance to the next token in the pool. Call this when you catch
@@ -202,8 +205,51 @@ class QobuzClient:
             user_auth_token=new_token,
             user_id=self.session.user_id if self.session else "unknown",
         )
-        return self.session    
-        
+        return self.session
+
+    # ── Session persistence ────────────────────────────────────────────────────
+
+    def save_session(self, path: str | Path) -> None:
+        """
+        Persist the current session to a JSON file.
+
+        Parent directories are created automatically. The file is
+        overwritten if it already exists.
+
+        Raises:
+            NoAuthError — if there is no active session to save.
+
+        Example:
+            client.save_session("~/.config/qobuz/session.json")
+        """
+        if self.session is None:
+            raise NoAuthError("No active session to save. Call login() first.")
+        dest = Path(path).expanduser()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(json.dumps(self.session.to_dict(), indent=2))
+
+    def load_session(self, path: str | Path) -> AuthSession:
+        """
+        Restore a previously saved session from a JSON file and set it
+        as the active session on this client.
+
+        Returns the loaded AuthSession so callers can inspect it —
+        for example to check is_likely_expired before making calls.
+
+        Raises:
+            FileNotFoundError — if the file does not exist.
+            KeyError / ValueError — if the file is malformed.
+
+        Example:
+            session = client.load_session("~/.config/qobuz/session.json")
+            if session.is_likely_expired:
+                client.login(username=..., password=...)
+        """
+        src = Path(path).expanduser()
+        data = json.loads(src.read_text())
+        self.session = AuthSession.from_dict(data)
+        return self.session
+
     # ── HTTP layer ─────────────────────────────────────────────────────────────
 
     def _request(
@@ -240,7 +286,7 @@ class QobuzClient:
 
         if status == 404:
             raise NotFoundError(body.get("message", "Not found."), status_code=status)
-    
+
         if status == 429:
             raise RateLimitError("Rate limit hit. Back off and retry.", status_code=status)
 
@@ -249,8 +295,8 @@ class QobuzClient:
                 body.get("message", f"API error: HTTP {status}"),
                 status_code=status,
             )
-        return body   
-        
+        return body
+
     # ── Request signing ────────────────────────────────────────────────────────
 
     def _sign_track_url_request(
@@ -260,7 +306,7 @@ class QobuzClient:
     ) -> tuple[str, str]:
         """
         Compute the timestamp + MD5 signature required by getFileUrl.
-    
+
         Qobuz assembles a canonical string from the request parameters
         and the App Secret, then MD5-hashes it. The timestamp is included
         to prevent replay attacks — the same request sent 10 minutes later
@@ -280,8 +326,7 @@ class QobuzClient:
         )
         sig = hashlib.md5(canonical.encode("utf-8")).hexdigest()
         return ts, sig
-        
-        
+
     # ── Catalog endpoints ──────────────────────────────────────────────────────
 
     def get_track(self, track_id: str | int) -> Track:
@@ -304,14 +349,15 @@ class QobuzClient:
         extras: str = "albums",
         limit: int = 25,
         offset: int = 0,
-    ) -> dict:
+    ) -> Artist:
         """
         Fetch artist info and optionally their discography.
         extras controls what extra data is included — common values are
         "albums", "tracks", "playlists", "focusAll".
+        Pass extras="" to skip the album list entirely.
         """
-        return self._request(
-                "GET", "/artist/get",
+        data = self._request(
+            "GET", "/artist/get",
             params={
                 "artist_id": str(artist_id),
                 "extra":     extras,
@@ -319,6 +365,25 @@ class QobuzClient:
                 "offset":    offset,
             },
         )
+        return Artist.from_dict(data)
+
+    def get_playlist(
+        self,
+        playlist_id: str | int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Playlist:
+        """Fetch a single playlist and its tracks."""
+        data = self._request(
+            "GET", "/playlist/get",
+            params={
+                "playlist_id": str(playlist_id),
+                "extra":       "tracks",
+                "limit":       limit,
+                "offset":      offset,
+            },
+        )
+        return Playlist.from_dict(data)
 
     def search(
         self,
@@ -340,7 +405,6 @@ class QobuzClient:
                 "offset": offset,
             },
         )
-    
 
     # ── User library endpoints ─────────────────────────────────────────────────
 
@@ -367,23 +431,6 @@ class QobuzClient:
             "GET", "/playlist/getUserPlaylists",
             params={"limit": limit, "offset": offset},
         )
-    
-    def get_playlist(
-        self,
-        playlist_id: str | int,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> dict:
-        """Fetch a single playlist and its tracks."""
-        return self._request(
-            "GET", "/playlist/get",
-            params={
-                "playlist_id": str(playlist_id),
-                "extra":       "tracks",
-                "limit":       limit,
-                "offset":      offset,
-            },
-        )
 
     def get_user_purchases(
         self,
@@ -397,7 +444,6 @@ class QobuzClient:
             params={"type": type, "limit": limit, "offset": offset},
         )
 
-
     # ── Stream endpoint ────────────────────────────────────────────────────────
 
     def get_track_url(
@@ -407,7 +453,7 @@ class QobuzClient:
     ) -> dict:
         """
         Resolve a track to a signed CDN download URL.
-    
+
         The returned dict contains "url" — a time-limited signed URL
         pointing directly to the audio file — plus format metadata like
         "bit_depth", "sampling_rate", and "mime_type".
@@ -442,4 +488,4 @@ class QobuzClient:
                 result.get("message", "Track URL not available.")
             )
 
-        return result    
+        return result
