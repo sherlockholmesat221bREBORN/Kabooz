@@ -345,24 +345,26 @@ class Downloader:
         path: Path,
         on_progress: Optional[Callable[[int, int], None]],
     ) -> DownloadResult:
-        """Skip / resume / fresh download to a specific path."""
         total         = self._head(url)
         existing_size = path.stat().st_size if path.exists() else 0
 
-        # Skip.
-        if existing_size > 0 and existing_size == total:
+        # Skip if the file is at least as large as the CDN reports.
+        # Tagging adds cover art and metadata so the on-disk file will
+        # exceed the raw Content-Length — that is expected, not corruption.
+        if total > 0 and existing_size >= total:
             if on_progress:
                 on_progress(total, total)
             return DownloadResult(
                 path=path, bytes_written=0, total_bytes=total, skipped=True,
             )
-
-        # Resume or fresh.
-        resumed = existing_size > 0 and (total == 0 or existing_size < total)
+    
+        # Resume only when HEAD gave a real total and file is partial.
+        resumed = total > 0 and existing_size > 0 and existing_size < total
         headers = {"Range": f"bytes={existing_size}-"} if resumed else {}
         written = 0
+        mode    = "ab" if resumed else "wb"
 
-        with open(path, "ab") as f:
+        with open(path, mode) as f:
             with self._http.stream("GET", url, headers=headers) as response:
                 response.raise_for_status()
                 for chunk in response.iter_bytes(chunk_size=self._chunk_size):
