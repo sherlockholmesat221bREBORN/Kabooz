@@ -74,6 +74,15 @@ def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
     cfg = cfg or _cfg()
     creds = cfg.credentials
 
+    # Pool mode — credentials live inside the pool file, not the config.
+    if creds.pool:
+        try:
+            return QobuzClient.from_token_pool(creds.pool)
+        except Exception as exc:
+            err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
+            raise typer.Exit(code=1)
+
+    # Session mode — app credentials required.
     app_id     = creds.app_id
     app_secret = creds.app_secret
 
@@ -83,13 +92,6 @@ def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
             "Run [bold]qobuz login[/bold] to configure them."
         )
         raise typer.Exit(code=1)
-
-    if creds.pool:
-        try:
-            return QobuzClient.from_token_pool(creds.pool)
-        except Exception as exc:
-            err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
-            raise typer.Exit(code=1)
 
     if not _SESSION_PATH.exists():
         err_console.print(
@@ -283,9 +285,22 @@ def login(
     """
     cfg = _cfg()
 
+    # ── Token pool mode — handled first, no app credentials needed ───────
+    if pool:
+        try:
+            QobuzClient.from_token_pool(pool)
+        except Exception as exc:
+             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
+             raise typer.Exit(code=1)
+        cfg.credentials.pool = pool
+        save_config(cfg)
+        console.print(f"[green]Token pool saved.[/green] Config at [bold]{_CONFIG_PATH}[/bold].")
+        return
+    
+    # Only prompt for app credentials if not using a pool
     resolved_app_id     = app_id     or os.environ.get("QOBUZ_APP_ID")     or cfg.credentials.app_id
     resolved_app_secret = app_secret or os.environ.get("QOBUZ_APP_SECRET")  or cfg.credentials.app_secret
-
+    
     if not resolved_app_id:
         resolved_app_id = typer.prompt("App ID")
     if not resolved_app_secret:
@@ -293,23 +308,7 @@ def login(
 
     cfg.credentials.app_id     = resolved_app_id
     cfg.credentials.app_secret = resolved_app_secret
-
-    # ── Token pool mode ────────────────────────────────────────────────────
-    if pool:
-        try:
-            QobuzClient.from_token_pool(pool)
-        except Exception as exc:
-            err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
-            raise typer.Exit(code=1)
-        cfg.credentials.pool = pool
-        save_config(cfg)
-        console.print(f"[green]Token pool saved.[/green] Config at [bold]{_CONFIG_PATH}[/bold].")
-        return
-
-    cfg.credentials.pool = ""
-    client = QobuzClient.from_credentials(
-        app_id=resolved_app_id, app_secret=resolved_app_secret,
-    )
+    cfg.credentials.pool       = ""
 
     # ── Direct token mode ──────────────────────────────────────────────────
     if token:
