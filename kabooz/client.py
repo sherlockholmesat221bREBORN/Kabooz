@@ -22,6 +22,8 @@ from .exceptions import (
     TokenPoolExhaustedError,
 )
 from .quality import Quality
+from .models.track import Track
+from .models.album import Album
 
 _BASE_URL = "https://www.qobuz.com/api.json/0.2"
 
@@ -282,19 +284,19 @@ class QobuzClient:
         
     # ── Catalog endpoints ──────────────────────────────────────────────────────
 
-    def get_track(self, track_id: str | int) -> dict:
-        """Fetch full metadata for a single track."""
-        return self._request(
+    def get_track(self, track_id: str | int) -> Track:
+        data = self._request(
             "GET", "/track/get",
             params={"track_id": str(track_id)},
         )
-    
-    def get_album(self, album_id: str) -> dict:
-        """Fetch full metadata for an album including its track listing."""
-        return self._request(
+        return Track.from_dict(data)
+
+    def get_album(self, album_id: str) -> Album:
+        data = self._request(
             "GET", "/album/get",
             params={"album_id": album_id},
         )
+        return Album.from_dict(data)
 
     def get_artist(
         self,
