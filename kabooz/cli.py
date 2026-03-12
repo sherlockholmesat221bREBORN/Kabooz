@@ -61,7 +61,6 @@ _SESSION_PATH = _CONFIG_DIR / "session.json"
 # ── Config file helpers ────────────────────────────────────────────────────
 
 def _read_config() -> dict:
-    """Read ~/.config/qobuz/config.json, returning {} if absent or unreadable."""
     if not _CONFIG_PATH.exists():
         return {}
     try:
@@ -71,7 +70,6 @@ def _read_config() -> dict:
 
 
 def _write_config(data: dict) -> None:
-    """Merge data into the existing config file and write it back."""
     existing = _read_config()
     existing.update(data)
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -81,11 +79,6 @@ def _write_config(data: dict) -> None:
 # ── Credential helpers ─────────────────────────────────────────────────────
 
 def _load_app_credentials() -> tuple[str, str]:
-    """
-    Load app_id and app_secret.
-    Priority: environment variables > ~/.config/qobuz/config.json.
-    Exits with a clear message if neither source provides both values.
-    """
     cfg        = _read_config()
     app_id     = os.environ.get("QOBUZ_APP_ID")    or cfg.get("app_id")
     app_secret = os.environ.get("QOBUZ_APP_SECRET") or cfg.get("app_secret")
@@ -109,16 +102,11 @@ def _build_client() -> QobuzClient:
     Authentication source priority:
       1. Token pool (if `pool` key is present in config.json)
       2. Session file (if ~/.config/qobuz/session.json exists)
-
-    Exits with a helpful message if neither is available.
-    401 errors from actual API calls propagate naturally and are caught
-    in each command handler with a prompt to re-login.
     """
     app_id, app_secret = _load_app_credentials()
     cfg = _read_config()
 
     pool_source = cfg.get("pool")
-
     if pool_source:
         try:
             return QobuzClient.from_token_pool(pool_source)
@@ -143,7 +131,6 @@ def _build_client() -> QobuzClient:
 
 
 def _handle_auth_error(exc: Exception) -> None:
-    """Print a consistent message for auth failures and exit."""
     err_console.print(
         f"[red]Authentication error:[/red] {exc}\n"
         "Run [bold]qobuz login[/bold] to refresh your session."
@@ -151,10 +138,54 @@ def _handle_auth_error(exc: Exception) -> None:
     raise typer.Exit(code=1)
 
 
+# ── Metadata verification ──────────────────────────────────────────────────
+
+def _needs_tagging(path: Path, check_cover: bool = True) -> bool:
+    """
+    Return True if the file at path is missing essential tags or cover art.
+
+    For FLAC: checks for TITLE and ARTIST Vorbis comments, and at least
+    one embedded picture when check_cover is True.
+
+    For MP3: checks for TIT2 (title) and TPE1 (artist) ID3 frames, and
+    at least one APIC frame when check_cover is True.
+
+    Returns True (needs tagging) on any read error so we always err on
+    the side of re-tagging rather than silently leaving a bare file.
+    """
+    try:
+        suffix = path.suffix.lower()
+        if suffix == ".flac":
+            from mutagen.flac import FLAC
+            audio = FLAC(path)
+            has_title  = bool(audio.get("title"))
+            has_artist = bool(audio.get("artist"))
+            has_cover  = len(audio.pictures) > 0
+        elif suffix == ".mp3":
+            from mutagen.id3 import ID3, ID3NoHeaderError
+            try:
+                tags = ID3(path)
+            except ID3NoHeaderError:
+                return True
+            has_title  = "TIT2" in tags
+            has_artist = "TPE1" in tags
+            has_cover  = any(k.startswith("APIC") for k in tags.keys())
+        else:
+            # Unsupported format — don't attempt to re-tag.
+            return False
+    except Exception:
+        return True
+
+    if not has_title or not has_artist:
+        return True
+    if check_cover and not has_cover:
+        return True
+    return False
+
+
 # ── Utility helpers ────────────────────────────────────────────────────────
 
 def _resolve_id(url_or_id: str, expected_type: Optional[str] = None) -> str:
-    """Accept a raw entity ID or a full Qobuz URL. Returns the entity ID."""
     if url_or_id.startswith("http"):
         try:
             entity_type, entity_id = parse_url(url_or_id)
@@ -183,7 +214,6 @@ def _make_progress() -> Progress:
 
 
 def _fetch_lyrics_for(track_obj, album_obj=None):
-    """Fetch lyrics for a track, returning a LyricsResult or None."""
     artist_name = (
         track_obj.performer.name if track_obj.performer
         else (album_obj.artist.name if album_obj and album_obj.artist else "")
@@ -336,9 +366,8 @@ def track(
     """
     Download a single track by ID or URL.
 
-    The track is treated as a standalone single — it is placed directly
-    in the output directory with no album subfolder, regardless of what
-    album it belongs to on Qobuz.
+    The track is treated as a standalone single — placed directly in the
+    output directory with no album subfolder.
     """
     track_id = _resolve_id(url_or_id, expected_type="track")
     client   = _build_client()
@@ -374,7 +403,6 @@ def track(
             progress.update(task, completed=done, total=total or None)
 
         with Downloader() as dl:
-            # album=None intentionally — single track goes flat into output dir.
             result = dl.download_track(
                 track=track_obj,
                 url_info=url_info,
@@ -383,14 +411,18 @@ def track(
                 on_progress=on_progress,
             )
 
-    if result.skipped:
-        console.print(f"[yellow]Skipped[/yellow] (already complete): {result.path}")
+    # Even if the file was skipped, verify it has tags and cover art.
+    if result.skipped and not _needs_tagging(result.path, check_cover=cover):
+        console.print(f"[yellow]Skipped[/yellow] (complete + tagged): {result.path}")
         return
+
+    if result.skipped:
+        console.print(f"    [yellow]File complete but missing tags — re-tagging.[/yellow]")
 
     lyrics_result = None
     if lyrics:
         lyrics_result = _fetch_lyrics_for(track_obj)
-        if lyrics_result.found:
+        if lyrics_result and lyrics_result.found:
             console.print("[green]Lyrics found[/green]")
 
     tagger = Tagger()
@@ -502,10 +534,13 @@ def album(
                     failed += 1
                     continue
 
+        # File size matched — but verify tags and cover before skipping.
         if result.skipped:
-            console.print("    [yellow]Already complete, skipped.[/yellow]")
-            skipped += 1
-            continue
+            if not _needs_tagging(result.path, check_cover=cover):
+                console.print("    [yellow]Already complete, skipped.[/yellow]")
+                skipped += 1
+                continue
+            console.print("    [yellow]File complete but missing tags — re-tagging.[/yellow]")
 
         lyrics_result = None
         if lyrics:
