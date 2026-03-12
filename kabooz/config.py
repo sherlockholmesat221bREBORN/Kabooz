@@ -9,8 +9,9 @@ from typing import Optional
 
 import tomli_w
 
-_CONFIG_DIR  = Path.home() / ".config" / "qobuz"
-_CONFIG_PATH = _CONFIG_DIR / "config.toml"
+_CONFIG_DIR   = Path.home() / ".config" / "qobuz"
+_CONFIG_PATH  = _CONFIG_DIR / "config.toml"
+_SESSION_PATH = _CONFIG_DIR / "session.json"
 
 # ── Sub-configs ────────────────────────────────────────────────────────────
 

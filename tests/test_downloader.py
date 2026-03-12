@@ -61,16 +61,16 @@ def test_sanitize_clean_string_unchanged():
 # ── Quality tag tests ──────────────────────────────────────────────────────
 
 def test_quality_tag_full():
-    assert quality_tag(24, 96.0) == "[FLAC 24bit 96kHz]"
+    assert quality_tag(24, 96.0) == "FLAC 24bit 96kHz"
 
 def test_quality_tag_whole_number_rate():
-    assert quality_tag(16, 44.1) == "[FLAC 16bit 44.1kHz]"
+    assert quality_tag(16, 44.1) == "FLAC 16bit 44.1kHz"
 
 def test_quality_tag_no_sampling_rate():
-    assert quality_tag(24, None) == "[FLAC 24bit]"
+    assert quality_tag(24, None) == "FLAC 24bit"
 
 def test_quality_tag_nothing():
-    assert quality_tag(None, None) == "[FLAC]"
+    assert quality_tag(None, None) == "FLAC"
 
 
 # ── Filename tests ─────────────────────────────────────────────────────────
