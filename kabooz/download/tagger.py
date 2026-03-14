@@ -68,8 +68,14 @@ class Tagger:
         suffix = path.suffix.lower()
 
         cover_data = None
-        if embed_cover and album:
-            url = (album.image.large or album.image.small) if album.image else None
+        if embed_cover:
+            img = None
+        if album and album.image:
+            img = album.image
+        elif track.album and track.album.image:
+            img = track.album.image
+        if img:
+            url = img.large or img.small
             cover_data = self._fetch_cover(url)
 
         if suffix == ".flac":

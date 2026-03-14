@@ -47,6 +47,7 @@ from .exceptions import (
     NotFoundError,
     NotStreamableError,
     TokenExpiredError,
+    ConfigError
 )
 from .models.track import Track
 from .models.album import Album
@@ -404,7 +405,11 @@ def config(
                 except ValueError:
                     coerced = value  # keep as string
 
-        update_config({section: {key: coerced}})
+        try:
+            update_config({section: {key: coerced}})
+        except ConfigError as exc:
+            err_console.print(f"[red]Invalid config value:[/red] {exc}")
+            raise typer.Exit(code=1)
         console.print(f"[green]Set[/green] {section}.{key} = {coerced!r}")
         return
 

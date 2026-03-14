@@ -7,6 +7,8 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
+from .exceptions import ConfigError
+
 import tomli_w
 
 _CONFIG_DIR   = Path.home() / ".config" / "qobuz"
@@ -99,7 +101,75 @@ class QobuzConfig:
 
 
 # ── Read / write ───────────────────────────────────────────────────────────
+_VALID_QUALITIES = {"mp3_320", "flac_16", "flac_24_96", "hi_res"}
 
+def validate_config(cfg: QobuzConfig) -> None:
+    """
+    Raise ConfigError with a clear message on the first invalid value found.
+    Called after loading or updating config so errors surface immediately,
+    not at runtime mid-download.
+    """
+    d = cfg.download
+    t = cfg.tagging
+    n = cfg.naming
+
+    if d.quality.lower() not in _VALID_QUALITIES:
+        raise ConfigError(
+            f"download.quality={d.quality!r} is invalid. "
+            f"Valid values: {', '.join(sorted(_VALID_QUALITIES))}"
+        )
+
+    if d.max_workers < 1:
+        raise ConfigError(
+            f"download.max_workers={d.max_workers} must be >= 1."
+        )
+
+    if d.read_timeout <= 0:
+        raise ConfigError(
+            f"download.read_timeout={d.read_timeout} must be > 0."
+        )
+
+    if d.connect_timeout <= 0:
+        raise ConfigError(
+            f"download.connect_timeout={d.connect_timeout} must be > 0."
+        )
+
+    if not isinstance(t.enabled, bool):
+        raise ConfigError(f"tagging.enabled must be true or false.")
+    if not isinstance(t.embed_cover, bool):
+        raise ConfigError(f"tagging.embed_cover must be true or false.")
+    if not isinstance(t.save_cover_file, bool):
+        raise ConfigError(f"tagging.save_cover_file must be true or false.")
+    if not isinstance(t.fetch_lyrics, bool):
+        raise ConfigError(f"tagging.fetch_lyrics must be true or false.")
+
+    # Validate naming templates contain no unknown placeholders.
+    _KNOWN_PLACEHOLDERS = {
+        "title", "artist", "track", "disc", "isrc",
+        "bit_depth", "sampling_rate", "quality",
+        "album", "albumartist", "year", "label", "genre", "upc",
+        "playlist", "index",
+    }
+    for tmpl_name, tmpl in {
+        "naming.album":       n.album,
+        "naming.single":      n.single,
+        "naming.ep":          n.ep,
+        "naming.compilation": n.compilation,
+        "naming.playlist":    n.playlist,
+    }.items():
+        import string
+        used = {
+            f.split(":")[0]   # strip format spec e.g. {track:02d} → track
+            for _, f, _, _ in string.Formatter().parse(tmpl)
+            if f is not None
+        }
+        unknown = used - _KNOWN_PLACEHOLDERS
+        if unknown:
+            raise ConfigError(
+                f"{tmpl_name} uses unknown placeholder(s): "
+                f"{', '.join(f'{{{u}}}' for u in sorted(unknown))}"
+            )
+            
 def load_config(path: Path = _CONFIG_PATH) -> QobuzConfig:
     """
     Read the TOML config file and return a QobuzConfig.
@@ -162,6 +232,7 @@ def load_config(path: Path = _CONFIG_PATH) -> QobuzConfig:
     if env_secret:
         cfg.credentials.app_secret = env_secret
 
+    validate_config(cfg)
     return cfg
 
 
@@ -196,6 +267,7 @@ def update_config(updates: dict, path: Path = _CONFIG_PATH) -> QobuzConfig:
             if hasattr(obj, key):
                 setattr(obj, key, val)
 
+    validate_config(cfg)
     save_config(cfg, path)
     return cfg
 

@@ -80,3 +80,9 @@ class RateLimitError(APIError):
     """Too many requests in a short window. The caller should back off
     and retry after a delay."""
     pass
+
+class ConfigError(QobuzError):
+    """A config value is missing, the wrong type, or out of range.
+    Raised at load/update time so you get a clear message immediately
+    rather than a cryptic crash later."""
+    pass
