@@ -72,6 +72,14 @@ class LRCLibProvider:
             album:    Album title (improves matching accuracy).
             duration: Track duration in seconds (improves matching accuracy).
         """
+        from ..dev import dev_log
+
+        dev_log(
+            f"fetching lyrics — title={title!r} artist={artist!r}"
+            + (f" album={album!r}" if album else "")
+            + (f" duration={duration}s" if duration else "")
+        )
+
         params: dict[str, str] = {
             "track_name":  title,
             "artist_name": artist,
@@ -87,24 +95,32 @@ class LRCLibProvider:
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as response:
                 if response.status == 404:
+                    dev_log("lyrics: not found (404)")
                     return LyricsResult(found=False)
                 if response.status != 200:
+                    dev_log(f"lyrics: unexpected status {response.status}")
                     return LyricsResult(found=False)
                 data = json.loads(response.read().decode("utf-8"))
-        except Exception:
+        except Exception as exc:
+            dev_log(f"lyrics: fetch error — {exc}")
             return LyricsResult(found=False)
 
         synced = data.get("syncedLyrics") or None
         plain  = data.get("plainLyrics") or None
 
         if not synced and not plain:
+            dev_log("lyrics: response empty — no lyrics in database")
             return LyricsResult(found=False)
 
-        # If synced is available, use it as the primary result.
-        # If not and fallback is enabled, use plain.
-        # If not and fallback is disabled, return only synced (None).
         if not synced and not self.fallback_to_plain:
+            dev_log("lyrics: no synced lyrics and fallback disabled")
             return LyricsResult(found=False)
+
+        dev_log(
+            f"lyrics: found via lrclib — "
+            f"synced={'yes' if synced else 'no'} "
+            f"plain={'yes' if plain else 'no'}"
+        )
 
         return LyricsResult(
             synced=synced,
@@ -137,4 +153,3 @@ def fetch_lyrics(
         fallback_to_plain=fallback_to_plain,
     )
     return provider.fetch(title, artist, album, duration)
-

@@ -47,7 +47,7 @@ class QobuzClient:
         token_pool: Optional[TokenPool] = None,
         http_client: Optional[httpx.Client] = None,
         dev: bool = False,
-        )-> None:
+    ) -> None:
         self._credentials = credentials
         self._token_pool = token_pool
         self._dev = dev
@@ -94,8 +94,16 @@ class QobuzClient:
         catalog call to find the first one that returns real results.
         Tokens from accounts without an active subscription pass auth
         but return empty catalogs — this filters them out automatically.
+
+        Validation always runs with dev=False regardless of the dev flag,
+        so that probe requests are never cached. dev is enabled on the
+        returned instance only after a working token is confirmed.
         """
         pool = TokenPool.from_local_or_url(source, timeout=timeout)
+
+        # Always create with dev=False — validation probes must never be
+        # cached. Empty-catalog responses from bad tokens would permanently
+        # poison the cache for those queries.
         instance = cls(
             credentials=pool.credentials,
             token_pool=pool,
@@ -108,7 +116,7 @@ class QobuzClient:
                 user_auth_token=pool.current_token,
                 user_id="unknown",
             )
-            instance._dev = dev
+            instance._dev = dev   # enable dev now, validation was skipped
             return instance
 
         # Try each token. Albums reliably populate for any active
@@ -130,7 +138,7 @@ class QobuzClient:
                             pool.next_token()
                         except TokenPoolExhaustedError:
                             break
-                    instance._dev = dev
+                    instance._dev = dev   # enable dev after finding good token
                     return instance
             except (TokenExpiredError, InvalidCredentialsError):
                 continue
@@ -144,7 +152,7 @@ class QobuzClient:
             user_auth_token=pool.current_token,
             user_id="unknown",
         )
-        instance._dev = dev
+        instance._dev = dev       # enable dev on fallback path too
         return instance
 
     # ── Context manager support ────────────────────────────────────────────
@@ -292,36 +300,21 @@ class QobuzClient:
         headers = {}
 
         if require_auth and self.session:
-            # Send token both ways — as a query param (required by stream/
-            # signing endpoints) and as a header (required by catalog
-            # endpoints to return populated results).
             all_params["user_auth_token"] = self.session.user_auth_token
             headers["X-User-Auth-Token"]  = self.session.user_auth_token
 
         # ── Dev mode: cache check ──────────────────────────────────────────
         if self._dev:
-            from .dev import load_cached, save_cached
-            try:
-                from rich.console import Console as _Console
-                _con = _Console(stderr=True)
-            except ImportError:
-                _con = None
+            from .dev import load_cached, save_cached, dev_log
 
             cached = load_cached(method, endpoint, all_params)
             if cached is not None:
-                if _con:
-                    _con.print(
-                        f"[dim][DEV] {method} {endpoint} "
-                        f"[green]CACHE HIT[/green][/dim]"
-                    )
+                dev_log(f"[green]CACHE HIT[/green] {method} {endpoint}")
                 return cached
 
-            if _con:
-                _con.print(
-                    f"[dim][DEV] {method} {endpoint} "
-                    f"params={[k for k in all_params if k != 'user_auth_token']} "
-                    f"→ fetching…[/dim]"
-                )
+            # Show params without the auth token — it's noise in the log.
+            visible = [k for k in all_params if k not in ("user_auth_token",)]
+            dev_log(f"{method} {endpoint} params={visible} → fetching…")
 
         response = self._http.request(
             method, endpoint, params=all_params, headers=headers,
@@ -330,15 +323,9 @@ class QobuzClient:
 
         # ── Dev mode: cache the fresh response ────────────────────────────
         if self._dev:
+            from .dev import save_cached, dev_log
             save_cached(method, endpoint, all_params, body)
-            try:
-                from rich.console import Console as _Console
-                _Console(stderr=True).print(
-                    f"[dim][DEV] {method} {endpoint} "
-                    f"→ [cyan]HTTP {response.status_code}[/cyan] (cached)[/dim]"
-                )
-            except ImportError:
-                pass
+            dev_log(f"{method} {endpoint} → HTTP {response.status_code} (cached)")
 
         return body
 

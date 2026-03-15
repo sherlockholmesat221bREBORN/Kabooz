@@ -44,7 +44,7 @@ class _RateLimiter:
 _limiter = _RateLimiter()
 
 _MB_BASE    = "https://musicbrainz.org/ws/2"
-_USER_AGENT = "qobuz-py/0.1 ( https://github.com/you/qobuz-py )"
+_USER_AGENT = "kabooz/0.1 ( https://gitlab.com/TchaikovskyCannonsAPI/kabooz )"
 
 
 # ── Public interface ───────────────────────────────────────────────────────
@@ -67,9 +67,12 @@ def lookup_isrc(
         isrc:        The ISRC code from the Qobuz track metadata.
         http_client: Optional injected httpx.Client for testing.
     """
+    from ..dev import dev_log
+
     if not isrc:
         return MBResult()
 
+    dev_log(f"MusicBrainz lookup — ISRC={isrc}")
     _limiter.wait()
 
     own_client = http_client is None
@@ -80,16 +83,12 @@ def lookup_isrc(
 
     try:
         resp = client.get(
-            f"{_MB_BASE}/recording",
-            params={
-                "isrc":  isrc,
-                "inc":   "artists releases",
-                "fmt":   "json",
-            },
+            f"{_MB_BASE}/isrc/{isrc}?inc=artists+releases&fmt=json",
         )
         resp.raise_for_status()
         data = resp.json()
-    except Exception:
+    except Exception as exc:
+        dev_log(f"MusicBrainz: lookup failed — {exc}")
         return MBResult()
     finally:
         if own_client:
@@ -97,10 +96,9 @@ def lookup_isrc(
 
     recordings = data.get("recordings", [])
     if not recordings:
+        dev_log(f"MusicBrainz: no recordings found for ISRC={isrc}")
         return MBResult()
 
-    # Take the first recording. When multiple recordings share an ISRC
-    # (re-releases, compilations) the first is typically the canonical one.
     rec = recordings[0]
     recording_mbid = rec.get("id")
 
@@ -115,6 +113,13 @@ def lookup_isrc(
     releases = rec.get("releases", [])
     if releases:
         release_mbid = releases[0].get("id")
+
+    dev_log(
+        f"MusicBrainz: found — "
+        f"recording={recording_mbid} "
+        f"artist={artist_mbid} "
+        f"release={release_mbid}"
+    )
 
     return MBResult(
         recording_mbid = recording_mbid,
@@ -134,12 +139,16 @@ def apply_mb_tags(path, mb: MBResult) -> None:
     Called after the main tagger has already written all other tags, so
     we open, update, and save rather than replacing everything.
     """
+    from ..dev import dev_log
+
     if not mb.found:
         return
 
     from pathlib import Path as _Path
     path = _Path(path)
     suffix = path.suffix.lower()
+
+    dev_log(f"applying MusicBrainz tags to {path.name}")
 
     try:
         if suffix == ".flac":
@@ -166,7 +175,5 @@ def apply_mb_tags(path, mb: MBResult) -> None:
             if mb.release_mbid:
                 tags.add(TXXX(encoding=3, desc="MusicBrainz Album Id",  text=mb.release_mbid))
             tags.save()
-    except Exception:
-        # Non-fatal — MB enrichment is best-effort.
-        pass
-
+    except Exception as exc:
+        dev_log(f"MusicBrainz: tag write failed — {exc}")

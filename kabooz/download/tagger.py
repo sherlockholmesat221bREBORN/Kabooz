@@ -64,6 +64,8 @@ class Tagger:
             embed_cover: If True, downloads and embeds the album cover art.
                          Requires album to be provided and have an image URL.
         """
+        from ..dev import dev_log
+
         path = Path(path)
         suffix = path.suffix.lower()
 
@@ -76,7 +78,23 @@ class Tagger:
                 img = track.album.image
             if img:
                 url = img.large or img.small
+                dev_log(f"fetching cover art from {url}")
                 cover_data = self._fetch_cover(url)
+                if cover_data:
+                    dev_log(f"cover art fetched ({len(cover_data):,} bytes)")
+                else:
+                    dev_log("[yellow]cover art fetch failed or no URL[/yellow]")
+
+        artist = track.performer.name if track.performer else ""
+        album_title = album.title if album else (track.album.title if track.album else "")
+        dev_log(
+            f"tagging {path.name} — "
+            f"title={track.title!r} "
+            f"artist={artist!r} "
+            f"album={album_title!r} "
+            f"cover={'yes' if cover_data else 'no'} "
+            f"lyrics={'yes' if lyrics and lyrics.found else 'no'}"
+        )
 
         if suffix == ".flac":
             self._tag_flac(path, track, album, lyrics, cover_data)
@@ -84,6 +102,8 @@ class Tagger:
             self._tag_mp3(path, track, album, lyrics, cover_data)
         else:
             raise ValueError(f"Unsupported audio format: {suffix}")
+
+        dev_log(f"tagged OK → {path.name}")
 
     # ── FLAC tagging ───────────────────────────────────────────────────────
 
@@ -145,7 +165,6 @@ class Tagger:
             if album.media_count:
                 audio["TOTALDISCS"] = str(album.media_count)
         elif track.album:
-            # Fall back to the nested TrackAlbum if no full Album was passed.
             audio["ALBUM"] = track.album.title
             if track.album.artist:
                 audio["ALBUMARTIST"] = track.album.artist.name
@@ -198,10 +217,8 @@ class Tagger:
         try:
             audio = ID3(path)
         except ID3NoHeaderError:
-            # File has no ID3 header yet — create one.
             audio = ID3()
 
-        # Clear existing tags.
         audio.clear()
 
         # ── Track-level tags ───────────────────────────────────────────────
@@ -244,8 +261,6 @@ class Tagger:
         # ── Lyrics ────────────────────────────────────────────────────────
         if lyrics and lyrics.found:
             if lyrics.synced:
-                # SYLT = Synchronised lyrics. Each entry is (text, timestamp_ms).
-                # We parse the LRC format into the list of tuples ID3 expects.
                 sylt_data = _parse_lrc_to_sylt(lyrics.synced)
                 if sylt_data:
                     audio["SYLT"] = SYLT(
@@ -316,8 +331,6 @@ def _parse_lrc_to_sylt(lrc: str) -> list[tuple[str, int]]:
         centis   = match.group(3)
         text     = match.group(4).strip()
 
-        # Normalise centiseconds to milliseconds regardless of whether
-        # the LRC file uses 2 or 3 decimal digits.
         if len(centis) == 2:
             ms = int(centis) * 10
         else:
@@ -327,4 +340,3 @@ def _parse_lrc_to_sylt(lrc: str) -> list[tuple[str, int]]:
         result.append((text, total_ms))
 
     return result
-

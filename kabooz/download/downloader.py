@@ -29,6 +29,8 @@ class DownloadResult:
         total_bytes:   Total file size in bytes.
         skipped:       File was already complete — not re-downloaded.
         resumed:       Download was resumed from a partial file.
+        dev_stub:      True when the file is a stub (not real audio).
+                       When True, the full tagging pipeline is skipped.
     """
     path: Path
     bytes_written: int
@@ -56,7 +58,7 @@ class AlbumDownloadResult:
     """Aggregate result of downloading a full album."""
     tracks:  list[DownloadResult]       = field(default_factory=list)
     goodies: list[GoodieResult]         = field(default_factory=list)
-    failed:  list[tuple[int, str]]      = field(default_factory=list)  # (track_id, reason)
+    failed:  list[tuple[int, str]]      = field(default_factory=list)
 
     @property
     def succeeded(self) -> int:
@@ -80,6 +82,9 @@ class Downloader:
     - Optional external downloader (e.g. aria2c) via a shell template.
     - Naming template support (passed through to resolve_track_path).
     - Goodie (bonus file) downloading into the album folder.
+    - Dev mode: writes real audio (transcoded from the embedded Opus clip)
+      instead of streaming from Qobuz. Falls back to a sine wave if the
+      clip isn't baked yet, then to stub bytes as a last resort.
 
     External downloader template
     ────────────────────────────
@@ -110,15 +115,13 @@ class Downloader:
         naming_template: Optional[str] = None,
         dev: bool = False,
     ) -> None:
-        self._chunk_size         = chunk_size
-        self._read_timeout       = read_timeout
-        self._connect_timeout    = connect_timeout
-        self._max_workers        = max(1, max_workers)
+        self._chunk_size          = chunk_size
+        self._read_timeout        = read_timeout
+        self._connect_timeout     = connect_timeout
+        self._max_workers         = max(1, max_workers)
         self._external_downloader = external_downloader.strip()
-        self._naming_template    = naming_template
-        self._dev = dev
-        # Shared client for HEAD requests and sequential downloads.
-        # Each thread in the pool creates its own client.
+        self._naming_template     = naming_template
+        self._dev                 = dev
         self._http = http_client or self._make_client()
 
     def _make_client(self) -> httpx.Client:
@@ -155,7 +158,7 @@ class Downloader:
         dest_dir = Path(dest_dir)
         url      = url_info["url"]
         mime     = url_info.get("mime_type", "audio/flac")
-        extension = ".mp3" if "mpeg" in mime else ".flac"
+        extension     = ".mp3" if "mpeg" in mime else ".flac"
         bit_depth     = url_info.get("bit_depth")
         sampling_rate = url_info.get("sampling_rate")
 
@@ -178,6 +181,9 @@ class Downloader:
             playlist_index=playlist_index,
         )
 
+        from ..dev import dev_log
+        dev_log(f"resolved path → {dest_path}")
+
         if self._external_downloader:
             return self._external_download(url, dest_path, on_progress)
 
@@ -185,7 +191,7 @@ class Downloader:
 
     def download_album(
         self,
-        tracks: list[tuple[Track, dict]],   # [(track, url_info), …]
+        tracks: list[tuple[Track, dict]],
         dest_dir: str | Path,
         album: Optional[Album] = None,
         on_track_start: Optional[Callable[[Track, int, int], None]] = None,
@@ -238,7 +244,7 @@ class Downloader:
             with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
                 for i, item in enumerate(tracks, 1):
                     f = pool.submit(_do, item, i)
-                    futures[f] = item[0]  # track
+                    futures[f] = item[0]
                 for f in as_completed(futures):
                     track = futures[f]
                     try:
@@ -253,12 +259,8 @@ class Downloader:
 
         # ── Goodies ───────────────────────────────────────────────────────
         if download_goodies and album and album.goodies:
-            # Determine the album folder from the first successfully
-            # downloaded track's path parent, falling back to dest_dir.
             album_dir = dest_dir
             if result.tracks:
-                # Go up from the track file to the album root.
-                # For multi-disc albums the track lives one level deeper.
                 candidate = result.tracks[0].path.parent
                 if album.media_count and album.media_count > 1:
                     candidate = candidate.parent
@@ -292,13 +294,15 @@ class Downloader:
                 error="No URL available for this goodie",
             )
 
-        # Derive filename from the URL path, fall back to goodie.name.
         url_filename = url.split("?")[0].rstrip("/").split("/")[-1]
         filename = sanitize(url_filename) if url_filename else sanitize(goodie.name)
         if not filename:
             filename = f"goodie_{goodie.id}"
 
         dest_path = dest_dir / filename
+
+        from ..dev import dev_log
+        dev_log(f"goodie '{goodie.name}' → {dest_path}")
 
         try:
             result = self._download_to_path(url, dest_path, on_progress)
@@ -337,7 +341,7 @@ class Downloader:
     def _head(self, url: str) -> int:
         """Return Content-Length from a HEAD request, or 0 on failure."""
         try:
-            head  = self._http.head(url)
+            head = self._http.head(url)
             return int(head.headers.get("content-length", 0))
         except Exception:
             return 0
@@ -348,38 +352,40 @@ class Downloader:
         path: Path,
         on_progress: Optional[Callable[[int, int], None]],
     ) -> DownloadResult:
-        # ── Dev mode: write a stub instead of streaming real audio ────────
+        # ── Dev mode: write dev audio instead of streaming real audio ─────
         if self._dev:
-            from .dev import DEV_STUB_BYTES, is_stub
-            try:
-                from rich.console import Console as _Console
-                _Console(stderr=True).print(
-                    f"[dim][DEV] stub → {path}[/dim]"
-                )
-            except ImportError:
-                pass
+            from ..dev import prepare_dev_audio, is_stub, DEV_STUB_BYTES, dev_log
 
-            if path.exists() and is_stub(path):
+            # Already exists — check whether it's a stub or real audio.
+            if path.exists():
+                if is_stub(path):
+                    dev_log(f"stub already exists, skipping → {path.name}")
+                else:
+                    dev_log(f"dev audio already exists, skipping → {path.name}")
+                size = path.stat().st_size
                 if on_progress:
-                    on_progress(len(DEV_STUB_BYTES), len(DEV_STUB_BYTES))
+                    on_progress(size, size)
                 return DownloadResult(
                     path=path,
                     bytes_written=0,
-                    total_bytes=len(DEV_STUB_BYTES),
+                    total_bytes=size,
                     skipped=True,
-                    dev_stub=True,
+                    dev_stub=is_stub(path),
                 )
 
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(DEV_STUB_BYTES)
+            # Write the dev audio file. Returns True = real audio, False = stub.
+            is_real_audio = prepare_dev_audio(path)
+            size = path.stat().st_size if path.exists() else len(DEV_STUB_BYTES)
             if on_progress:
-                on_progress(len(DEV_STUB_BYTES), len(DEV_STUB_BYTES))
+                on_progress(size, size)
             return DownloadResult(
                 path=path,
-                bytes_written=len(DEV_STUB_BYTES),
-                total_bytes=len(DEV_STUB_BYTES),
-                dev_stub=True,
+                bytes_written=size,
+                total_bytes=size,
+                dev_stub=not is_real_audio,
             )
+
+        # ── Normal path ────────────────────────────────────────────────────
         total         = self._head(url)
         existing_size = path.stat().st_size if path.exists() else 0
 
@@ -392,7 +398,7 @@ class Downloader:
             return DownloadResult(
                 path=path, bytes_written=0, total_bytes=total, skipped=True,
             )
-    
+
         # Resume only when HEAD gave a real total and file is partial.
         resumed = total > 0 and existing_size > 0 and existing_size < total
         headers = {"Range": f"bytes={existing_size}-"} if resumed else {}
@@ -461,7 +467,6 @@ class Downloader:
             ) from exc
 
         written = path.stat().st_size if path.exists() else 0
-
         if on_progress:
             on_progress(written, written)
 

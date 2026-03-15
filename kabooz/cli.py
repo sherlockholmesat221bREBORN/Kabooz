@@ -76,7 +76,7 @@ def main(
         envvar="QOBUZ_DEV",
         help=(
             "Developer mode: cache API responses to ~/.cache/qobuz/ and "
-            "write stub files instead of downloading real audio. "
+            "write dev audio instead of downloading real files. "
             "Saves bandwidth during testing."
         ),
         is_eager=True,
@@ -86,11 +86,12 @@ def main(
     global _dev
     _dev = dev
     if dev:
-        from .dev import CACHE_DIR
+        from . import dev as _dev_module
+        _dev_module.enable()
         err_console.print(
             "[yellow bold][DEV MODE][/yellow bold] "
-            "API responses cached · Audio downloads stubbed · "
-            f"Cache: [dim]{CACHE_DIR}[/dim]"
+            "API responses cached · Dev audio enabled · "
+            f"Cache: [dim]{_dev_module.CACHE_DIR}[/dim]"
         )
 
 
@@ -104,7 +105,6 @@ def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
     cfg = cfg or _cfg()
     creds = cfg.credentials
 
-    # Pool mode — credentials live inside the pool file, not the config.
     if creds.pool:
         try:
             return QobuzClient.from_token_pool(creds.pool, dev=_dev)
@@ -112,7 +112,6 @@ def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
             raise typer.Exit(code=1)
 
-    # Session mode — app credentials required.
     app_id     = creds.app_id
     app_secret = creds.app_secret
 
@@ -214,33 +213,55 @@ def _post_download(
     fetch_lyrics_flag: bool,
     save_cover_file: bool,
 ) -> None:
-    """Tag, optionally fetch lyrics, optionally run MusicBrainz lookup."""
-    if not cfg.tagging.enabled:
-        return
+    """
+    Tag, optionally fetch lyrics, optionally run MusicBrainz lookup.
 
-    # Dev stub files are not real audio — skip tagging entirely.
-    if result.dev_stub:
+    For dev audio (real audio generated from the embedded Opus clip),
+    the full pipeline runs — tagging, lyrics, MusicBrainz — exactly as
+    it would for a real download.
+
+    For stub files (fallback when ffmpeg is unavailable), tagging is
+    skipped because mutagen can't parse fake bytes. Lyrics and
+    MusicBrainz still run since they don't touch the file.
+    """
+    if not cfg.tagging.enabled:
         return
 
     lyrics_result = None
     if fetch_lyrics_flag:
         lyrics_result = _fetch_lyrics_for(track_obj, album_obj)
 
-    tagger = Tagger()
-    tagger.tag(
-        path=result.path,
-        track=track_obj,
-        album=album_obj,
-        lyrics=lyrics_result,
-        embed_cover=embed_cover,
-    )
+    # Tagging requires a valid audio file — skip only for stubs.
+    if not result.dev_stub:
+        tagger = Tagger()
+        tagger.tag(
+            path=result.path,
+            track=track_obj,
+            album=album_obj,
+            lyrics=lyrics_result,
+            embed_cover=embed_cover,
+        )
 
-    if save_cover_file and album_obj and album_obj.image:
-        _save_cover_file(result.path.parent, album_obj)
+        if save_cover_file and album_obj and album_obj.image:
+            _save_cover_file(result.path.parent, album_obj)
+    else:
+        from .dev import dev_log
+        dev_log(
+            "[yellow]stub file — tagging skipped "
+            "(install ffmpeg to get real dev audio)[/yellow]"
+        )
 
     if cfg.musicbrainz.enabled and track_obj.isrc:
-        mb = lookup_isrc(track_obj.isrc)
-        apply_mb_tags(result.path, mb)
+        if not result.dev_stub:
+            mb = lookup_isrc(track_obj.isrc)
+            apply_mb_tags(result.path, mb)
+        else:
+            from .dev import dev_log
+            dev_log(
+                f"MusicBrainz lookup for isrc={track_obj.isrc!r} "
+                f"(tags not written — stub file)"
+            )
+            lookup_isrc(track_obj.isrc)   # run the lookup for verbosity, discard result
 
 
 def _save_cover_file(folder: Path, album: Album) -> None:
@@ -324,7 +345,6 @@ def login(
     """
     cfg = _cfg()
 
-    # ── Token pool mode — handled first, no app credentials needed ────────
     if pool:
         try:
             QobuzClient.from_token_pool(pool)
@@ -336,7 +356,6 @@ def login(
         console.print(f"[green]Token pool saved.[/green] Config at [bold]{_CONFIG_PATH}[/bold].")
         return
 
-    # Only prompt for app credentials if not using a pool.
     resolved_app_id     = app_id     or os.environ.get("QOBUZ_APP_ID")     or cfg.credentials.app_id
     resolved_app_secret = app_secret or os.environ.get("QOBUZ_APP_SECRET") or cfg.credentials.app_secret
 
@@ -354,7 +373,6 @@ def login(
         app_secret=resolved_app_secret,
     )
 
-    # ── Direct token mode ─────────────────────────────────────────────────
     if token:
         if not user_id:
             user_id = typer.prompt("User ID")
@@ -363,8 +381,6 @@ def login(
         except Exception as exc:
             err_console.print(f"[red]Login failed:[/red] {exc}")
             raise typer.Exit(code=1)
-
-    # ── Username + password ───────────────────────────────────────────────
     else:
         if not username:
             username = typer.prompt("Qobuz username (email)")
@@ -428,7 +444,6 @@ def config(
             raise typer.Exit(code=1)
         section, key = parts
 
-        # Coerce common types.
         coerced: object = value
         if value.lower() in ("true", "yes", "1"):
             coerced = True
@@ -441,7 +456,7 @@ def config(
                 try:
                     coerced = float(value)
                 except ValueError:
-                    coerced = value  # keep as string
+                    coerced = value
 
         try:
             update_config({section: {key: coerced}})
@@ -451,7 +466,6 @@ def config(
         console.print(f"[green]Set[/green] {section}.{key} = {coerced!r}")
         return
 
-    # No flags — print help.
     console.print("Use [bold]--show[/bold] to view config or [bold]--set section.key=value[/bold] to update it.")
     console.print(f"Config file: [bold]{_CONFIG_PATH}[/bold]")
 
@@ -476,7 +490,6 @@ def dev_cache(
         console.print(f"[green]Cleared {n} cached response(s).[/green]")
         return
 
-    # Default to --show behaviour if no flag given.
     files = list(CACHE_DIR.glob("*.json")) if CACHE_DIR.exists() else []
     console.print(f"Cache directory: [bold]{CACHE_DIR}[/bold]")
     console.print(f"Cached responses: [bold]{len(files)}[/bold]")
@@ -722,14 +735,9 @@ def album(
 
         # ── Goodies ───────────────────────────────────────────────────────
         if do_goodies and album_obj.goodies:
-            # Walk track_results (all downloaded/skipped tracks) to find
-            # the album folder. Using the first result is sufficient —
-            # all tracks in the same album land in the same parent dir.
             album_dir = dest_dir
             for r in track_results:
                 candidate = r.path.parent
-                # Multi-disc: track lives in Disc N/ subfolder, go up one
-                # more level to reach the album root.
                 if album_obj.media_count and album_obj.media_count > 1:
                     candidate = candidate.parent
                 if candidate.is_dir():
@@ -829,7 +837,6 @@ def playlist(
                 failed += 1
                 continue
 
-            # Fetch album for cover and full metadata.
             album_obj = None
             if track_obj.album:
                 try:
@@ -886,7 +893,6 @@ def playlist(
             m3u_lines.append(str(result.path))
             succeeded += 1
 
-    # ── Write .m3u8 ───────────────────────────────────────────────────────
     if m3u and len(m3u_lines) > 1:
         pl_dir  = dest_dir / sanitize(pl.name)
         pl_dir.mkdir(parents=True, exist_ok=True)
