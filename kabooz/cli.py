@@ -64,6 +64,35 @@ app = typer.Typer(
 console     = Console()
 err_console = Console(stderr=True)
 
+# ── Dev mode flag (set by @app.callback before any command runs) ───────────
+_dev: bool = False
+
+
+@app.callback()
+def main(
+    dev: bool = typer.Option(
+        False,
+        "--dev",
+        envvar="QOBUZ_DEV",
+        help=(
+            "Developer mode: cache API responses to ~/.cache/qobuz/ and "
+            "write stub files instead of downloading real audio. "
+            "Saves bandwidth during testing."
+        ),
+        is_eager=True,
+    ),
+) -> None:
+    """Unofficial Qobuz CLI — download tracks, albums, playlists, and more."""
+    global _dev
+    _dev = dev
+    if dev:
+        from .dev import CACHE_DIR
+        err_console.print(
+            "[yellow bold][DEV MODE][/yellow bold] "
+            "API responses cached · Audio downloads stubbed · "
+            f"Cache: [dim]{CACHE_DIR}[/dim]"
+        )
+
 
 # ── Config helpers ─────────────────────────────────────────────────────────
 
@@ -78,7 +107,7 @@ def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
     # Pool mode — credentials live inside the pool file, not the config.
     if creds.pool:
         try:
-            return QobuzClient.from_token_pool(creds.pool)
+            return QobuzClient.from_token_pool(creds.pool, dev=_dev)
         except Exception as exc:
             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
             raise typer.Exit(code=1)
@@ -100,7 +129,11 @@ def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
         )
         raise typer.Exit(code=1)
 
-    client = QobuzClient.from_credentials(app_id=app_id, app_secret=app_secret)
+    client = QobuzClient.from_credentials(
+        app_id=app_id,
+        app_secret=app_secret,
+        dev=_dev,
+    )
     try:
         client.load_session(_SESSION_PATH)
     except Exception as exc:
@@ -117,6 +150,7 @@ def _build_downloader(cfg: QobuzConfig, template: Optional[str] = None) -> Downl
         max_workers         = cfg.download.max_workers,
         external_downloader = cfg.download.external_downloader,
         naming_template     = template or None,
+        dev                 = _dev,
     )
 
 
@@ -182,6 +216,10 @@ def _post_download(
 ) -> None:
     """Tag, optionally fetch lyrics, optionally run MusicBrainz lookup."""
     if not cfg.tagging.enabled:
+        return
+
+    # Dev stub files are not real audio — skip tagging entirely.
+    if result.dev_stub:
         return
 
     lyrics_result = None
@@ -286,22 +324,22 @@ def login(
     """
     cfg = _cfg()
 
-    # ── Token pool mode — handled first, no app credentials needed ───────
+    # ── Token pool mode — handled first, no app credentials needed ────────
     if pool:
         try:
             QobuzClient.from_token_pool(pool)
         except Exception as exc:
-             err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
-             raise typer.Exit(code=1)
+            err_console.print(f"[red]Failed to load token pool:[/red] {exc}")
+            raise typer.Exit(code=1)
         cfg.credentials.pool = pool
         save_config(cfg)
         console.print(f"[green]Token pool saved.[/green] Config at [bold]{_CONFIG_PATH}[/bold].")
         return
-    
-    # Only prompt for app credentials if not using a pool
+
+    # Only prompt for app credentials if not using a pool.
     resolved_app_id     = app_id     or os.environ.get("QOBUZ_APP_ID")     or cfg.credentials.app_id
-    resolved_app_secret = app_secret or os.environ.get("QOBUZ_APP_SECRET")  or cfg.credentials.app_secret
-    
+    resolved_app_secret = app_secret or os.environ.get("QOBUZ_APP_SECRET") or cfg.credentials.app_secret
+
     if not resolved_app_id:
         resolved_app_id = typer.prompt("App ID")
     if not resolved_app_secret:
@@ -311,12 +349,12 @@ def login(
     cfg.credentials.app_secret = resolved_app_secret
     cfg.credentials.pool = ""
 
-    client = QobuzClient.from_credentials(          # ← add this
+    client = QobuzClient.from_credentials(
         app_id=resolved_app_id,
         app_secret=resolved_app_secret,
     )
 
-    # ── Direct token mode ──────────────────────────────────────────────────
+    # ── Direct token mode ─────────────────────────────────────────────────
     if token:
         if not user_id:
             user_id = typer.prompt("User ID")
@@ -326,7 +364,7 @@ def login(
             err_console.print(f"[red]Login failed:[/red] {exc}")
             raise typer.Exit(code=1)
 
-    # ── Username + password ────────────────────────────────────────────────
+    # ── Username + password ───────────────────────────────────────────────
     else:
         if not username:
             username = typer.prompt("Qobuz username (email)")
@@ -373,7 +411,7 @@ def config(
     """
     if show:
         cfg = _cfg()
-        import tomli_w, dataclasses
+        import dataclasses
         console.print_json(
             __import__("json").dumps(dataclasses.asdict(cfg), indent=2)
         )
@@ -418,9 +456,38 @@ def config(
     console.print(f"Config file: [bold]{_CONFIG_PATH}[/bold]")
 
 
+@app.command("dev-cache")
+def dev_cache(
+    clear: bool = typer.Option(False, "--clear", help="Delete all cached API responses"),
+    show:  bool = typer.Option(False, "--show",  help="Print cache directory and stats"),
+) -> None:
+    """
+    Manage the dev mode API response cache.
+
+    \b
+    Examples:
+        qobuz dev-cache --show
+        qobuz dev-cache --clear
+    """
+    from .dev import CACHE_DIR, clear_cache
+
+    if clear:
+        n = clear_cache()
+        console.print(f"[green]Cleared {n} cached response(s).[/green]")
+        return
+
+    # Default to --show behaviour if no flag given.
+    files = list(CACHE_DIR.glob("*.json")) if CACHE_DIR.exists() else []
+    console.print(f"Cache directory: [bold]{CACHE_DIR}[/bold]")
+    console.print(f"Cached responses: [bold]{len(files)}[/bold]")
+    if files:
+        total_kb = sum(f.stat().st_size for f in files) / 1024
+        console.print(f"Total size: [bold]{total_kb:.1f} KB[/bold]")
+
+
 @app.command()
 def track(
-    url_or_id:   str          = typer.Argument(..., help="Track ID or Qobuz URL"),
+    url_or_id:   str            = typer.Argument(..., help="Track ID or Qobuz URL"),
     output:      Optional[Path] = typer.Option(None,  "-o", "--output"),
     quality:     Optional[str]  = typer.Option(None,  "-q", "--quality"),
     lyrics:      Optional[bool] = typer.Option(None,  "--lyrics/--no-lyrics"),
@@ -436,13 +503,13 @@ def track(
     """
     cfg = _cfg()
 
-    dest_dir     = output      or Path(cfg.download.output_dir)
-    q_str        = quality     or cfg.download.quality
-    embed_cover  = cover       if cover     is not None else cfg.tagging.embed_cover
-    save_cov     = save_cover  if save_cover is not None else cfg.tagging.save_cover_file
-    do_lyrics    = lyrics      if lyrics    is not None else cfg.tagging.fetch_lyrics
-    n_workers    = workers     or cfg.download.max_workers
-    ext_dl       = downloader  or cfg.download.external_downloader
+    dest_dir    = output      or Path(cfg.download.output_dir)
+    q_str       = quality     or cfg.download.quality
+    embed_cover = cover       if cover      is not None else cfg.tagging.embed_cover
+    save_cov    = save_cover  if save_cover is not None else cfg.tagging.save_cover_file
+    do_lyrics   = lyrics      if lyrics     is not None else cfg.tagging.fetch_lyrics
+    n_workers   = workers     or cfg.download.max_workers
+    ext_dl      = downloader  or cfg.download.external_downloader
 
     try:
         q = Quality[q_str.upper()]
@@ -477,7 +544,6 @@ def track(
 
     console.print(f"[cyan]Downloading[/cyan] {track_obj.title}")
 
-    # Use single template for standalone track downloads.
     tmpl = template or cfg.naming.single
 
     with _make_progress() as progress:
@@ -492,20 +558,21 @@ def track(
             max_workers=n_workers,
             external_downloader=ext_dl,
             naming_template=tmpl,
+            dev=_dev,
         ) as dl:
             result = dl.download_track(
                 track=track_obj,
                 url_info=url_info,
                 dest_dir=dest_dir,
-                album=None,         # single — no album context
+                album=None,
                 on_progress=on_progress,
             )
 
-    if result.skipped and not _needs_tagging(result.path, check_cover=embed_cover):
+    if result.skipped and not result.dev_stub and not _needs_tagging(result.path, check_cover=embed_cover):
         console.print(f"[yellow]Skipped[/yellow] (complete + tagged): {result.path}")
         return
 
-    if result.skipped:
+    if result.skipped and not result.dev_stub:
         console.print("    [yellow]File complete but missing tags — re-tagging.[/yellow]")
 
     _post_download(result, track_obj, None, cfg, embed_cover, do_lyrics, save_cov)
@@ -514,7 +581,7 @@ def track(
 
 @app.command()
 def album(
-    url_or_id:   str           = typer.Argument(..., help="Album ID or Qobuz URL"),
+    url_or_id:   str            = typer.Argument(..., help="Album ID or Qobuz URL"),
     output:      Optional[Path] = typer.Option(None,  "-o", "--output"),
     quality:     Optional[str]  = typer.Option(None,  "-q", "--quality"),
     lyrics:      Optional[bool] = typer.Option(None,  "--lyrics/--no-lyrics"),
@@ -562,7 +629,7 @@ def album(
         raise typer.Exit(code=1)
 
     release_type = (album_obj.release_type or "album").lower()
-    if release_type in ("single",):
+    if release_type == "single":
         tmpl = template or cfg.naming.single
     elif release_type == "ep":
         tmpl = template or cfg.naming.ep
@@ -584,7 +651,7 @@ def album(
     succeeded     = 0
     skipped       = 0
     failed        = 0
-    track_results: list[DownloadResult] = []   # ← accumulate all results here
+    track_results: list[DownloadResult] = []
 
     with Downloader(
         read_timeout=cfg.download.read_timeout,
@@ -592,6 +659,7 @@ def album(
         max_workers=n_workers,
         external_downloader=ext_dl,
         naming_template=tmpl,
+        dev=_dev,
     ) as dl:
         for i, track_summary in enumerate(album_obj.tracks.items, 1):
             console.print(f"  [{i}/{total}] {track_summary.title}")
@@ -640,9 +708,9 @@ def album(
                     failed += 1
                     continue
 
-            track_results.append(result)   # ← collect every result, skipped or not
+            track_results.append(result)
 
-            if result.skipped:
+            if result.skipped and not result.dev_stub:
                 if not _needs_tagging(result.path, check_cover=embed_cover):
                     console.print("    [yellow]Already complete, skipped.[/yellow]")
                     skipped += 1
@@ -660,8 +728,8 @@ def album(
             album_dir = dest_dir
             for r in track_results:
                 candidate = r.path.parent
-                # Multi-disc albums: track lives in Disc N/ subfolder,
-                # so go up one more level to reach the album root.
+                # Multi-disc: track lives in Disc N/ subfolder, go up one
+                # more level to reach the album root.
                 if album_obj.media_count and album_obj.media_count > 1:
                     candidate = candidate.parent
                 if candidate.is_dir():
@@ -747,6 +815,7 @@ def playlist(
         max_workers=n_workers,
         external_downloader=ext_dl,
         naming_template=tmpl,
+        dev=_dev,
     ) as dl:
         for i, pl_track in enumerate(pl.tracks.items, 1):
             console.print(f"  [{i}/{pl.tracks_count}] {pl_track.title}")
@@ -795,7 +864,7 @@ def playlist(
                         track=track_obj,
                         url_info=url_info,
                         dest_dir=dest_dir,
-                        album=None,         # playlist uses flat structure via template
+                        album=None,
                         on_progress=on_progress,
                         playlist_name=pl.name,
                         playlist_index=i,
@@ -805,7 +874,7 @@ def playlist(
                     failed += 1
                     continue
 
-            if result.skipped:
+            if result.skipped and not result.dev_stub:
                 if not _needs_tagging(result.path, check_cover=embed_cover):
                     console.print("    [yellow]Already complete, skipped.[/yellow]")
                     skipped += 1
@@ -833,10 +902,10 @@ def playlist(
 
 @app.command()
 def search(
-    query: str  = typer.Argument(..., help="Search query"),
-    type:  str  = typer.Option("tracks", "--type", "-t",
-                               help="tracks, albums, artists, playlists"),
-    limit: int  = typer.Option(10, "--limit", "-n"),
+    query:       str  = typer.Argument(..., help="Search query"),
+    type:        str  = typer.Option("tracks", "--type", "-t",
+                                     help="tracks, albums, artists, playlists"),
+    limit:       int  = typer.Option(10, "--limit", "-n"),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON"),
 ) -> None:
     """Search the Qobuz catalog."""
@@ -878,10 +947,10 @@ def search(
             table.add_row(str(item.get("id", "")), item.get("title", ""), artist, alb)
 
     elif type == "albums":
-        table.add_column("ID",     style="dim", no_wrap=True)
-        table.add_column("Title",  style="bold")
+        table.add_column("ID",    style="dim", no_wrap=True)
+        table.add_column("Title", style="bold")
         table.add_column("Artist")
-        table.add_column("Year",   style="dim")
+        table.add_column("Year",  style="dim")
         for item in items:
             artist = (item.get("artist") or {}).get("name", "")
             year   = (item.get("release_date_original") or "")[:4]

@@ -46,9 +46,11 @@ class QobuzClient:
         credentials: AppCredentials,
         token_pool: Optional[TokenPool] = None,
         http_client: Optional[httpx.Client] = None,
-    ) -> None:
+        dev: bool = False,
+        )-> None:
         self._credentials = credentials
         self._token_pool = token_pool
+        self._dev = dev
         self.session: Optional[AuthSession] = None
         self._http = http_client or httpx.Client(
             base_url=_BASE_URL,
@@ -64,6 +66,7 @@ class QobuzClient:
         app_id: str,
         app_secret: str,
         http_client: Optional[httpx.Client] = None,
+        dev: bool = False,
     ) -> QobuzClient:
         """
         Create a client from a bare App ID and App Secret.
@@ -72,6 +75,7 @@ class QobuzClient:
         return cls(
             credentials=AppCredentials(app_id=app_id, app_secret=app_secret),
             http_client=http_client,
+            dev=dev,
         )
 
     @classmethod
@@ -81,6 +85,7 @@ class QobuzClient:
         http_client: Optional[httpx.Client] = None,
         timeout: int = 10,
         validate: bool = True,
+        dev: bool = False,
     ) -> QobuzClient:
         """
         Create a client from a token pool file or URL.
@@ -95,6 +100,7 @@ class QobuzClient:
             credentials=pool.credentials,
             token_pool=pool,
             http_client=http_client,
+            dev=False,
         )
 
         if not validate:
@@ -102,6 +108,7 @@ class QobuzClient:
                 user_auth_token=pool.current_token,
                 user_id="unknown",
             )
+            instance._dev = dev
             return instance
 
         # Try each token. Albums reliably populate for any active
@@ -123,6 +130,7 @@ class QobuzClient:
                             pool.next_token()
                         except TokenPoolExhaustedError:
                             break
+                    instance._dev = dev
                     return instance
             except (TokenExpiredError, InvalidCredentialsError):
                 continue
@@ -136,6 +144,7 @@ class QobuzClient:
             user_auth_token=pool.current_token,
             user_id="unknown",
         )
+        instance._dev = dev
         return instance
 
     # ── Context manager support ────────────────────────────────────────────
@@ -289,10 +298,49 @@ class QobuzClient:
             all_params["user_auth_token"] = self.session.user_auth_token
             headers["X-User-Auth-Token"]  = self.session.user_auth_token
 
+        # ── Dev mode: cache check ──────────────────────────────────────────
+        if self._dev:
+            from .dev import load_cached, save_cached
+            try:
+                from rich.console import Console as _Console
+                _con = _Console(stderr=True)
+            except ImportError:
+                _con = None
+
+            cached = load_cached(method, endpoint, all_params)
+            if cached is not None:
+                if _con:
+                    _con.print(
+                        f"[dim][DEV] {method} {endpoint} "
+                        f"[green]CACHE HIT[/green][/dim]"
+                    )
+                return cached
+
+            if _con:
+                _con.print(
+                    f"[dim][DEV] {method} {endpoint} "
+                    f"params={[k for k in all_params if k != 'user_auth_token']} "
+                    f"→ fetching…[/dim]"
+                )
+
         response = self._http.request(
             method, endpoint, params=all_params, headers=headers,
         )
-        return self._handle_response(response)
+        body = self._handle_response(response)
+
+        # ── Dev mode: cache the fresh response ────────────────────────────
+        if self._dev:
+            save_cached(method, endpoint, all_params, body)
+            try:
+                from rich.console import Console as _Console
+                _Console(stderr=True).print(
+                    f"[dim][DEV] {method} {endpoint} "
+                    f"→ [cyan]HTTP {response.status_code}[/cyan] (cached)[/dim]"
+                )
+            except ImportError:
+                pass
+
+        return body
 
     def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
         try:

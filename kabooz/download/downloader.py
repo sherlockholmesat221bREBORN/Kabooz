@@ -35,6 +35,7 @@ class DownloadResult:
     total_bytes: int
     skipped: bool = False
     resumed: bool = False
+    dev_stub: bool = False
 
 
 @dataclass
@@ -107,6 +108,7 @@ class Downloader:
         max_workers: int = 1,
         external_downloader: str = "",
         naming_template: Optional[str] = None,
+        dev: bool = False,
     ) -> None:
         self._chunk_size         = chunk_size
         self._read_timeout       = read_timeout
@@ -114,6 +116,7 @@ class Downloader:
         self._max_workers        = max(1, max_workers)
         self._external_downloader = external_downloader.strip()
         self._naming_template    = naming_template
+        self._dev = dev
         # Shared client for HEAD requests and sequential downloads.
         # Each thread in the pool creates its own client.
         self._http = http_client or self._make_client()
@@ -345,6 +348,38 @@ class Downloader:
         path: Path,
         on_progress: Optional[Callable[[int, int], None]],
     ) -> DownloadResult:
+        # ── Dev mode: write a stub instead of streaming real audio ────────
+        if self._dev:
+            from .dev import DEV_STUB_BYTES, is_stub
+            try:
+                from rich.console import Console as _Console
+                _Console(stderr=True).print(
+                    f"[dim][DEV] stub → {path}[/dim]"
+                )
+            except ImportError:
+                pass
+
+            if path.exists() and is_stub(path):
+                if on_progress:
+                    on_progress(len(DEV_STUB_BYTES), len(DEV_STUB_BYTES))
+                return DownloadResult(
+                    path=path,
+                    bytes_written=0,
+                    total_bytes=len(DEV_STUB_BYTES),
+                    skipped=True,
+                    dev_stub=True,
+                )
+
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(DEV_STUB_BYTES)
+            if on_progress:
+                on_progress(len(DEV_STUB_BYTES), len(DEV_STUB_BYTES))
+            return DownloadResult(
+                path=path,
+                bytes_written=len(DEV_STUB_BYTES),
+                total_bytes=len(DEV_STUB_BYTES),
+                dev_stub=True,
+            )
         total         = self._head(url)
         existing_size = path.stat().st_size if path.exists() else 0
 
