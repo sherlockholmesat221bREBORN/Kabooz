@@ -35,6 +35,23 @@ class TokenPoolExhaustedError(AuthError):
     At this point there is nothing left to rotate to."""
     pass
 
+class PoolModeError(AuthError):
+    """
+    A write operation was attempted while the client is running in token
+    pool mode.
+
+    Write operations (adding/removing favourites, modifying the library)
+    affect the Qobuz account tied to the token. Pool tokens typically
+    belong to shared or scraped accounts — writing against them would
+    corrupt state that other users of the pool depend on.
+
+    If you need to perform write operations, authenticate with a personal
+    session instead:
+        client = QobuzClient.from_credentials(app_id=..., app_secret=...)
+        client.login(username=..., password=...)
+    """
+    pass
+
 
 # ── Credential / config errors ─────────────────────────────────────────────
 
@@ -62,8 +79,6 @@ class APIError(QobuzError):
     without having to parse the message string."""
 
     def __init__(self, message: str, status_code: int | None = None):
-        # Pass the message up to Exception so str(error) and repr(error)
-        # work normally — callers who just print the error get the message.
         super().__init__(message)
         self.status_code = status_code
 

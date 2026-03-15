@@ -46,25 +46,41 @@ from .exceptions import (
     NoAuthError,
     NotFoundError,
     NotStreamableError,
+    PoolModeError,
     TokenExpiredError,
-    ConfigError
+    ConfigError,
 )
+from .local.store import LocalStore
+from .local.playlist import (
+    LocalPlaylist, LocalPlaylistTrack,
+    load_playlist, save_playlist,
+    playlist_from_store_tracks,
+)
+from .local.export import backup_to_tar, export_favorites_toml
 from .models.track import Track
 from .models.album import Album
 from .quality import Quality
 from .url import parse_url
 
-# ── App ────────────────────────────────────────────────────────────────────
+# ── Apps ───────────────────────────────────────────────────────────────────
 
 app = typer.Typer(
     name="qobuz",
     help="Unofficial Qobuz CLI — download tracks, albums, playlists, and more.",
     add_completion=False,
 )
+
+library_app = typer.Typer(help="Manage local and remote favourites.")
+lpl_app     = typer.Typer(help="Create, manage, and share local playlists.")
+export_app  = typer.Typer(help="Export and back up your library.")
+
+app.add_typer(library_app, name="library")
+app.add_typer(lpl_app,     name="lpl")
+app.add_typer(export_app,  name="export")
+
 console     = Console()
 err_console = Console(stderr=True)
 
-# ── Dev mode flag (set by @app.callback before any command runs) ───────────
 _dev: bool = False
 
 
@@ -76,8 +92,7 @@ def main(
         envvar="QOBUZ_DEV",
         help=(
             "Developer mode: cache API responses to ~/.cache/qobuz/ and "
-            "write dev audio instead of downloading real files. "
-            "Saves bandwidth during testing."
+            "write dev audio instead of downloading real files."
         ),
         is_eager=True,
     ),
@@ -99,6 +114,11 @@ def main(
 
 def _cfg() -> QobuzConfig:
     return load_config()
+
+
+def _store(cfg: Optional[QobuzConfig] = None) -> LocalStore:
+    cfg = cfg or _cfg()
+    return LocalStore(cfg.local_data.db_path)
 
 
 def _build_client(cfg: Optional[QobuzConfig] = None) -> QobuzClient:
@@ -164,7 +184,6 @@ def _handle_auth_error(exc: Exception) -> None:
 # ── Metadata helpers ───────────────────────────────────────────────────────
 
 def _needs_tagging(path: Path, check_cover: bool = True) -> bool:
-    """Return True if the file is missing title/artist tags or cover art."""
     try:
         suffix = path.suffix.lower()
         if suffix == ".flac":
@@ -213,17 +232,6 @@ def _post_download(
     fetch_lyrics_flag: bool,
     save_cover_file: bool,
 ) -> None:
-    """
-    Tag, optionally fetch lyrics, optionally run MusicBrainz lookup.
-
-    For dev audio (real audio generated from the embedded Opus clip),
-    the full pipeline runs — tagging, lyrics, MusicBrainz — exactly as
-    it would for a real download.
-
-    For stub files (fallback when ffmpeg is unavailable), tagging is
-    skipped because mutagen can't parse fake bytes. Lyrics and
-    MusicBrainz still run since they don't touch the file.
-    """
     if not cfg.tagging.enabled:
         return
 
@@ -231,7 +239,6 @@ def _post_download(
     if fetch_lyrics_flag:
         lyrics_result = _fetch_lyrics_for(track_obj, album_obj)
 
-    # Tagging requires a valid audio file — skip only for stubs.
     if not result.dev_stub:
         tagger = Tagger()
         tagger.tag(
@@ -241,15 +248,11 @@ def _post_download(
             lyrics=lyrics_result,
             embed_cover=embed_cover,
         )
-
         if save_cover_file and album_obj and album_obj.image:
             _save_cover_file(result.path.parent, album_obj)
     else:
         from .dev import dev_log
-        dev_log(
-            "[yellow]stub file — tagging skipped "
-            "(install ffmpeg to get real dev audio)[/yellow]"
-        )
+        dev_log("[yellow]stub file — tagging skipped (install ffmpeg)[/yellow]")
 
     if cfg.musicbrainz.enabled and track_obj.isrc:
         if not result.dev_stub:
@@ -257,15 +260,26 @@ def _post_download(
             apply_mb_tags(result.path, mb)
         else:
             from .dev import dev_log
-            dev_log(
-                f"MusicBrainz lookup for isrc={track_obj.isrc!r} "
-                f"(tags not written — stub file)"
+            dev_log(f"MusicBrainz lookup isrc={track_obj.isrc!r} (tags not written — stub)")
+            lookup_isrc(track_obj.isrc)
+
+    # Log to local history.
+    if cfg.local_data.track_history and not result.dev_stub:
+        try:
+            store = _store(cfg)
+            store.log_play(
+                track_id=str(track_obj.id),
+                title=track_obj.display_title,
+                artist=track_obj.performer.name if track_obj.performer else "",
+                album=album_obj.title if album_obj else (
+                    track_obj.album.title if track_obj.album else ""
+                ),
             )
-            lookup_isrc(track_obj.isrc)   # run the lookup for verbosity, discard result
+        except Exception:
+            pass
 
 
 def _save_cover_file(folder: Path, album: Album) -> None:
-    """Download cover art as cover.jpg into the given folder."""
     url = None
     if album.image:
         url = album.image.large or album.image.small
@@ -314,7 +328,7 @@ def _resolve_id(url_or_id: str, expected_type: Optional[str] = None) -> str:
     return url_or_id
 
 
-# ── Commands ───────────────────────────────────────────────────────────────
+# ── Core commands ──────────────────────────────────────────────────────────
 
 @app.command()
 def login(
@@ -399,6 +413,25 @@ def login(
         err_console.print(f"[red]Could not save session:[/red] {exc}")
         raise typer.Exit(code=1)
 
+    # Auto-sync favorites to local store if enabled.
+    if cfg.local_data.auto_sync_favorites:
+        console.print("[dim]Syncing favorites to local store…[/dim]")
+        try:
+            store = _store(cfg)
+            fav = client.get_user_favorites()
+            for t, page in [
+                ("track",  fav.tracks),
+                ("album",  fav.albums),
+                ("artist", fav.artists),
+            ]:
+                if page and page.items:
+                    import dataclasses
+                    raw_items = [dataclasses.asdict(i) for i in page.items]
+                    n = store.sync_favorites_from_api(raw_items, t)
+                    console.print(f"  [dim]{n} {t}(s) synced[/dim]")
+        except Exception as exc:
+            err_console.print(f"[yellow]Auto-sync failed:[/yellow] {exc}")
+
     console.print(
         f"[green]Logged in as[/green] {session.user_email or session.user_id}. "
         f"Session saved to [bold]{_SESSION_PATH}[/bold]."
@@ -410,7 +443,7 @@ def config(
     show: bool = typer.Option(False, "--show", help="Print current config"),
     set_: Optional[str] = typer.Option(
         None, "--set",
-        help="Set a config value. Format: section.key=value  e.g. download.max_workers=4"
+        help="Set a config value. Format: section.key=value"
     ),
 ) -> None:
     """
@@ -420,10 +453,9 @@ def config(
     Examples:
         qobuz config --show
         qobuz config --set download.max_workers=4
-        qobuz config --set download.external_downloader="aria2c -x 16 -s 16 -d {dir} -o {filename} {url}"
-        qobuz config --set naming.album="{albumartist}/{album} [{quality}]/{track:02d}. {title}"
-        qobuz config --set tagging.save_cover_file=true
-        qobuz config --set musicbrainz.enabled=true
+        qobuz config --set local_data.track_history=true
+        qobuz config --set local_data.auto_sync_favorites=true
+        qobuz config --set local_data.data_dir=/sdcard/qobuz-data
     """
     if show:
         cfg = _cfg()
@@ -475,14 +507,7 @@ def dev_cache(
     clear: bool = typer.Option(False, "--clear", help="Delete all cached API responses"),
     show:  bool = typer.Option(False, "--show",  help="Print cache directory and stats"),
 ) -> None:
-    """
-    Manage the dev mode API response cache.
-
-    \b
-    Examples:
-        qobuz dev-cache --show
-        qobuz dev-cache --clear
-    """
+    """Manage the dev mode API response cache."""
     from .dev import CACHE_DIR, clear_cache
 
     if clear:
@@ -508,12 +533,9 @@ def track(
     save_cover:  Optional[bool] = typer.Option(None,  "--save-cover/--no-save-cover"),
     workers:     Optional[int]  = typer.Option(None,  "--workers", "-j"),
     downloader:  Optional[str]  = typer.Option(None,  "--downloader"),
-    template:    Optional[str]  = typer.Option(None,  "--template", help="Naming template override"),
+    template:    Optional[str]  = typer.Option(None,  "--template"),
 ) -> None:
-    """
-    Download a single track. Treated as a standalone single — no album
-    subfolder regardless of what album it belongs to on Qobuz.
-    """
+    """Download a single track."""
     cfg = _cfg()
 
     dest_dir    = output      or Path(cfg.download.output_dir)
@@ -556,7 +578,6 @@ def track(
         raise typer.Exit(code=1)
 
     console.print(f"[cyan]Downloading[/cyan] {track_obj.display_title}")
-
     tmpl = template or cfg.naming.single
 
     with _make_progress() as progress:
@@ -600,7 +621,7 @@ def album(
     lyrics:      Optional[bool] = typer.Option(None,  "--lyrics/--no-lyrics"),
     cover:       Optional[bool] = typer.Option(None,  "--cover/--no-cover"),
     save_cover:  Optional[bool] = typer.Option(None,  "--save-cover/--no-save-cover"),
-    goodies:     Optional[bool] = typer.Option(None,  "--goodies/--no-goodies", help="Download bonus files"),
+    goodies:     Optional[bool] = typer.Option(None,  "--goodies/--no-goodies"),
     workers:     Optional[int]  = typer.Option(None,  "--workers", "-j"),
     downloader:  Optional[str]  = typer.Option(None,  "--downloader"),
     template:    Optional[str]  = typer.Option(None,  "--template"),
@@ -653,13 +674,12 @@ def album(
 
     artist_name = album_obj.artist.name if album_obj.artist else "Unknown Artist"
     console.print(
-        f"[cyan]Downloading album:[/cyan] {album_obj.title} "
+        f"[cyan]Downloading album:[/cyan] {album_obj.display_title} "
         f"by {artist_name} ({album_obj.tracks.total} tracks)"
     )
     if album_obj.goodies and do_goodies:
         console.print(f"  [dim]+{len(album_obj.goodies)} goodie(s)[/dim]")
 
-    tagger        = Tagger()
     total         = album_obj.tracks.total
     succeeded     = 0
     skipped       = 0
@@ -701,7 +721,7 @@ def album(
 
             with _make_progress() as progress:
                 task = progress.add_task(track_obj.title, total=None)
-                
+
                 def on_progress(
                     done: int, total_bytes: int,
                     _task=task, _progress=progress,
@@ -733,7 +753,6 @@ def album(
             _post_download(result, track_obj, album_obj, cfg, embed_cover, do_lyrics, save_cov)
             succeeded += 1
 
-        # ── Goodies ───────────────────────────────────────────────────────
         if do_goodies and album_obj.goodies:
             album_dir = dest_dir
             for r in track_results:
@@ -743,7 +762,6 @@ def album(
                 if candidate.is_dir():
                     album_dir = candidate
                     break
-
             console.print(f"  [dim]Downloading {len(album_obj.goodies)} goodie(s)…[/dim]")
             for goodie in album_obj.goodies:
                 gr = dl.download_goodie(goodie, album_dir)
@@ -770,7 +788,7 @@ def playlist(
     workers:    Optional[int]  = typer.Option(None, "--workers", "-j"),
     downloader: Optional[str]  = typer.Option(None, "--downloader"),
     template:   Optional[str]  = typer.Option(None, "--template"),
-    m3u:        bool           = typer.Option(False, "--m3u", help="Write an .m3u8 playlist file"),
+    m3u:        bool           = typer.Option(False, "--m3u"),
 ) -> None:
     """Download a full playlist by ID or URL."""
     cfg = _cfg()
@@ -859,7 +877,7 @@ def playlist(
 
             with _make_progress() as progress:
                 task = progress.add_task(track_obj.title, total=None)
-                
+
                 def on_progress(
                     done: int, total_bytes: int,
                     _task=task, _progress=progress,
@@ -912,7 +930,7 @@ def search(
     type:        str  = typer.Option("tracks", "--type", "-t",
                                      help="tracks, albums, artists, playlists"),
     limit:       int  = typer.Option(10, "--limit", "-n"),
-    json_output: bool = typer.Option(False, "--json", help="Output raw JSON"),
+    json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Search the Qobuz catalog."""
     valid_types = {"tracks", "albums", "artists", "playlists"}
@@ -951,7 +969,6 @@ def search(
             artist = (item.get("performer") or {}).get("name", "")
             alb    = (item.get("album") or {}).get("title", "")
             table.add_row(str(item.get("id", "")), item.get("title", ""), artist, alb)
-
     elif type == "albums":
         table.add_column("ID",    style="dim", no_wrap=True)
         table.add_column("Title", style="bold")
@@ -961,14 +978,12 @@ def search(
             artist = (item.get("artist") or {}).get("name", "")
             year   = (item.get("release_date_original") or "")[:4]
             table.add_row(str(item.get("id", "")), item.get("title", ""), artist, year)
-
     elif type == "artists":
         table.add_column("ID",     style="dim", no_wrap=True)
         table.add_column("Name",   style="bold")
         table.add_column("Albums", style="dim")
         for item in items:
             table.add_row(str(item.get("id", "")), item.get("name", ""), str(item.get("albums_count", "")))
-
     elif type == "playlists":
         table.add_column("ID",     style="dim", no_wrap=True)
         table.add_column("Name",   style="bold")
@@ -979,6 +994,689 @@ def search(
             table.add_row(str(item.get("id", "")), item.get("name", ""), str(item.get("tracks_count", "")), owner)
 
     console.print(table)
+
+
+# ── library subcommands ────────────────────────────────────────────────────
+
+@library_app.command("show")
+def library_show(
+    type: str = typer.Option("all", "--type", "-t",
+                             help="track, album, artist, or all"),
+    limit: int = typer.Option(50, "--limit", "-n"),
+) -> None:
+    """Show local favorites."""
+    cfg   = _cfg()
+    store = _store(cfg)
+
+    types = ["track", "album", "artist"] if type == "all" else [type]
+    for t in types:
+        items = store.get_favorites(t, limit=limit)
+        if not items:
+            continue
+        table = Table(title=f"Favorite {t}s ({len(items)})", show_lines=False)
+        table.add_column("ID",     style="dim", no_wrap=True)
+        table.add_column("Title",  style="bold")
+        table.add_column("Artist")
+        if t == "track":
+            table.add_column("Album", style="dim")
+        for item in items:
+            row = [item.get("id", ""), item.get("title", ""), item.get("artist", "")]
+            if t == "track":
+                row.append(item.get("extra", ""))
+            table.add_row(*row)
+        console.print(table)
+
+
+@library_app.command("add")
+def library_add(
+    url_or_id: str = typer.Argument(..., help="Track/album/artist ID or Qobuz URL"),
+    type: str = typer.Option("track", "--type", "-t", help="track, album, or artist"),
+    remote: bool = typer.Option(False, "--remote/--local-only",
+                                help="Also add to Qobuz account (personal session only)"),
+) -> None:
+    """
+    Add a track, album, or artist to local favorites.
+
+    Works in all modes including token pool. Use --remote to also
+    add to your Qobuz account (requires a personal session, not a pool).
+    """
+    cfg      = _cfg()
+    store    = _store(cfg)
+    item_id  = _resolve_id(url_or_id, expected_type=type if url_or_id.startswith("http") else None)
+    client   = _build_client(cfg)
+
+    # Fetch metadata so we can store a useful display name.
+    title = artist = extra = ""
+    try:
+        if type == "track":
+            obj    = client.get_track(item_id)
+            title  = obj.display_title
+            artist = obj.performer.name if obj.performer else ""
+            extra  = obj.album.title if obj.album else ""
+        elif type == "album":
+            obj    = client.get_album(item_id)
+            title  = obj.display_title
+            artist = obj.artist.name if obj.artist else ""
+            extra  = obj.genre.name if obj.genre else ""
+        elif type == "artist":
+            obj    = client.get_artist(item_id, extras="")
+            title  = obj.name
+    except Exception as exc:
+        err_console.print(f"[yellow]Could not fetch metadata: {exc} — storing ID only.[/yellow]")
+
+    store.add_favorite(item_id, type, title=title, artist=artist, extra=extra)
+    console.print(f"[green]Added[/green] {type}: {title or item_id}")
+
+    if remote:
+        try:
+            kwargs: dict = {}
+            if type == "track":
+                kwargs = {"track_ids": [item_id]}
+            elif type == "album":
+                kwargs = {"album_ids": [item_id]}
+            elif type == "artist":
+                kwargs = {"artist_ids": [item_id]}
+            client.add_favorite(**kwargs)
+            console.print(f"  [dim]Also added to Qobuz account.[/dim]")
+        except PoolModeError:
+            err_console.print(
+                "  [yellow]--remote is not available in pool mode.[/yellow]"
+            )
+        except Exception as exc:
+            err_console.print(f"  [yellow]Remote add failed: {exc}[/yellow]")
+
+
+@library_app.command("remove")
+def library_remove(
+    url_or_id: str = typer.Argument(..., help="Track/album/artist ID or Qobuz URL"),
+    type: str = typer.Option("track", "--type", "-t"),
+    remote: bool = typer.Option(False, "--remote/--local-only"),
+) -> None:
+    """Remove a track, album, or artist from local favorites."""
+    cfg     = _cfg()
+    store   = _store(cfg)
+    item_id = _resolve_id(url_or_id)
+
+    removed = store.remove_favorite(item_id, type)
+    if removed:
+        console.print(f"[green]Removed[/green] {type} {item_id} from local favorites.")
+    else:
+        console.print(f"[yellow]{type} {item_id} was not in local favorites.[/yellow]")
+
+    if remote:
+        client = _build_client(cfg)
+        try:
+            kwargs: dict = {}
+            if type == "track":
+                kwargs = {"track_ids": [item_id]}
+            elif type == "album":
+                kwargs = {"album_ids": [item_id]}
+            elif type == "artist":
+                kwargs = {"artist_ids": [item_id]}
+            client.remove_favorite(**kwargs)
+            console.print(f"  [dim]Also removed from Qobuz account.[/dim]")
+        except PoolModeError:
+            err_console.print("  [yellow]--remote is not available in pool mode.[/yellow]")
+        except Exception as exc:
+            err_console.print(f"  [yellow]Remote remove failed: {exc}[/yellow]")
+
+
+@library_app.command("sync")
+def library_sync(
+    type: str  = typer.Option("all", "--type", "-t", help="track, album, artist, or all"),
+    clear: bool = typer.Option(False, "--clear", help="Clear local favorites before syncing"),
+) -> None:
+    """
+    Sync favorites from your Qobuz account into the local store.
+
+    Requires a personal session (not available in pool mode).
+    """
+    cfg    = _cfg()
+    client = _build_client(cfg)
+    store  = _store(cfg)
+
+    if client.is_pool_mode:
+        err_console.print(
+            "[red]sync is not available in pool mode.[/red]\n"
+            "Pool mode clients don't have a personal account to sync from."
+        )
+        raise typer.Exit(code=1)
+
+    types = ["track", "album", "artist"] if type == "all" else [type]
+
+    try:
+        fav = client.get_user_favorites()
+    except Exception as exc:
+        err_console.print(f"[red]Failed to fetch favorites: {exc}[/red]")
+        raise typer.Exit(code=1)
+
+    import dataclasses
+    for t in types:
+        page = getattr(fav, f"{t}s" if not t.endswith("s") else t, None)
+        # UserFavorites has .tracks, .albums, .artists
+        page = getattr(fav, {"track": "tracks", "album": "albums", "artist": "artists"}[t], None)
+        if not page or not page.items:
+            console.print(f"  [dim]No {t} favorites found on account.[/dim]")
+            continue
+        raw = [dataclasses.asdict(i) for i in page.items]
+        n = store.sync_favorites_from_api(raw, t, clear_first=clear)
+        console.print(f"[green]Synced[/green] {n} {t}(s) → local store.")
+
+
+@library_app.command("history")
+def library_history(
+    limit: int  = typer.Option(20, "--limit", "-n"),
+    clear: bool = typer.Option(False, "--clear", help="Clear all history"),
+) -> None:
+    """Show or clear the local download/play history."""
+    cfg   = _cfg()
+    store = _store(cfg)
+
+    if clear:
+        n = store.clear_history()
+        console.print(f"[green]Cleared {n} history entries.[/green]")
+        return
+
+    rows = store.get_history(limit=limit)
+    if not rows:
+        console.print("[dim]No history yet.[/dim]")
+        return
+
+    table = Table(title=f"Recent history (last {limit})", show_lines=False)
+    table.add_column("Time",   style="dim", no_wrap=True)
+    table.add_column("Title",  style="bold")
+    table.add_column("Artist")
+    table.add_column("Album",  style="dim")
+    for row in rows:
+        table.add_row(
+            row.get("played_at", "")[:16],
+            row.get("title", ""),
+            row.get("artist", ""),
+            row.get("album", ""),
+        )
+    console.print(table)
+
+
+# ── lpl (local playlist) subcommands ──────────────────────────────────────
+
+@lpl_app.command("list")
+def lpl_list() -> None:
+    """List all local playlists."""
+    store = _store()
+    pls   = store.list_playlists()
+    if not pls:
+        console.print("[dim]No local playlists yet. Use [bold]qobuz lpl create[/bold] to make one.[/dim]")
+        return
+    table = Table(title="Local playlists", show_lines=False)
+    table.add_column("ID",     style="dim", no_wrap=True, max_width=10)
+    table.add_column("Name",   style="bold")
+    table.add_column("Tracks", style="dim")
+    table.add_column("Updated", style="dim")
+    for pl in pls:
+        table.add_row(
+            pl["id"][:8],
+            pl["name"],
+            str(pl.get("track_count", 0)),
+            pl.get("updated_at", "")[:10],
+        )
+    console.print(table)
+
+
+@lpl_app.command("create")
+def lpl_create(
+    name:        str = typer.Argument(..., help="Playlist name"),
+    description: str = typer.Option("", "--desc", "-d"),
+) -> None:
+    """Create a new local playlist."""
+    store = _store()
+    pl_id = store.create_playlist(name, description)
+    console.print(f"[green]Created[/green] playlist [bold]{name}[/bold] (id: {pl_id[:8]})")
+
+@lpl_app.command("clone")
+def lpl_clone(
+    url_or_id: str = typer.Argument(..., help="Qobuz playlist ID or URL"),
+    name: Optional[str] = typer.Option(None, "--name", "-n",
+                                       help="Override playlist name"),
+) -> None:
+    """
+    Clone a Qobuz playlist into the local store by ID or URL.
+
+    Fetches all tracks from the playlist and saves them locally.
+    Works in all modes including token pool.
+
+    \b
+    Examples:
+        qobuz lpl clone 12345678
+        qobuz lpl clone https://open.qobuz.com/playlist/12345678
+        qobuz lpl clone 12345678 --name "My Copy"
+    """
+    cfg         = _cfg()
+    store       = _store(cfg)
+    client      = _build_client(cfg)
+    playlist_id = _resolve_id(url_or_id, expected_type="playlist")
+
+    try:
+        pl = client.get_playlist(playlist_id)
+    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+        _handle_auth_error(exc)
+    except NotFoundError:
+        err_console.print(f"[red]Playlist not found:[/red] {playlist_id}")
+        raise typer.Exit(code=1)
+    except APIError as exc:
+        err_console.print(f"[red]API error:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if not pl.tracks or not pl.tracks.items:
+        err_console.print("[red]Playlist is empty.[/red]")
+        raise typer.Exit(code=1)
+
+    local_name = name or pl.name
+    # Avoid name collision.
+    if store.get_playlist_by_name(local_name):
+        local_name = f"{local_name} (cloned)"
+
+    local_id = store.create_playlist(local_name, pl.description or "")
+    console.print(
+        f"[cyan]Cloning[/cyan] [bold]{pl.name}[/bold] "
+        f"({pl.tracks_count} tracks) → local playlist [bold]{local_name}[/bold]"
+    )
+
+    added = 0
+    for i, t in enumerate(pl.tracks.items):
+        store.add_track_to_playlist(
+            local_id,
+            str(t.id),
+            title=t.title,
+            artist=t.performer.name if t.performer else "",
+            album=t.album.title if t.album else "",
+            duration=t.duration or 0,
+            isrc=getattr(t, "isrc", "") or "",
+            position=i,
+        )
+        added += 1
+
+    console.print(f"[green]Done.[/green] {added} tracks saved locally.")
+    console.print(
+        f"  Download with: [bold]qobuz lpl download {local_name!r}[/bold]"
+    )
+
+@lpl_app.command("show")
+def lpl_show(name: str = typer.Argument(..., help="Playlist name or ID prefix")) -> None:
+    """Show tracks in a local playlist."""
+    store = _store()
+    pl    = store.get_playlist_by_name(name)
+    if not pl:
+        # Try by ID prefix
+        for candidate in store.list_playlists():
+            if candidate["id"].startswith(name):
+                pl = candidate
+                break
+    if not pl:
+        err_console.print(f"[red]Playlist not found:[/red] {name}")
+        raise typer.Exit(code=1)
+
+    tracks = store.get_playlist_tracks(pl["id"])
+    console.print(f"[bold]{pl['name']}[/bold]  [dim]{pl.get('description','')}[/dim]")
+    console.print(f"[dim]{len(tracks)} track(s)[/dim]")
+    if not tracks:
+        return
+    table = Table(show_lines=False, show_header=True)
+    table.add_column("#",      style="dim", width=4)
+    table.add_column("ID",     style="dim", no_wrap=True)
+    table.add_column("Title",  style="bold")
+    table.add_column("Artist")
+    table.add_column("Album",  style="dim")
+    for t in tracks:
+        table.add_row(
+            str(t["position"] + 1),
+            str(t["track_id"]),
+            t.get("title", ""),
+            t.get("artist", ""),
+            t.get("album", ""),
+        )
+    console.print(table)
+
+
+@lpl_app.command("add")
+def lpl_add(
+    playlist: str = typer.Argument(..., help="Playlist name or ID prefix"),
+    track:    str = typer.Argument(..., help="Track ID or Qobuz URL"),
+) -> None:
+    """Add a track to a local playlist (fetches metadata from Qobuz)."""
+    cfg      = _cfg()
+    store    = _store(cfg)
+    track_id = _resolve_id(track, expected_type="track")
+
+    pl = store.get_playlist_by_name(playlist)
+    if not pl:
+        for candidate in store.list_playlists():
+            if candidate["id"].startswith(playlist):
+                pl = candidate
+                break
+    if not pl:
+        err_console.print(f"[red]Playlist not found:[/red] {playlist}")
+        raise typer.Exit(code=1)
+
+    title = artist = album = ""
+    duration = 0
+    isrc = ""
+    try:
+        client    = _build_client(cfg)
+        track_obj = client.get_track(track_id)
+        title     = track_obj.display_title
+        artist    = track_obj.performer.name if track_obj.performer else ""
+        album     = track_obj.album.title if track_obj.album else ""
+        duration  = track_obj.duration or 0
+        isrc      = track_obj.isrc or ""
+    except Exception as exc:
+        err_console.print(f"[yellow]Could not fetch metadata: {exc}[/yellow]")
+
+    store.add_track_to_playlist(
+        pl["id"], track_id,
+        title=title, artist=artist, album=album,
+        duration=duration, isrc=isrc,
+    )
+    console.print(f"[green]Added[/green] {title or track_id} → [bold]{pl['name']}[/bold]")
+
+
+@lpl_app.command("remove")
+def lpl_remove(
+    playlist: str = typer.Argument(..., help="Playlist name or ID prefix"),
+    track:    str = typer.Argument(..., help="Track ID"),
+) -> None:
+    """Remove a track from a local playlist."""
+    store = _store()
+    pl    = store.get_playlist_by_name(playlist) or next(
+        (c for c in store.list_playlists() if c["id"].startswith(playlist)), None
+    )
+    if not pl:
+        err_console.print(f"[red]Playlist not found:[/red] {playlist}")
+        raise typer.Exit(code=1)
+    removed = store.remove_track_from_playlist(pl["id"], track)
+    if removed:
+        console.print(f"[green]Removed[/green] track {track} from [bold]{pl['name']}[/bold].")
+    else:
+        console.print(f"[yellow]Track {track} was not in that playlist.[/yellow]")
+
+
+@lpl_app.command("delete")
+def lpl_delete(
+    name:    str  = typer.Argument(..., help="Playlist name or ID prefix"),
+    confirm: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+) -> None:
+    """Delete a local playlist."""
+    store = _store()
+    pl    = store.get_playlist_by_name(name) or next(
+        (c for c in store.list_playlists() if c["id"].startswith(name)), None
+    )
+    if not pl:
+        err_console.print(f"[red]Playlist not found:[/red] {name}")
+        raise typer.Exit(code=1)
+    if not confirm:
+        typer.confirm(f"Delete playlist '{pl['name']}'?", abort=True)
+    store.delete_playlist(pl["id"])
+    console.print(f"[green]Deleted[/green] playlist [bold]{pl['name']}[/bold].")
+
+
+@lpl_app.command("download")
+def lpl_download(
+    name:       str            = typer.Argument(..., help="Playlist name or ID prefix"),
+    output:     Optional[Path] = typer.Option(None, "-o", "--output"),
+    quality:    Optional[str]  = typer.Option(None, "-q", "--quality"),
+    workers:    Optional[int]  = typer.Option(None, "--workers", "-j"),
+    template:   Optional[str]  = typer.Option(None, "--template"),
+) -> None:
+    """Download all tracks in a local playlist."""
+    cfg   = _cfg()
+    store = _store(cfg)
+
+    pl = store.get_playlist_by_name(name) or next(
+        (c for c in store.list_playlists() if c["id"].startswith(name)), None
+    )
+    if not pl:
+        err_console.print(f"[red]Playlist not found:[/red] {name}")
+        raise typer.Exit(code=1)
+
+    tracks = store.get_playlist_tracks(pl["id"])
+    if not tracks:
+        err_console.print("[red]Playlist is empty.[/red]")
+        raise typer.Exit(code=1)
+
+    dest_dir  = output    or Path(cfg.download.output_dir)
+    q_str     = quality   or cfg.download.quality
+    n_workers = workers   or cfg.download.max_workers
+    tmpl      = template  or cfg.naming.playlist
+
+    try:
+        q = Quality[q_str.upper()]
+    except KeyError:
+        err_console.print(f"[red]Unknown quality:[/red] {q_str}")
+        raise typer.Exit(code=1)
+
+    client = _build_client(cfg)
+    console.print(f"[cyan]Downloading local playlist:[/cyan] {pl['name']} ({len(tracks)} tracks)")
+
+    succeeded = skipped = failed = 0
+
+    with Downloader(
+        read_timeout=cfg.download.read_timeout,
+        connect_timeout=cfg.download.connect_timeout,
+        max_workers=n_workers,
+        naming_template=tmpl,
+        dev=_dev,
+    ) as dl:
+        for i, t in enumerate(tracks, 1):
+            track_id = t["track_id"]
+            console.print(f"  [{i}/{len(tracks)}] {t.get('title', track_id)}")
+
+            try:
+                track_obj = client.get_track(track_id)
+                url_info  = client.get_track_url(track_id, quality=q)
+            except Exception as exc:
+                err_console.print(f"    [red]{exc}[/red]")
+                failed += 1
+                continue
+
+            try:
+                result = dl.download_track(
+                    track=track_obj, url_info=url_info,
+                    dest_dir=dest_dir, album=None,
+                    playlist_name=pl["name"], playlist_index=i,
+                )
+            except Exception as exc:
+                err_console.print(f"    [red]Download failed: {exc}[/red]")
+                failed += 1
+                continue
+
+            if result.skipped and not result.dev_stub:
+                skipped += 1
+                continue
+
+            _post_download(
+                result, track_obj, None, cfg,
+                cfg.tagging.embed_cover,
+                cfg.tagging.fetch_lyrics,
+                cfg.tagging.save_cover_file,
+            )
+            succeeded += 1
+
+    console.print(
+        f"\n[green]Done.[/green] "
+        f"{succeeded} downloaded, {skipped} skipped, {failed} failed."
+    )
+
+
+@lpl_app.command("share")
+def lpl_share(
+    name:   str            = typer.Argument(..., help="Playlist name or ID prefix"),
+    output: Optional[Path] = typer.Option(None, "-o", "--output",
+                                          help="Output path (default: <name>.toml in playlists dir)"),
+    author: str            = typer.Option("", "--author", "-a"),
+) -> None:
+    """
+    Export a local playlist as a shareable TOML file.
+
+    The exported file contains track IDs and display metadata.
+    Anyone with qobuz-py can import it with [bold]qobuz lpl import[/bold].
+    """
+    cfg   = _cfg()
+    store = _store(cfg)
+
+    pl = store.get_playlist_by_name(name) or next(
+        (c for c in store.list_playlists() if c["id"].startswith(name)), None
+    )
+    if not pl:
+        err_console.print(f"[red]Playlist not found:[/red] {name}")
+        raise typer.Exit(code=1)
+
+    tracks = store.get_playlist_tracks(pl["id"])
+    lpl = playlist_from_store_tracks(
+        name=pl["name"],
+        tracks=tracks,
+        description=pl.get("description", ""),
+        author=author,
+    )
+
+    if output is None:
+        cfg.local_data.playlists_dir.mkdir(parents=True, exist_ok=True)
+        safe = sanitize(pl["name"])
+        output = cfg.local_data.playlists_dir / f"{safe}.toml"
+
+    save_playlist(lpl, output)
+    console.print(f"[green]Exported[/green] [bold]{pl['name']}[/bold] → {output}")
+    console.print(f"  [dim]{lpl.track_count} tracks — share this file with anyone using qobuz-py[/dim]")
+
+
+@lpl_app.command("import")
+def lpl_import(
+    file: Path = typer.Argument(..., help="Path to a .toml playlist file"),
+) -> None:
+    """
+    Import a shared TOML playlist file into the local store.
+
+    Works offline — no Qobuz account needed to import.
+    Track IDs can be used to download later with [bold]qobuz lpl download[/bold].
+    """
+    if not file.exists():
+        err_console.print(f"[red]File not found:[/red] {file}")
+        raise typer.Exit(code=1)
+
+    try:
+        lpl = load_playlist(file)
+    except (ValueError, Exception) as exc:
+        err_console.print(f"[red]Failed to parse playlist:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    store = _store()
+
+    # Check for name conflict.
+    existing = store.get_playlist_by_name(lpl.name)
+    if existing:
+        new_name = f"{lpl.name} (imported)"
+        console.print(f"[yellow]Name conflict — importing as '{new_name}'[/yellow]")
+        lpl.name = new_name
+
+    pl_id = store.create_playlist(lpl.name, lpl.description)
+    for i, t in enumerate(lpl.tracks):
+        store.add_track_to_playlist(
+            pl_id, t.id,
+            title=t.title, artist=t.artist, album=t.album,
+            duration=t.duration, isrc=t.isrc,
+            position=i,
+        )
+
+    console.print(
+        f"[green]Imported[/green] [bold]{lpl.name}[/bold] "
+        f"({len(lpl.tracks)} tracks)"
+    )
+    if lpl.author:
+        console.print(f"  [dim]Author: {lpl.author}[/dim]")
+
+
+# ── export subcommands ─────────────────────────────────────────────────────
+
+@export_app.command("backup")
+def export_backup(
+    output: Optional[Path] = typer.Option(
+        None, "-o", "--output",
+        help="Output .tar.gz path (default: exports/qobuz-backup-{date}.tar.gz)",
+    ),
+) -> None:
+    """
+    Create a full backup of your local library as a .tar.gz archive.
+
+    Archive contains:
+      - library.db (SQLite database)
+      - config.toml (with credentials stripped)
+      - playlists/*.toml
+      - favorites/tracks.json, albums.json, artists.json
+      - manifest.json
+
+    Restore by extracting the archive and replacing library.db.
+    """
+    cfg   = _cfg()
+    store = _store(cfg)
+
+    if output is None:
+        cfg.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime, timezone
+        date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        output = cfg.local_data.exports_dir / f"qobuz-backup-{date}.tar.gz"
+
+    console.print(f"[cyan]Creating backup…[/cyan]")
+    try:
+        path = backup_to_tar(
+            store=store,
+            config_path=_CONFIG_PATH,
+            playlists_dir=cfg.local_data.playlists_dir,
+            output_path=output,
+        )
+    except Exception as exc:
+        err_console.print(f"[red]Backup failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    size_kb = path.stat().st_size / 1024
+    console.print(f"[green]Backup saved:[/green] {path}  [dim]({size_kb:.1f} KB)[/dim]")
+
+
+@export_app.command("favorites")
+def export_favorites(
+    output: Optional[Path] = typer.Option(
+        None, "-o", "--output",
+        help="Output .toml path (default: exports/favorites-{date}.toml)",
+    ),
+    type: str = typer.Option("all", "--type", "-t",
+                             help="track, album, artist, or all"),
+) -> None:
+    """Export local favorites to a human-readable TOML file."""
+    cfg   = _cfg()
+    store = _store(cfg)
+
+    if output is None:
+        cfg.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime, timezone
+        date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        output = cfg.local_data.exports_dir / f"favorites-{date}.toml"
+
+    t = None if type == "all" else type
+    try:
+        path = export_favorites_toml(store, output, type=t)
+    except Exception as exc:
+        err_console.print(f"[red]Export failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]Favorites exported:[/green] {path}")
+
+
+@export_app.command("playlist")
+def export_playlist(
+    name:   str            = typer.Argument(..., help="Playlist name or ID prefix"),
+    output: Optional[Path] = typer.Option(None, "-o", "--output"),
+    author: str            = typer.Option("", "--author", "-a"),
+) -> None:
+    """Export a local playlist to a shareable TOML file (alias for lpl share)."""
+    # Delegate to lpl_share for consistent behaviour.
+    lpl_share(name=name, output=output, author=author)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────

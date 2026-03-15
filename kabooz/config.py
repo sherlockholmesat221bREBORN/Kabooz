@@ -21,7 +21,6 @@ _SESSION_PATH = _CONFIG_DIR / "session.json"
 class CredentialsConfig:
     app_id:     str = ""
     app_secret: str = ""
-    # Path or URL to a token pool file. Empty = not using a pool.
     pool:       str = ""
 
 
@@ -29,12 +28,7 @@ class CredentialsConfig:
 class DownloadConfig:
     output_dir:          str   = "."
     quality:             str   = "hi_res"
-    # 1 = sequential. Higher values parallelise track downloads within an
-    # album or playlist. Be conservative — Qobuz rate-limits aggressively.
     max_workers:         int   = 1
-    # Shell command template for an external downloader. Leave empty to use
-    # the built-in httpx downloader. Placeholders: {url}, {output}.
-    # Example: "aria2c -x 16 -s 16 -o {output} {url}"
     external_downloader: str   = ""
     read_timeout:        float = 300.0
     connect_timeout:     float = 10.0
@@ -44,38 +38,12 @@ class DownloadConfig:
 class TaggingConfig:
     enabled:         bool = True
     embed_cover:     bool = True
-    # Save a separate cover.jpg in the album folder.
     save_cover_file: bool = False
     fetch_lyrics:    bool = False
 
 
 @dataclass
 class NamingConfig:
-    # Templates are relative paths from the output directory.
-    # A "/" in the template creates a subdirectory.
-    #
-    # Available placeholders for all templates:
-    #   {title}         track title
-    #   {artist}        primary track artist
-    #   {track}         track number  (supports format specs, e.g. {track:02d})
-    #   {disc}          disc number
-    #   {isrc}          ISRC code
-    #   {bit_depth}     audio bit depth
-    #   {sampling_rate} sampling rate (float)
-    #   {quality}       formatted quality tag, e.g. "FLAC 24bit 96kHz"
-    #
-    # Additional placeholders when album context is available:
-    #   {album}         album title
-    #   {albumartist}   album-level artist
-    #   {year}          4-digit release year
-    #   {label}         record label name
-    #   {genre}         primary genre
-    #   {upc}           album UPC
-    #
-    # Additional placeholders for playlists:
-    #   {playlist}      playlist name
-    #   {index}         position in playlist (supports format specs)
-
     album:       str = "{albumartist}/{album} [{quality}] [{year}]/{track:02d}. {title}"
     single:      str = "{artist} - {title}"
     ep:          str = "{albumartist}/{album} [{quality}] [{year}]/{track:02d}. {title}"
@@ -85,10 +53,48 @@ class NamingConfig:
 
 @dataclass
 class MusicBrainzConfig:
-    # When enabled, every track download looks up its ISRC on MusicBrainz
-    # and adds the recording MBID and artist MBID to the file tags.
-    # Requires an internet connection and respects MB's 1 req/sec rate limit.
     enabled: bool = False
+
+
+@dataclass
+class LocalDataConfig:
+    """
+    Configuration for the local user data store.
+
+    The store works in ALL authentication modes, including token pool
+    mode where writes to the Qobuz API are disabled. Pool users can
+    maintain their own local favorites and playlists here.
+
+    Fields:
+        data_dir:            Root directory for the SQLite database,
+                             local playlist TOML files, and exports.
+        track_history:       Log every download to the history table.
+        auto_sync_favorites: On login (personal session only), pull
+                             all Qobuz favorites into the local store.
+                             Pool mode ignores this setting.
+        playlists_subdir:    Subdirectory under data_dir for playlist
+                             TOML files. Relative paths are resolved
+                             against data_dir.
+    """
+    data_dir:            str  = str(Path.home() / ".local" / "share" / "qobuz")
+    track_history:       bool = True
+    auto_sync_favorites: bool = False
+    playlists_subdir:    str  = "playlists"
+
+    @property
+    def db_path(self) -> Path:
+        return Path(self.data_dir).expanduser() / "library.db"
+
+    @property
+    def playlists_dir(self) -> Path:
+        sub = Path(self.playlists_subdir)
+        if sub.is_absolute():
+            return sub
+        return Path(self.data_dir).expanduser() / sub
+
+    @property
+    def exports_dir(self) -> Path:
+        return Path(self.data_dir).expanduser() / "exports"
 
 
 @dataclass
@@ -98,56 +104,48 @@ class QobuzConfig:
     tagging:      TaggingConfig      = field(default_factory=TaggingConfig)
     naming:       NamingConfig       = field(default_factory=NamingConfig)
     musicbrainz:  MusicBrainzConfig  = field(default_factory=MusicBrainzConfig)
+    local_data:   LocalDataConfig    = field(default_factory=LocalDataConfig)
 
 
 # ── Read / write ───────────────────────────────────────────────────────────
 _VALID_QUALITIES = {"mp3_320", "flac_16", "flac_24_96", "hi_res"}
 
+
 def validate_config(cfg: QobuzConfig) -> None:
     """
     Raise ConfigError with a clear message on the first invalid value found.
-    Called after loading or updating config so errors surface immediately,
-    not at runtime mid-download.
     """
     d = cfg.download
     t = cfg.tagging
     n = cfg.naming
+    ld = cfg.local_data
 
     if d.quality.lower() not in _VALID_QUALITIES:
         raise ConfigError(
             f"download.quality={d.quality!r} is invalid. "
             f"Valid values: {', '.join(sorted(_VALID_QUALITIES))}"
         )
-
     if d.max_workers < 1:
-        raise ConfigError(
-            f"download.max_workers={d.max_workers} must be >= 1."
-        )
-
+        raise ConfigError(f"download.max_workers={d.max_workers} must be >= 1.")
     if d.read_timeout <= 0:
-        raise ConfigError(
-            f"download.read_timeout={d.read_timeout} must be > 0."
-        )
-
+        raise ConfigError(f"download.read_timeout={d.read_timeout} must be > 0.")
     if d.connect_timeout <= 0:
-        raise ConfigError(
-            f"download.connect_timeout={d.connect_timeout} must be > 0."
-        )
+        raise ConfigError(f"download.connect_timeout={d.connect_timeout} must be > 0.")
 
-    if not isinstance(t.enabled, bool):
-        raise ConfigError(f"tagging.enabled must be true or false.")
-    if not isinstance(t.embed_cover, bool):
-        raise ConfigError(f"tagging.embed_cover must be true or false.")
-    if not isinstance(t.save_cover_file, bool):
-        raise ConfigError(f"tagging.save_cover_file must be true or false.")
-    if not isinstance(t.fetch_lyrics, bool):
-        raise ConfigError(f"tagging.fetch_lyrics must be true or false.")
+    for attr in ("enabled", "embed_cover", "save_cover_file", "fetch_lyrics"):
+        if not isinstance(getattr(t, attr), bool):
+            raise ConfigError(f"tagging.{attr} must be true or false.")
 
-    # Validate naming templates contain no unknown placeholders.
+    for attr in ("track_history", "auto_sync_favorites"):
+        if not isinstance(getattr(ld, attr), bool):
+            raise ConfigError(f"local_data.{attr} must be true or false.")
+
     _KNOWN_PLACEHOLDERS = {
-        "title", "artist", "track", "disc", "isrc",
+        "title", "raw_title", "work", "version",
+        "artist", "track", "disc", "isrc",
         "bit_depth", "sampling_rate", "quality",
-        "album", "albumartist", "year", "label", "genre", "upc",
+        "album", "raw_album", "albumartist", "year",
+        "label", "genre", "upc",
         "playlist", "index",
     }
     for tmpl_name, tmpl in {
@@ -159,7 +157,7 @@ def validate_config(cfg: QobuzConfig) -> None:
     }.items():
         import string
         used = {
-            f.split(":")[0]   # strip format spec e.g. {track:02d} → track
+            f.split(":")[0]
             for _, f, _, _ in string.Formatter().parse(tmpl)
             if f is not None
         }
@@ -169,12 +167,12 @@ def validate_config(cfg: QobuzConfig) -> None:
                 f"{tmpl_name} uses unknown placeholder(s): "
                 f"{', '.join(f'{{{u}}}' for u in sorted(unknown))}"
             )
-            
+
+
 def load_config(path: Path = _CONFIG_PATH) -> QobuzConfig:
     """
     Read the TOML config file and return a QobuzConfig.
-    Missing keys fall back to dataclass defaults, so a partial or empty
-    config file is always valid.
+    Missing keys fall back to dataclass defaults.
 
     Environment variables override config file values for credentials:
         QOBUZ_APP_ID, QOBUZ_APP_SECRET
@@ -224,7 +222,14 @@ def load_config(path: Path = _CONFIG_PATH) -> QobuzConfig:
             enabled = m.get("enabled", cfg.musicbrainz.enabled),
         )
 
-    # Environment variables always win for credentials.
+        ld = raw.get("local_data", {})
+        cfg.local_data = LocalDataConfig(
+            data_dir            = ld.get("data_dir",            cfg.local_data.data_dir),
+            track_history       = ld.get("track_history",       cfg.local_data.track_history),
+            auto_sync_favorites = ld.get("auto_sync_favorites", cfg.local_data.auto_sync_favorites),
+            playlists_subdir    = ld.get("playlists_subdir",    cfg.local_data.playlists_subdir),
+        )
+
     env_id     = os.environ.get("QOBUZ_APP_ID")
     env_secret = os.environ.get("QOBUZ_APP_SECRET")
     if env_id:
@@ -239,12 +244,15 @@ def load_config(path: Path = _CONFIG_PATH) -> QobuzConfig:
 def save_config(cfg: QobuzConfig, path: Path = _CONFIG_PATH) -> None:
     """Serialise a QobuzConfig to TOML and write it to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Exclude the computed property methods — asdict only captures fields.
+    ld = asdict(cfg.local_data)
     data = {
         "credentials": asdict(cfg.credentials),
         "download":    asdict(cfg.download),
         "tagging":     asdict(cfg.tagging),
         "naming":      asdict(cfg.naming),
         "musicbrainz": asdict(cfg.musicbrainz),
+        "local_data":  ld,
     }
     path.write_bytes(tomli_w.dumps(data).encode())
 
@@ -253,12 +261,8 @@ def update_config(updates: dict, path: Path = _CONFIG_PATH) -> QobuzConfig:
     """
     Load the current config, apply a dict of nested updates, save, and
     return the updated config.
-
-    updates format mirrors the TOML structure:
-        {"credentials": {"app_id": "123"}, "download": {"max_workers": 3}}
     """
     cfg = load_config(path)
-
     for section, values in updates.items():
         obj = getattr(cfg, section, None)
         if obj is None:
@@ -266,8 +270,6 @@ def update_config(updates: dict, path: Path = _CONFIG_PATH) -> QobuzConfig:
         for key, val in values.items():
             if hasattr(obj, key):
                 setattr(obj, key, val)
-
     validate_config(cfg)
     save_config(cfg, path)
     return cfg
-

@@ -8,10 +8,14 @@ from .exceptions import (
     TokenExpiredError,
     NoAuthError,
     TokenPoolExhaustedError,
+    PoolModeError,
     CredentialError,
     TokenPoolLoadError,
     APIError,
     NotFoundError,
     NotStreamableError,
     RateLimitError,
+    ConfigError,
 )
+from .models.release import Release, ReleasesList
+from .models.favorites import UserFavorites, UserFavoriteIds, LabelDetail

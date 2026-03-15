@@ -540,3 +540,32 @@ class QobuzClient:
             )
 
         return result
+
+    # ── User auth endpoints ─────────────────────────────────────────────
+    def get_user_info(self) -> dict:
+        """
+        Fetch the authenticated user's profile information.
+
+        Returns the raw API dict containing fields like:
+        id, login, email, firstname, lastname, avatar, credential,
+        subscription, store_features, and so on.
+        """
+        return self._request("GET", "/user/get")
+
+    def reset_password(self, username_or_email: str) -> dict:
+        """
+        Request a password reset email for a Qobuz account.
+
+        Works for both username and email address. Qobuz sends a reset
+        link to the account's registered email address.
+
+        This endpoint does NOT require authentication — it can be called
+        before login.
+
+        Returns a status dict with a 'status' key ('success' or error).
+        """
+        return self._request(
+            "GET", "/user/resetPassword",
+            params={"username": username_or_email},
+            require_auth=False,
+        )
