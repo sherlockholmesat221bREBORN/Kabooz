@@ -1,5 +1,6 @@
 # kabooz/__init__.py
 from .client import QobuzClient
+from .session import QobuzSession
 from .quality import Quality
 from .exceptions import (
     QobuzError,

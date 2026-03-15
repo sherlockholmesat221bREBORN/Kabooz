@@ -172,4 +172,3 @@ def format_credits_for_id3(credits: ParsedCredits) -> dict[str, list[tuple[str, 
         for name in names:
             pairs.append((role, name))
     return {"TIPL": pairs}
-

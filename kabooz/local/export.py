@@ -232,4 +232,3 @@ def export_favorites_toml(
         encoding="utf-8",
     )
     return output_path
-

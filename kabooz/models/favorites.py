@@ -121,4 +121,3 @@ class LabelDetail:
             albums_count=data.get("albums_count"),
             albums=albums,
         )
-

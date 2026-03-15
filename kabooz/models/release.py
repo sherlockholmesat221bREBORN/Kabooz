@@ -221,4 +221,3 @@ class ReleasesList:
             has_more=data.get("has_more", False),
             items=_parse_list(Release, data.get("items")),
         )
-

@@ -44,7 +44,7 @@ class _RateLimiter:
 _limiter = _RateLimiter()
 
 _MB_BASE    = "https://musicbrainz.org/ws/2"
-_USER_AGENT = "kabooz/0.1 ( https://gitlab.com/TchaikovskyCannonsAPI/kabooz )"
+_USER_AGENT = "kabooz/0.1 ( https://gitlab.com//kabooz )"
 
 
 # ── Public interface ───────────────────────────────────────────────────────

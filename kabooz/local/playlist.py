@@ -14,7 +14,7 @@ File format (version 1):
     description = "Quiet pieces for the evening"
     created     = "2026-03-15T10:30:00Z"
     version     = "1"
-    author      = "maxx"          # optional
+    author      = "maxxx"          # optional
 
     [[tracks]]
     id       = "12345678"
@@ -205,4 +205,3 @@ def playlist_from_store_tracks(
             isrc=t.get("isrc", ""),
         ))
     return pl
-
