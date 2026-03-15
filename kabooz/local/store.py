@@ -108,6 +108,9 @@ class LocalStore:
     def _conn(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self._path, timeout=10)
         conn.row_factory = sqlite3.Row
+        # FIX: Foreign-key enforcement must be enabled per-connection in SQLite.
+        # The PRAGMA in _SCHEMA only affects the connection used during init.
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
@@ -344,9 +347,12 @@ class LocalStore:
             )
 
     def get_history(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        # FIX: Order by autoincrement id DESC instead of played_at DESC so that
+        # two entries inserted within the same second are returned in insertion
+        # order (most recent first) rather than arbitrary order.
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM history ORDER BY played_at DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM history ORDER BY id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             ).fetchall()
             return [dict(r) for r in rows]

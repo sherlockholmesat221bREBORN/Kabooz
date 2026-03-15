@@ -867,14 +867,28 @@ def lpl_share(
 
 
 @lpl_app.command("import")
-def lpl_import(file: Path = typer.Argument(...)) -> None:
-    """Import a shared TOML playlist file into the local store."""
+def lpl_import(
+    file:      Path = typer.Argument(...),
+    overwrite: bool = typer.Option(
+        False, "--overwrite/--no-overwrite",
+        help="Replace an existing playlist with the same name instead of "
+             "appending '(imported)' to the name.",
+    ),
+) -> None:
+    """
+    Import a shared TOML playlist file into the local store.
+
+    \b
+    Examples:
+        qobuz lpl import evening-classical.toml
+        qobuz lpl import evening-classical.toml --overwrite
+    """
     if not file.exists():
         err_console.print(f"[red]File not found:[/red] {file}")
         raise typer.Exit(code=1)
     sess = _session()
     try:
-        pl_id = sess.import_playlist(file)
+        pl_id = sess.import_playlist(file, overwrite=overwrite)
     except Exception as exc:
         err_console.print(f"[red]Import failed:[/red] {exc}")
         raise typer.Exit(code=1)
@@ -923,6 +937,307 @@ def export_playlist(
 ) -> None:
     """Export a local playlist to a shareable TOML file."""
     lpl_share(name=name, output=output, author=author)
+
+
+@export_app.command("import-favorites")
+def export_import_favorites(
+    file:    Path = typer.Argument(..., help="Path to a favorites TOML export file"),
+    no_merge: bool = typer.Option(
+        False, "--replace/--merge",
+        help="--replace clears each type present in the file before importing. "
+             "--merge (default) upserts without removing existing records.",
+    ),
+) -> None:
+    """
+    Import favorites from a TOML file created by 'export favorites'.
+
+    \b
+    Examples:
+        qobuz export import-favorites favorites-2026-03-15.toml
+        qobuz export import-favorites favorites-2026-03-15.toml --replace
+    """
+    if not file.exists():
+        err_console.print(f"[red]File not found:[/red] {file}")
+        raise typer.Exit(code=1)
+    sess = _session()
+    try:
+        n = sess.import_favorites(file, merge=not no_merge)
+    except ValueError as exc:
+        err_console.print(f"[red]Invalid file:[/red] {exc}")
+        raise typer.Exit(code=1)
+    except Exception as exc:
+        err_console.print(f"[red]Import failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+    console.print(f"[green]Imported[/green] {n} favorite(s) from {file.name}.")
+
+
+@export_app.command("restore")
+def export_restore(
+    archive:           Path = typer.Argument(..., help="Path to a .tar.gz backup archive"),
+    favorites:         bool = typer.Option(True,  "--favorites/--no-favorites",
+                                           help="Restore favorites from the archive."),
+    playlists:         bool = typer.Option(True,  "--playlists/--no-playlists",
+                                           help="Restore playlists from the archive."),
+    db:                bool = typer.Option(False, "--db",
+                                           help="Full DB replacement (destructive). "
+                                                "Re-open the app after this."),
+    replace:           bool = typer.Option(False, "--replace/--merge",
+                                           help="--replace clears existing data of each "
+                                                "type before restoring. "
+                                                "--merge (default) upserts."),
+    playlists_dir:     Optional[Path] = typer.Option(
+        None, "--playlists-dir",
+        help="Also extract playlist TOML files to this directory.",
+    ),
+) -> None:
+    """
+    Restore from a backup archive created by 'export backup'.
+
+    By default favorites and playlists are merged into the live store so
+    existing data is preserved. Use --replace to clear before restoring.
+    Use --db for a full atomic database swap (everything is replaced).
+
+    \b
+    Examples:
+        qobuz export restore qobuz-backup-2026-03-15.tar.gz
+        qobuz export restore backup.tar.gz --no-favorites
+        qobuz export restore backup.tar.gz --replace
+        qobuz export restore backup.tar.gz --db
+        qobuz export restore backup.tar.gz --playlists-dir ~/Music/playlists
+    """
+    if not archive.exists():
+        err_console.print(f"[red]File not found:[/red] {archive}")
+        raise typer.Exit(code=1)
+
+    sess = _session()
+    try:
+        from .local.export import restore_from_tar
+        result = restore_from_tar(
+            sess.store,
+            archive,
+            restore_favorites=favorites,
+            restore_playlists=playlists,
+            restore_db=db,
+            merge=not replace,
+            playlists_dir=playlists_dir,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        err_console.print(f"[red]Restore failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+    except Exception as exc:
+        err_console.print(f"[red]Restore failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if result.db_restored:
+        console.print("[green]Database restored.[/green] Please re-open the application.")
+        return
+
+    console.print(
+        f"[green]Restore complete.[/green]  "
+        f"Favorites: {result.favorites_imported}  "
+        f"Playlists: {result.playlists_imported} imported, "
+        f"{result.playlists_skipped} skipped."
+    )
+    if result.errors:
+        err_console.print(f"[yellow]{len(result.errors)} non-fatal error(s):[/yellow]")
+        for e in result.errors:
+            err_console.print(f"  [dim]{e}[/dim]")
+
+
+# ── Top-level download commands ────────────────────────────────────────────
+
+@app.command()
+def artist(
+    url_or_id:    str            = typer.Argument(..., help="Artist ID or Qobuz URL"),
+    output:       Optional[Path] = typer.Option(None,  "-o", "--output"),
+    quality:      Optional[str]  = typer.Option(None,  "-q", "--quality"),
+    release_type: Optional[str]  = typer.Option(
+        None, "--type", "-t",
+        help="album, live, compilation, epSingle, other, download. "
+             "Omit for all. Combine with commas.",
+    ),
+    workers:      Optional[int]  = typer.Option(None,  "-j", "--workers"),
+    template:     Optional[str]  = typer.Option(None,  "--template"),
+) -> None:
+    """
+    Download an artist's full discography.
+
+    \b
+    Examples:
+        qobuz artist 999
+        qobuz artist https://open.qobuz.com/artist/999
+        qobuz artist 999 --type album
+        qobuz artist 999 --type album,live -q flac_16
+    """
+    cfg = _cfg()
+    q   = None
+    if quality:
+        try:
+            q = Quality[quality.upper()]
+        except KeyError:
+            err_console.print(f"[red]Unknown quality:[/red] {quality}")
+            raise typer.Exit(code=1)
+
+    sess = _session(cfg)
+
+    try:
+        artist_obj = sess.client.get_artist(_resolve_id(url_or_id, "artist"), extras="")
+        console.print(
+            f"[cyan]Downloading discography:[/cyan] {artist_obj.name}"
+            + (f" [dim](type: {release_type})[/dim]" if release_type else "")
+        )
+    except Exception as exc:
+        err_console.print(f"[red]Could not fetch artist:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    total_albums = 0
+    total_tracks = 0
+
+    def on_start(title: str, index: int, total: int) -> None:
+        console.print(f"  [{index}] {title}")
+
+    def on_done(result) -> None:
+        nonlocal total_tracks
+        if result.download.skipped and not result.download.dev_stub:
+            console.print("    [yellow]skipped[/yellow]")
+        else:
+            total_tracks += 1
+
+    try:
+        results = sess.download_artist_discography(
+            url_or_id,
+            release_type=release_type,
+            quality=q,
+            dest_dir=output or Path(cfg.download.output_dir),
+            template=template,
+            on_track_start=on_start,
+            on_track_done=on_done,
+            workers=workers,
+        )
+        total_albums = len(results)
+    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+        _handle_auth_error(exc)
+    except Exception as exc:
+        err_console.print(f"[red]Failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"\n[green]Done.[/green] "
+        f"{total_albums} albums, {total_tracks} tracks downloaded."
+    )
+
+
+@app.command()
+def favorites(
+    type:     str            = typer.Option("tracks", "--type", "-t",
+                                            help="tracks or albums"),
+    output:   Optional[Path] = typer.Option(None, "-o", "--output"),
+    quality:  Optional[str]  = typer.Option(None, "-q", "--quality"),
+    workers:  Optional[int]  = typer.Option(None, "-j", "--workers"),
+) -> None:
+    """
+    Download all favorited tracks or albums.
+
+    \b
+    Examples:
+        qobuz favorites
+        qobuz favorites --type albums
+        qobuz favorites --type tracks -q flac_16
+    """
+    if type not in ("tracks", "albums"):
+        err_console.print("[red]--type must be 'tracks' or 'albums'[/red]")
+        raise typer.Exit(code=1)
+
+    cfg = _cfg()
+    q   = None
+    if quality:
+        try:
+            q = Quality[quality.upper()]
+        except KeyError:
+            err_console.print(f"[red]Unknown quality:[/red] {quality}")
+            raise typer.Exit(code=1)
+
+    sess = _session(cfg)
+    console.print(f"[cyan]Downloading favorite {type}…[/cyan]")
+
+    try:
+        result = sess.download_favorites(
+            type=type,
+            quality=q,
+            dest_dir=output or Path(cfg.download.output_dir),
+            on_track_start=_track_start_cb,
+            on_track_done=_track_done_cb,
+            workers=workers,
+        )
+    except PoolModeError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1)
+    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+        _handle_auth_error(exc)
+    except Exception as exc:
+        err_console.print(f"[red]Failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"\n[green]Done.[/green] "
+        f"{result.succeeded} downloaded, {result.skipped} skipped, "
+        f"{result.failed} failed."
+    )
+
+
+@app.command()
+def purchases(
+    type:     str            = typer.Option("albums", "--type", "-t",
+                                            help="albums or tracks"),
+    output:   Optional[Path] = typer.Option(None, "-o", "--output"),
+    quality:  Optional[str]  = typer.Option(None, "-q", "--quality"),
+    workers:  Optional[int]  = typer.Option(None, "-j", "--workers"),
+) -> None:
+    """
+    Download all purchased albums or tracks.
+
+    \b
+    Examples:
+        qobuz purchases
+        qobuz purchases --type tracks
+        qobuz purchases --type albums -q hi_res
+    """
+    if type not in ("albums", "tracks"):
+        err_console.print("[red]--type must be 'albums' or 'tracks'[/red]")
+        raise typer.Exit(code=1)
+
+    cfg = _cfg()
+    q   = None
+    if quality:
+        try:
+            q = Quality[quality.upper()]
+        except KeyError:
+            err_console.print(f"[red]Unknown quality:[/red] {quality}")
+            raise typer.Exit(code=1)
+
+    sess = _session(cfg)
+    console.print(f"[cyan]Downloading purchased {type}…[/cyan]")
+
+    try:
+        result = sess.download_purchases(
+            type=type,
+            quality=q,
+            dest_dir=output or Path(cfg.download.output_dir),
+            on_track_start=_track_start_cb,
+            on_track_done=_track_done_cb,
+            workers=workers,
+        )
+    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+        _handle_auth_error(exc)
+    except Exception as exc:
+        err_console.print(f"[red]Failed:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"\n[green]Done.[/green] "
+        f"{result.succeeded} downloaded, {result.skipped} skipped, "
+        f"{result.failed} failed."
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────

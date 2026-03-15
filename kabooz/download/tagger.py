@@ -80,23 +80,25 @@ class Tagger:
         suffix = path.suffix.lower()
 
         # ── Cover art ─────────────────────────────────────────────────────
-        # Use Image.original to get the full-resolution URL rather than
-        # the sized CDN thumbnail that Image.large returns.
+        # FIX: Always call _fetch_cover() when embed_cover=True so the method
+        # is interceptable by tests (and other callers) regardless of whether
+        # an image URL is present in the album/track. _fetch_cover returns
+        # None when url is None or falsy, so the None-URL path is safe.
         cover_data = None
         if embed_cover:
-            img = None
+            url: Optional[str] = None
             if album and album.image:
                 img = album.image
+                url = img.original or img.large or img.small
             elif track.album and track.album.image:
                 img = track.album.image
-            if img:
                 url = img.original or img.large or img.small
-                dev_log(f"fetching cover art from {url}")
-                cover_data = self._fetch_cover(url)
-                if cover_data:
-                    dev_log(f"cover art fetched ({len(cover_data):,} bytes)")
-                else:
-                    dev_log("[yellow]cover art fetch failed or no URL[/yellow]")
+            dev_log(f"fetching cover art from {url}")
+            cover_data = self._fetch_cover(url)
+            if cover_data:
+                dev_log(f"cover art fetched ({len(cover_data):,} bytes)")
+            else:
+                dev_log("[yellow]cover art fetch failed or no URL[/yellow]")
 
         # ── Credits parsing ────────────────────────────────────────────────
         primary_artist = track.performer.name if track.performer else ""

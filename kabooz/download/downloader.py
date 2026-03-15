@@ -439,7 +439,11 @@ class Downloader:
         total         = self._head(url)
         existing_size = path.stat().st_size if path.exists() else 0
 
-        if existing_size > 0 and existing_size == total:
+        # FIX: use >= (not ==) so that tagged files (which grow slightly beyond
+        # the raw CDN Content-Length after cover art + metadata are embedded)
+        # are still correctly skipped on subsequent runs.  Consistent with the
+        # skip logic in _download_to_path.
+        if total > 0 and existing_size >= total:
             if on_progress:
                 on_progress(total, total)
             return DownloadResult(

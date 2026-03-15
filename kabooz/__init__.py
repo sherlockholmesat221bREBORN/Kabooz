@@ -20,3 +20,12 @@ from .exceptions import (
 )
 from .models.release import Release, ReleasesList
 from .models.favorites import UserFavorites, UserFavoriteIds, LabelDetail
+
+# Local data-layer types — exposed here so library consumers don't need to
+# import from the internal subpackage paths.
+from .local import (
+    LocalStore,
+    LocalPlaylist,
+    LocalPlaylistTrack,
+    ImportResult,
+)
