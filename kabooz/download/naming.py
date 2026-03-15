@@ -79,6 +79,35 @@ def _build_context(
     All string values are left raw here — sanitization is applied per
     path segment after rendering, not before, so that a template like
     "{albumartist}/{album}" can use "/" as a real path separator.
+
+    Available placeholders
+    ──────────────────────
+    Always available:
+        {title}          full display title: "{work} - {title} ({version})"
+                         This is what you almost always want in filenames.
+        {raw_title}      bare track title from the API, no work or version
+        {work}           classical work name (empty string if absent)
+        {version}        version string e.g. "2011 Remaster" (empty if absent)
+        {artist}         primary track artist
+        {track}          track number (int, supports format specs e.g. {track:02d})
+        {disc}           disc number (int)
+        {isrc}           ISRC code
+        {bit_depth}      audio bit depth (int or empty string)
+        {sampling_rate}  sampling rate (float or empty string)
+        {quality}        e.g. "FLAC 24bit 96kHz"
+
+    When album context is available:
+        {album}          album display title (includes version if present)
+        {raw_album}      bare album title from the API
+        {albumartist}    album-level artist name
+        {year}           4-digit release year
+        {label}          record label
+        {genre}          primary genre
+        {upc}            UPC code
+
+    For playlist downloads:
+        {playlist}       playlist name
+        {index}          track position in playlist (int)
     """
     bd = bit_depth or (album.maximum_bit_depth if album else None)
     sr = sampling_rate or (album.maximum_sampling_rate if album else None)
@@ -89,30 +118,40 @@ def _build_context(
     elif album and album.artist:
         artist = album.artist.name
 
-    albumartist = (album.artist.name if album and album.artist else artist)
-    album_title = album.title if album else ""
-    year        = ""
+    albumartist  = (album.artist.name if album and album.artist else artist)
+    album_title  = album.display_title if album else ""
+    raw_album    = album.title.rstrip() if album else ""
+    year         = ""
     if album and album.release_date_original:
         year = album.release_date_original[:4]
-    label  = (album.label.name  if album and album.label  else "")
-    genre  = (album.genre.name  if album and album.genre  else "")
-    upc    = (album.upc         if album                  else "")
+    label  = (album.label.name if album and album.label else "")
+    genre  = (album.genre.name if album and album.genre else "")
+    upc    = (album.upc        if album                 else "")
 
     return _SafeDict({
-        "title":         track.title or "",
+        # Title variants
+        "title":         track.display_title,
+        "raw_title":     track.title.rstrip(),
+        "work":          track.work    or "",
+        "version":       track.version or "",
+        # Track metadata
         "artist":        artist,
         "track":         track.track_number or 0,
         "disc":          track.media_number or 1,
         "isrc":          track.isrc or "",
+        # Quality
         "bit_depth":     bd or "",
         "sampling_rate": sr or "",
         "quality":       quality_tag(bd, sr),
+        # Album metadata
         "album":         album_title,
+        "raw_album":     raw_album,
         "albumartist":   albumartist,
         "year":          year,
         "label":         label,
         "genre":         genre,
         "upc":           upc,
+        # Playlist
         "playlist":      playlist_name  or "",
         "index":         playlist_index or 0,
     })
@@ -152,30 +191,6 @@ def render_template(
 
         {track:02d}   → "01", "02", …
         {index:03d}   → "001", "002", …
-
-    Available placeholders
-    ──────────────────────
-    Always available:
-        {title}          track title
-        {artist}         primary track artist (performer → album artist)
-        {track}          track number (int)
-        {disc}           disc number (int)
-        {isrc}           ISRC code
-        {bit_depth}      audio bit depth (int or empty string)
-        {sampling_rate}  sampling rate (float or empty string)
-        {quality}        e.g. "FLAC 24bit 96kHz"
-
-    When album context is available:
-        {album}          album title
-        {albumartist}    album-level artist name
-        {year}           4-digit release year
-        {label}          record label
-        {genre}          primary genre
-        {upc}            UPC code
-
-    For playlist downloads:
-        {playlist}       playlist name
-        {index}          track position in playlist (int)
     """
     ctx = _build_context(
         track=track,
@@ -188,7 +203,6 @@ def render_template(
 
     ext = extension if extension.startswith(".") else f".{extension}"
 
-    # Split on "/" first so we sanitize each segment independently.
     raw_segments = template.split("/")
     rendered_segments: list[str] = []
 
@@ -196,45 +210,36 @@ def render_template(
         try:
             rendered = segment.format_map(ctx)
         except (ValueError, KeyError):
-            # Malformed format spec — leave segment as-is.
             rendered = segment
 
-        # Strip orphaned placeholders (e.g. {playlist} in an album template).
         rendered = _ORPHAN_RE.sub("", rendered).strip()
-
-        # Sanitize the rendered segment to make it filesystem-safe.
         rendered = sanitize(rendered)
 
-        # Skip empty segments (can happen if a placeholder resolved to "").
         if not rendered:
             continue
 
-        # Append extension to the last segment only.
         if i == len(raw_segments) - 1:
             rendered = rendered + ext
 
         rendered_segments.append(rendered)
 
     if not rendered_segments:
-        # Absolute fallback — should never happen with valid templates.
-        rendered_segments = [sanitize(track.title or "track") + ext]
+        rendered_segments = [sanitize(track.display_title or "track") + ext]
 
     return Path(*rendered_segments)
 
 
 # ── Legacy helpers (kept for backwards compatibility) ──────────────────────
-# These are thin wrappers used by tests and any external code that calls
-# them directly. New code should use render_template instead.
 
 def track_filename(track: Track, extension: str) -> str:
     ext = extension if extension.startswith(".") else f".{extension}"
-    return f"{sanitize(track.title)}{ext}"
+    return f"{sanitize(track.display_title)}{ext}"
 
 
 def album_track_filename(track: Track, extension: str) -> str:
     number = str(track.track_number).zfill(2)
     ext = extension if extension.startswith(".") else f".{extension}"
-    return f"{number}. {sanitize(track.title)}{ext}"
+    return f"{number}. {sanitize(track.display_title)}{ext}"
 
 
 def album_folder(
@@ -242,7 +247,7 @@ def album_folder(
     bit_depth: Optional[int] = None,
     sampling_rate: Optional[float] = None,
 ) -> str:
-    title = sanitize(album.title)
+    title = sanitize(album.display_title)
     qtag  = f"[{quality_tag(bit_depth or album.maximum_bit_depth, sampling_rate or album.maximum_sampling_rate)}]"
     year  = f" [{album.release_date_original[:4]}]" if album.release_date_original else ""
     return f"{title} {qtag}{year}"

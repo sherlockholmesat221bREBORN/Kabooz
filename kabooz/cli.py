@@ -555,7 +555,7 @@ def track(
         err_console.print(f"[red]API error:[/red] {exc}")
         raise typer.Exit(code=1)
 
-    console.print(f"[cyan]Downloading[/cyan] {track_obj.title}")
+    console.print(f"[cyan]Downloading[/cyan] {track_obj.display_title}")
 
     tmpl = template or cfg.naming.single
 
@@ -675,7 +675,7 @@ def album(
         dev=_dev,
     ) as dl:
         for i, track_summary in enumerate(album_obj.tracks.items, 1):
-            console.print(f"  [{i}/{total}] {track_summary.title}")
+            console.print(f"  [{i}/{total}] {track_summary.display_title}")
 
             try:
                 track_obj = client.get_track(str(track_summary.id))
@@ -701,7 +701,7 @@ def album(
 
             with _make_progress() as progress:
                 task = progress.add_task(track_obj.title, total=None)
-
+                
                 def on_progress(
                     done: int, total_bytes: int,
                     _task=task, _progress=progress,
@@ -826,7 +826,7 @@ def playlist(
         dev=_dev,
     ) as dl:
         for i, pl_track in enumerate(pl.tracks.items, 1):
-            console.print(f"  [{i}/{pl.tracks_count}] {pl_track.title}")
+            console.print(f"  [{i}/{pl.tracks_count}] {pl_track.display_title}")
 
             try:
                 track_obj = client.get_track(str(pl_track.id))
@@ -859,7 +859,7 @@ def playlist(
 
             with _make_progress() as progress:
                 task = progress.add_task(track_obj.title, total=None)
-
+                
                 def on_progress(
                     done: int, total_bytes: int,
                     _task=task, _progress=progress,

@@ -17,6 +17,7 @@ class TrackAlbum:
     A subset of the full Album — no track listing, no artists list."""
     id: str          # STRING — not int
     title: str
+    version: Optional[str] = None          # e.g. "Deluxe Edition", "Remastered"
     slug: Optional[str] = None
     product_url: Optional[str] = None
     artist: Optional[AlbumArtist] = None
@@ -33,6 +34,7 @@ class TrackAlbum:
     maximum_bit_depth: Optional[int] = None
     maximum_sampling_rate: Optional[float] = None
     maximum_channel_count: Optional[int] = None
+    parental_warning: bool = False
     created_at: Optional[int] = None
     released_at: Optional[int] = None
     release_date_original: Optional[str] = None
@@ -45,11 +47,20 @@ class TrackAlbum:
     downloadable: bool = False
     hires: bool = False
 
+    @property
+    def display_title(self) -> str:
+        """Album title with version suffix appended if present."""
+        t = self.title.rstrip()
+        if self.version:
+            t += f" ({self.version})"
+        return t
+
     @classmethod
     def from_dict(cls, data: dict) -> TrackAlbum:
         return cls(
             id=str(data["id"]),      # force str — API sometimes returns int
             title=data["title"],
+            version=data.get("version"),
             slug=data.get("slug"),
             product_url=data.get("product_url"),
             artist=_parse(AlbumArtist, data.get("artist")),
@@ -66,6 +77,7 @@ class TrackAlbum:
             maximum_bit_depth=data.get("maximum_bit_depth"),
             maximum_sampling_rate=data.get("maximum_sampling_rate"),
             maximum_channel_count=data.get("maximum_channel_count"),
+            parental_warning=data.get("parental_warning", False),
             created_at=data.get("created_at"),
             released_at=data.get("released_at"),
             release_date_original=data.get("release_date_original"),
@@ -87,14 +99,16 @@ class Track:
     duration: int
     track_number: int
     media_number: int
+    version: Optional[str] = None          # e.g. "Live", "Acoustic", "2011 Remaster"
     isrc: Optional[str] = None
     copyright: Optional[str] = None
-    performers: Optional[str] = None   # comma-separated string of all contributors
-    performer: Optional[Performer] = None
+    performers: Optional[str] = None       # structured credit string, see credits.py
+    performer: Optional[Performer] = None  # primary credited artist
     composer: Optional[Composer] = None
-    work: Optional[str] = None
+    work: Optional[str] = None             # classical work name, e.g. "Symphony No. 40"
     audio_info: Optional[AudioInfo] = None
     album: Optional[TrackAlbum] = None
+    parental_warning: bool = False
     maximum_bit_depth: Optional[int] = None
     maximum_sampling_rate: Optional[float] = None
     maximum_channel_count: Optional[int] = None
@@ -106,6 +120,31 @@ class Track:
     downloadable: bool = False
     hires: bool = False
 
+    @property
+    def display_title(self) -> str:
+        """
+        Full display title as it should appear in tags and filenames.
+
+        Follows the convention from the reference codebase:
+          - Classical tracks: "{work} - {title}"
+          - Version suffix appended for all: "{title} ({version})"
+
+        Examples:
+            work="Symphony No. 40", title="I. Molto allegro"
+              → "Symphony No. 40 - I. Molto allegro"
+            title="Billie Jean", version="2012 Remaster"
+              → "Billie Jean (2012 Remaster)"
+            work="Piano Sonata No. 14", title="I. Adagio", version="Live"
+              → "Piano Sonata No. 14 - I. Adagio (Live)"
+        """
+        t = ""
+        if self.work:
+            t += f"{self.work} - "
+        t += self.title.rstrip()
+        if self.version:
+            t += f" ({self.version})"
+        return t
+
     @classmethod
     def from_dict(cls, data: dict) -> Track:
         return cls(
@@ -114,6 +153,7 @@ class Track:
             duration=data["duration"],
             track_number=data["track_number"],
             media_number=data["media_number"],
+            version=data.get("version"),
             isrc=data.get("isrc"),
             copyright=data.get("copyright"),
             performers=data.get("performers"),
@@ -122,6 +162,7 @@ class Track:
             work=data.get("work"),
             audio_info=_parse(AudioInfo, data.get("audio_info")),
             album=_parse(TrackAlbum, data.get("album")),
+            parental_warning=data.get("parental_warning", False),
             maximum_bit_depth=data.get("maximum_bit_depth"),
             maximum_sampling_rate=data.get("maximum_sampling_rate"),
             maximum_channel_count=data.get("maximum_channel_count"),

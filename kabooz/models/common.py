@@ -50,16 +50,18 @@ class Composer:
 class Label:
     id: int
     name: str
-    slug: str
-    supplier_id: int
+    # slug and supplier_id are absent on some older catalog entries —
+    # treat them as optional to avoid KeyError on incomplete API responses.
+    slug: Optional[str] = None
+    supplier_id: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> Label:
         return cls(
             id=data["id"],
             name=data["name"],
-            slug=data["slug"],
-            supplier_id=data["supplier_id"],
+            slug=data.get("slug"),
+            supplier_id=data.get("supplier_id"),
         )
 
 
@@ -86,6 +88,24 @@ class Image:
     small: Optional[str] = None
     thumbnail: Optional[str] = None
     back: Optional[str] = None
+
+    @property
+    def original(self) -> Optional[str]:
+        """
+        Full-resolution original cover art URL.
+
+        Qobuz CDN URLs have a size suffix before the extension:
+            https://static.qobuz.com/images/covers/ab/cd/abcd_600.jpg
+        Stripping the suffix and appending _org.jpg gives the
+        unresized original, which can be considerably larger.
+        """
+        url = self.large or self.small
+        if not url:
+            return None
+        # rsplit on '_' once from the right to drop the size token,
+        # then reattach the _org.jpg suffix.
+        base = url.rsplit("_", 1)[0]
+        return f"{base}_org.jpg"
 
     @classmethod
     def from_dict(cls, data: dict) -> Image:

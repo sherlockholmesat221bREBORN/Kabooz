@@ -16,23 +16,34 @@ class TrackSummary:
     """Lightweight track as it appears inside album.tracks.items."""
     id: int
     title: str
+    version: Optional[str] = None
     track_number: int = 0
     media_number: int = 1
     duration: int = 0
     isrc: Optional[str] = None
+    parental_warning: bool = False
     maximum_bit_depth: Optional[int] = None
     maximum_sampling_rate: Optional[float] = None
     maximum_channel_count: Optional[int] = None
+
+    @property
+    def display_title(self) -> str:
+        t = self.title.rstrip()
+        if self.version:
+            t += f" ({self.version})"
+        return t
 
     @classmethod
     def from_dict(cls, data: dict) -> TrackSummary:
         return cls(
             id=data["id"],
             title=data["title"],
+            version=data.get("version"),
             track_number=data.get("track_number", 0),
             media_number=data.get("media_number", 1),
             duration=data.get("duration", 0),
             isrc=data.get("isrc"),
+            parental_warning=data.get("parental_warning", False),
             maximum_bit_depth=data.get("maximum_bit_depth"),
             maximum_sampling_rate=data.get("maximum_sampling_rate"),
             maximum_channel_count=data.get("maximum_channel_count"),
@@ -89,6 +100,7 @@ class Goodie:
 class Album:
     id: str          # STRING — not int
     title: str
+    version: Optional[str] = None          # e.g. "Deluxe Edition", "Remastered"
     qobuz_id: Optional[int] = None
     subtitle: Optional[str] = None
     slug: Optional[str] = None
@@ -104,6 +116,7 @@ class Album:
     copyright: Optional[str] = None
     release_type: Optional[str] = None
     product_type: Optional[str] = None
+    parental_warning: bool = False
     created_at: Optional[int] = None
     released_at: Optional[int] = None
     release_date_original: Optional[str] = None
@@ -127,11 +140,20 @@ class Album:
     hires_streamable: bool = False
     tracks: Optional[TracksPage] = None
 
+    @property
+    def display_title(self) -> str:
+        """Album title with version suffix appended if present."""
+        t = self.title.rstrip()
+        if self.version:
+            t += f" ({self.version})"
+        return t
+
     @classmethod
     def from_dict(cls, data: dict) -> Album:
         return cls(
             id=str(data["id"]),      # force str
             title=data["title"],
+            version=data.get("version"),
             qobuz_id=data.get("qobuz_id"),
             subtitle=data.get("subtitle"),
             slug=data.get("slug"),
@@ -147,6 +169,7 @@ class Album:
             copyright=data.get("copyright"),
             release_type=data.get("release_type"),
             product_type=data.get("product_type"),
+            parental_warning=data.get("parental_warning", False),
             created_at=data.get("created_at"),
             released_at=data.get("released_at"),
             release_date_original=data.get("release_date_original"),
