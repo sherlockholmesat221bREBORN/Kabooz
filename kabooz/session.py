@@ -100,6 +100,9 @@ class AlbumDownloadResult:
     tracks: list[TrackDownloadResult] = field(default_factory=list)
     goodies_ok: int = 0
     goodies_failed: int = 0
+    # FIX: was a hardcoded `return 0` property — now a real counter so callers
+    # can tell whether any tracks were silently skipped due to errors.
+    failed: int = 0
 
     @property
     def succeeded(self) -> int:
@@ -108,10 +111,6 @@ class AlbumDownloadResult:
     @property
     def skipped(self) -> int:
         return sum(1 for r in self.tracks if r.download.skipped)
-
-    @property
-    def failed(self) -> int:
-        return 0
 
 
 @dataclass
@@ -407,6 +406,8 @@ class QobuzSession:
             on_progress:      Per-track progress callback(bytes_done, total).
             download_goodies: Download booklet PDFs and bonus files.
         """
+        from .dev import dev_log
+
         cfg = self.config
         _, album_id = self.resolve_id(url_or_id, "album")
 
@@ -431,7 +432,27 @@ class QobuzSession:
 
         agg           = AlbumDownloadResult(album=album_obj)
         track_results: list[DownloadResult] = []
-        total         = album_obj.tracks.total if album_obj.tracks else 0
+
+        # ── Build the track list ───────────────────────────────────────────
+        # get_album() is called above with limit=1200 (the default), so
+        # album_obj.tracks.items already contains every TrackSummary for
+        # almost every album ever released.  Only fall back to the paginated
+        # iter_album_tracks() when the album genuinely has more tracks than
+        # the initial fetch captured (> 1200 — essentially box-set outliers).
+        #
+        # The old code used iter_album_tracks() for any album with > 50
+        # tracks, which caused each track to call get_track() TWICE: once
+        # inside iter_album_tracks() and once again in this loop.  The inner
+        # iter_album_tracks() also has a silent `except Exception: pass` that
+        # could swallow individual track-fetch failures and quietly drop tracks
+        # from the yielded sequence — leading to the missing-tracks symptom.
+        summaries = (
+            album_obj.tracks.items
+            if album_obj.tracks
+            and len(album_obj.tracks.items) >= (album_obj.tracks.total or 0)
+            else list(self.client.iter_album_tracks(album_id))
+        )
+        total = len(summaries)
 
         with Downloader(
             read_timeout=cfg.download.read_timeout,
@@ -441,21 +462,34 @@ class QobuzSession:
             naming_template=tmpl,
             dev=self._dev,
         ) as dl:
-            for i, summary in enumerate(
-                self.client.iter_album_tracks(album_id) if total > 50
-                else (album_obj.tracks.items if album_obj.tracks else []),
-                1,
-            ):
+            for i, summary in enumerate(summaries, 1):
                 if on_track_start:
-                    title = getattr(summary, "display_title", getattr(summary, "title", ""))
+                    title = getattr(summary, "display_title",
+                                    getattr(summary, "title", ""))
                     on_track_start(title, i, total)
 
+                # ── Fetch full Track + signed URL ──────────────────────────
                 try:
                     track_obj = self.client.get_track(str(summary.id))
-                    url_info  = self.client.get_track_url(str(track_obj.id), quality=q)
-                except (NotStreamableError, APIError):
+                    url_info  = self.client.get_track_url(
+                        str(track_obj.id), quality=q
+                    )
+                except NotStreamableError as exc:
+                    dev_log(
+                        f"[yellow]track {summary.id} not streamable "
+                        f"(skipping): {exc}[/yellow]"
+                    )
+                    agg.failed += 1
+                    continue
+                except APIError as exc:
+                    dev_log(
+                        f"[red]track {summary.id} API error "
+                        f"(skipping): {exc}[/red]"
+                    )
+                    agg.failed += 1
                     continue
 
+                # ── Download ───────────────────────────────────────────────
                 try:
                     dl_result = dl.download_track(
                         track=track_obj,
@@ -464,7 +498,14 @@ class QobuzSession:
                         album=album_obj,
                         on_progress=on_progress,
                     )
-                except Exception:
+                except Exception as exc:
+                    # Log the real exception so it's visible in the terminal
+                    # instead of disappearing into a silent `continue`.
+                    dev_log(
+                        f"[red]track {track_obj.id} download error "
+                        f"(skipping): {type(exc).__name__}: {exc}[/red]"
+                    )
+                    agg.failed += 1
                     continue
 
                 track_results.append(dl_result)

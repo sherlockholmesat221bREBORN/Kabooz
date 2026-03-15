@@ -507,6 +507,7 @@ def artist(
 
     total_albums = 0
     total_tracks = 0
+    total_failed = 0
 
     def on_start(title: str, index: int, total: int) -> None:
         console.print(f"  [{index}] {title}")
@@ -530,6 +531,7 @@ def artist(
             workers=workers,
         )
         total_albums = len(results)
+        total_failed = sum(r.failed for r in results)
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
         _handle_auth_error(exc)
     except Exception as exc:
@@ -539,6 +541,7 @@ def artist(
     console.print(
         f"\n[green]Done.[/green] "
         f"{total_albums} albums, {total_tracks} tracks downloaded."
+        + (f"  [yellow]{total_failed} failed.[/yellow]" if total_failed else "")
     )
 
 
