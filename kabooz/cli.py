@@ -579,11 +579,12 @@ def album(
     if album_obj.goodies and do_goodies:
         console.print(f"  [dim]+{len(album_obj.goodies)} goodie(s)[/dim]")
 
-    tagger    = Tagger()
-    total     = album_obj.tracks.total
-    succeeded = 0
-    skipped   = 0
-    failed    = 0
+    tagger        = Tagger()
+    total         = album_obj.tracks.total
+    succeeded     = 0
+    skipped       = 0
+    failed        = 0
+    track_results: list[DownloadResult] = []   # ← accumulate all results here
 
     with Downloader(
         read_timeout=cfg.download.read_timeout,
@@ -639,6 +640,8 @@ def album(
                     failed += 1
                     continue
 
+            track_results.append(result)   # ← collect every result, skipped or not
+
             if result.skipped:
                 if not _needs_tagging(result.path, check_cover=embed_cover):
                     console.print("    [yellow]Already complete, skipped.[/yellow]")
@@ -651,12 +654,14 @@ def album(
 
         # ── Goodies ───────────────────────────────────────────────────────
         if do_goodies and album_obj.goodies:
-            # Resolve album dir from first downloaded/skipped track.
+            # Walk track_results (all downloaded/skipped tracks) to find
+            # the album folder. Using the first result is sufficient —
+            # all tracks in the same album land in the same parent dir.
             album_dir = dest_dir
-            all_results = [r for r in (locals().get("result"),) if r is not None]
-            # Walk to find actual album folder.
-            for r in all_results:
+            for r in track_results:
                 candidate = r.path.parent
+                # Multi-disc albums: track lives in Disc N/ subfolder,
+                # so go up one more level to reach the album root.
                 if album_obj.media_count and album_obj.media_count > 1:
                     candidate = candidate.parent
                 if candidate.is_dir():

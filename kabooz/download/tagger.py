@@ -70,13 +70,13 @@ class Tagger:
         cover_data = None
         if embed_cover:
             img = None
-        if album and album.image:
-            img = album.image
-        elif track.album and track.album.image:
-            img = track.album.image
-        if img:
-            url = img.large or img.small
-            cover_data = self._fetch_cover(url)
+            if album and album.image:
+                img = album.image
+            elif track.album and track.album.image:
+                img = track.album.image
+            if img:
+                url = img.large or img.small
+                cover_data = self._fetch_cover(url)
 
         if suffix == ".flac":
             self._tag_flac(path, track, album, lyrics, cover_data)
