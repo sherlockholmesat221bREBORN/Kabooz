@@ -9,7 +9,7 @@ method calls, with no dependency on typer or any CLI framework.
 Usage:
     from kabooz import QobuzSession, Quality
 
-    session = QobuzSession.from_config()          # load ~/.config/qobuz/config.toml
+    session = QobuzSession.from_config()
     session.download_track("12345")
     session.download_album("https://open.qobuz.com/album/abc123")
     session.clone_playlist("8898080", name="My Copy")
@@ -18,6 +18,20 @@ Usage:
     session.restore("qobuz-backup-2026-03-15.tar.gz")
     session.import_favorites("favorites-2026-03-15.toml")
     session.import_playlist("evening-classical.toml")
+
+    # Account management:
+    profile = session.get_profile()
+    session.update_profile(firstname="Alice", newsletter=False)
+    session.change_password("old", "new")
+
+    # Remote playlist management:
+    pl = session.create_remote_playlist("My Playlist", is_public=True)
+    session.add_tracks_to_remote_playlist(pl.id, ["12345", "67890"])
+    session.follow_playlist("8898080")
+
+    # Discovery:
+    releases = session.get_new_releases(type="press-awards")
+    playlists = session.get_featured_playlists()
 
     # Iterate without downloading:
     for track in session.client.iter_playlist_track_summaries("8898080"):
@@ -31,7 +45,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generator, Optional
+from typing import Any, Callable, Optional
 
 from .client import QobuzClient
 from .config import QobuzConfig, _CONFIG_PATH, _SESSION_PATH, load_config
@@ -59,8 +73,9 @@ from .local.export import (
 )
 from .models.album import Album
 from .models.track import Track
-from .models.playlist import PlaylistTrack
+from .models.playlist import Playlist
 from .models.favorites import UserFavorites
+from .models.user import UserProfile
 from .quality import Quality
 from .url import parse_url
 
@@ -96,7 +111,7 @@ class AlbumDownloadResult:
 
     @property
     def failed(self) -> int:
-        return len(self.tracks) == 0 and 0 or 0
+        return 0
 
 
 @dataclass
@@ -115,11 +130,16 @@ class PlaylistDownloadResult:
         return sum(1 for r in self.tracks if r.download.skipped)
 
 
-# ── Progress callback type ─────────────────────────────────────────────────
+# ── Progress callback types ────────────────────────────────────────────────
 
-ProgressCallback  = Callable[[int, int], None]
+# Signature: on_progress(done_bytes, total_bytes)
+ProgressCallback = Callable[[int, int], None]
+
+# Signature: on_track_start(track_title, index, total)
 TrackStartCallback = Callable[[str, int, int], None]
-TrackDoneCallback  = Callable[[TrackDownloadResult], None]
+
+# Signature: on_track_done(result)
+TrackDoneCallback = Callable[[TrackDownloadResult], None]
 
 
 # ── Session ────────────────────────────────────────────────────────────────
@@ -194,7 +214,11 @@ class QobuzSession:
 
     # ── URL / ID resolution ────────────────────────────────────────────────
 
-    def resolve_id(self, url_or_id: str, expected_type: Optional[str] = None) -> tuple[str, str]:
+    def resolve_id(
+        self,
+        url_or_id: str,
+        expected_type: Optional[str] = None,
+    ) -> tuple[str, str]:
         """
         Parse a Qobuz URL or bare ID.
         Returns (entity_type, entity_id).
@@ -226,14 +250,17 @@ class QobuzSession:
 
         All parameters default to config values when None.
         Returns a TrackDownloadResult with flags indicating what ran.
+
+        This method is safe to call from library code — it never exits
+        or prints; use the return value to check what happened.
         """
         cfg = self.config
         t   = cfg.tagging
         mb  = cfg.musicbrainz
 
-        _embed_cover  = embed_cover        if embed_cover        is not None else t.embed_cover
-        _fetch_lyrics = fetch_lyrics_flag  if fetch_lyrics_flag  is not None else t.fetch_lyrics
-        _save_cover   = save_cover_file    if save_cover_file     is not None else t.save_cover_file
+        _embed_cover  = embed_cover       if embed_cover       is not None else t.embed_cover
+        _fetch_lyrics = fetch_lyrics_flag if fetch_lyrics_flag is not None else t.fetch_lyrics
+        _save_cover   = save_cover_file   if save_cover_file   is not None else t.save_cover_file
 
         tagged = lyrics_found = mb_enriched = False
 
@@ -304,7 +331,19 @@ class QobuzSession:
         workers: Optional[int] = None,
         external_downloader: Optional[str] = None,
     ) -> TrackDownloadResult:
-        """Download a single track and run the full post-processing pipeline."""
+        """
+        Download a single track and run the full post-processing pipeline.
+
+        Parameters:
+            url_or_id:   Qobuz track ID or URL.
+            quality:     Quality tier. Defaults to config value.
+            dest_dir:    Output directory. Defaults to config value.
+            template:    Naming template override.
+            on_progress: Callback(bytes_done, total_bytes).
+
+        Returns TrackDownloadResult with the download outcome and flags
+        for what post-processing ran.
+        """
         cfg = self.config
         _, track_id = self.resolve_id(url_or_id, "track")
 
@@ -358,7 +397,16 @@ class QobuzSession:
         workers: Optional[int] = None,
         external_downloader: Optional[str] = None,
     ) -> AlbumDownloadResult:
-        """Download a full album and run post-processing on each track."""
+        """
+        Download a full album and run post-processing on each track.
+
+        Parameters:
+            url_or_id:        Qobuz album ID or URL.
+            on_track_start:   Callback(title, index, total) before each track.
+            on_track_done:    Callback(TrackDownloadResult) after each track.
+            on_progress:      Per-track progress callback(bytes_done, total).
+            download_goodies: Download booklet PDFs and bonus files.
+        """
         cfg = self.config
         _, album_id = self.resolve_id(url_or_id, "album")
 
@@ -367,9 +415,9 @@ class QobuzSession:
         n_work = workers or cfg.download.max_workers
         ext_dl = external_downloader or cfg.download.external_downloader
 
-        album_obj = self.client.get_album(album_id)
-
+        album_obj    = self.client.get_album(album_id)
         release_type = (album_obj.release_type or "album").lower()
+
         if template:
             tmpl = template
         elif release_type == "single":
@@ -466,7 +514,13 @@ class QobuzSession:
         external_downloader: Optional[str] = None,
         write_m3u: bool = False,
     ) -> PlaylistDownloadResult:
-        """Download a full Qobuz playlist (all pages, pagination-proof)."""
+        """
+        Download a full Qobuz playlist (all pages, pagination-proof).
+
+        Parameters:
+            url_or_id:  Qobuz playlist ID or URL.
+            write_m3u:  Write an .m3u8 file alongside the downloaded tracks.
+        """
         cfg = self.config
         _, playlist_id = self.resolve_id(url_or_id, "playlist")
 
@@ -551,7 +605,12 @@ class QobuzSession:
         on_track_done: Optional[TrackDoneCallback] = None,
         workers: Optional[int] = None,
     ) -> PlaylistDownloadResult:
-        """Download all tracks in a local (SQLite) playlist."""
+        """
+        Download all tracks in a local (SQLite) playlist.
+
+        Parameters:
+            playlist_name_or_id: Playlist name or ID prefix.
+        """
         cfg = self.config
 
         pl = self.store.get_playlist_by_name(playlist_name_or_id)
@@ -670,7 +729,10 @@ class QobuzSession:
 
         if output is None:
             self.config.local_data.playlists_dir.mkdir(parents=True, exist_ok=True)
-            output = self.config.local_data.playlists_dir / f"{sanitize(pl['name'])}.toml"
+            output = (
+                self.config.local_data.playlists_dir
+                / f"{sanitize(pl['name'])}.toml"
+            )
 
         save_playlist(lpl, output)
         return output
@@ -686,8 +748,9 @@ class QobuzSession:
         Parameters:
             file:      Path to a qobuz-playlist TOML file.
             overwrite: If True, replace any existing playlist with the same
-                       name. If False (default), append " (imported)" to the
-                       name when a conflict exists.
+                       name. If False (default), append ' (imported)' to the
+                       name when a conflict exists, so the call always
+                       succeeds and always returns a usable ID.
 
         Returns the new local playlist ID.
         Raises ValueError if the file is not a valid qobuz-playlist.
@@ -696,11 +759,11 @@ class QobuzSession:
         if pl_id is not None:
             return pl_id
 
-        # Playlist already existed and overwrite=False: use the " (imported)"
-        # suffix strategy so the call always returns a usable ID.
-        lpl       = load_playlist(file)
-        new_name  = f"{lpl.name} (imported)"
-        local_id  = self.store.create_playlist(new_name, lpl.description)
+        # Playlist already existed and overwrite=False — use the suffix strategy
+        # so this method always returns a valid ID.
+        lpl      = load_playlist(file)
+        new_name = f"{lpl.name} (imported)"
+        local_id = self.store.create_playlist(new_name, lpl.description)
         for i, t in enumerate(lpl.tracks):
             self.store.add_track_to_playlist(
                 local_id, t.id,
@@ -766,6 +829,7 @@ class QobuzSession:
         """
         Remove a track, album, or artist from local favorites.
         Returns True if removed, False if it wasn't present.
+        Raises PoolModeError if remote=True in pool mode.
         """
         removed = self.store.remove_favorite(id, type)
         if remote:
@@ -795,9 +859,8 @@ class QobuzSession:
                 "Pool mode clients don't have a personal account to sync from."
             )
 
-        types  = [type] if type else ["track", "album", "artist"]
-        result = {}
-
+        types    = [type] if type else ["track", "album", "artist"]
+        result   = {}
         fav      = self.client.get_user_favorites()
         type_map = {"track": fav.tracks, "album": fav.albums, "artist": fav.artists}
 
@@ -823,7 +886,10 @@ class QobuzSession:
             from datetime import datetime, timezone
             self.config.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
             date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            output = self.config.local_data.exports_dir / f"qobuz-backup-{date}.tar.gz"
+            output = (
+                self.config.local_data.exports_dir
+                / f"qobuz-backup-{date}.tar.gz"
+            )
 
         return backup_to_tar(
             store=self.store,
@@ -845,7 +911,10 @@ class QobuzSession:
             from datetime import datetime, timezone
             self.config.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
             date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            output = self.config.local_data.exports_dir / f"favorites-{date}.toml"
+            output = (
+                self.config.local_data.exports_dir
+                / f"favorites-{date}.toml"
+            )
 
         return export_favorites_toml(self.store, output, type=type)
 
@@ -862,7 +931,7 @@ class QobuzSession:
         Parameters:
             file:  Path to a favorites TOML export file.
             merge: If True (default), upsert — existing favorites not in the
-                   file are preserved.  If False, each type present in the
+                   file are preserved. If False, each type present in the
                    file is cleared before inserting.
 
         Returns the number of favorites imported.
@@ -884,7 +953,7 @@ class QobuzSession:
         Restore from a backup archive created by backup().
 
         By default only favorites and playlists are restored (merged into
-        the live store), so existing data is not destroyed.  Pass
+        the live store), so existing data is not destroyed. Pass
         restore_db=True for a full atomic database replacement — the store
         should be re-opened after that call.
 
@@ -902,7 +971,10 @@ class QobuzSession:
         Raises FileNotFoundError if the archive does not exist.
         Raises ValueError if the archive is not a valid qobuz backup.
         """
-        playlists_dir = self.config.local_data.playlists_dir if restore_playlists else None
+        playlists_dir = (
+            self.config.local_data.playlists_dir
+            if restore_playlists else None
+        )
         return restore_from_tar(
             self.store,
             Path(archive_path),
@@ -912,6 +984,193 @@ class QobuzSession:
             merge=merge,
             playlists_dir=playlists_dir,
         )
+
+    # ── User profile ───────────────────────────────────────────────────────
+
+    def get_profile(self) -> UserProfile:
+        """
+        Fetch the authenticated user's full profile.
+
+        Returns a typed UserProfile containing subscription tier,
+        credential parameters, display names, avatar URL, and so on.
+        """
+        return self.client.get_user_info()
+
+    def update_profile(
+        self,
+        email: Optional[str] = None,
+        firstname: Optional[str] = None,
+        lastname: Optional[str] = None,
+        display_name: Optional[str] = None,
+        country_code: Optional[str] = None,
+        language_code: Optional[str] = None,
+        newsletter: Optional[bool] = None,
+    ) -> UserProfile:
+        """
+        Update the authenticated user's profile fields.
+
+        Only the fields you pass are changed — omit a parameter to leave
+        the corresponding field unchanged on the Qobuz account.
+
+        Parameters:
+            email:         New email address.
+            firstname:     Given name.
+            lastname:      Family name.
+            display_name:  Public display name.
+            country_code:  ISO 3166-1 alpha-2 country code, e.g. 'US', 'GB'.
+            language_code: Preferred interface language, e.g. 'en', 'fr'.
+            newsletter:    Subscribe / unsubscribe from the Qobuz newsletter.
+
+        Returns the updated UserProfile.
+        Raises PoolModeError in pool mode.
+        Raises APIError if the server rejects the update (e.g. email taken).
+        """
+        return self.client.update_user(
+            email=email,
+            firstname=firstname,
+            lastname=lastname,
+            display_name=display_name,
+            country_code=country_code,
+            language_code=language_code,
+            newsletter=newsletter,
+        )
+
+    def change_password(
+        self,
+        current_password: str,
+        new_password: str,
+    ) -> None:
+        """
+        Change the password for the authenticated Qobuz account.
+
+        Parameters:
+            current_password: Existing password in plain text.
+            new_password:     Desired new password in plain text.
+
+        Raises PoolModeError in pool mode.
+        Raises InvalidCredentialsError if current_password is wrong.
+        Raises APIError for other server-side errors (e.g. password too weak).
+        """
+        self.client.update_password(current_password, new_password)
+
+    # ── Remote playlist management ─────────────────────────────────────────
+
+    def create_remote_playlist(
+        self,
+        name: str,
+        description: str = "",
+        is_public: bool = False,
+        is_collaborative: bool = False,
+        also_save_locally: bool = True,
+    ) -> Playlist:
+        """
+        Create a new playlist on the user's Qobuz account.
+
+        Parameters:
+            name:               Playlist title.
+            description:        Optional description.
+            is_public:          Make the playlist publicly visible.
+            is_collaborative:   Allow other users to add tracks.
+            also_save_locally:  If True (default), also create a matching
+                                entry in the local store so it shows up in
+                                local playlist commands.
+
+        Returns the newly created remote Playlist object.
+        Raises PoolModeError in pool mode.
+        """
+        pl = self.client.create_remote_playlist(
+            name=name,
+            description=description,
+            is_public=is_public,
+            is_collaborative=is_collaborative,
+        )
+        if also_save_locally:
+            self.store.create_playlist(name, description)
+        return pl
+
+    def update_remote_playlist(
+        self,
+        playlist_id: str | int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        is_public: Optional[bool] = None,
+        is_collaborative: Optional[bool] = None,
+    ) -> Playlist:
+        """
+        Update the metadata of a Qobuz playlist owned by the user.
+
+        Only the fields you pass are changed.
+        Raises PoolModeError in pool mode.
+        """
+        return self.client.update_remote_playlist(
+            playlist_id=playlist_id,
+            name=name,
+            description=description,
+            is_public=is_public,
+            is_collaborative=is_collaborative,
+        )
+
+    def delete_remote_playlist(self, playlist_id: str | int) -> None:
+        """
+        Permanently delete a Qobuz playlist owned by the user.
+        Raises PoolModeError in pool mode.
+        """
+        self.client.delete_remote_playlist(playlist_id)
+
+    def add_tracks_to_remote_playlist(
+        self,
+        playlist_id: str | int,
+        track_ids: list[str | int],
+        no_duplicate: bool = True,
+    ) -> None:
+        """
+        Add tracks to a Qobuz playlist owned by the user.
+
+        Parameters:
+            playlist_id:  Target playlist ID.
+            track_ids:    Qobuz track IDs to add.
+            no_duplicate: Skip tracks already in the playlist (default True).
+
+        Raises PoolModeError in pool mode.
+        """
+        self.client.add_tracks_to_remote_playlist(
+            playlist_id=playlist_id,
+            track_ids=track_ids,
+            no_duplicate=no_duplicate,
+        )
+
+    def remove_tracks_from_remote_playlist(
+        self,
+        playlist_id: str | int,
+        playlist_track_ids: list[int],
+    ) -> None:
+        """
+        Remove tracks from a Qobuz playlist by playlist_track_id.
+
+        The playlist_track_id is the join-table ID on each PlaylistTrack
+        object — NOT the track ID. Collect these from
+        client.get_playlist() first.
+
+        Raises PoolModeError in pool mode.
+        """
+        self.client.remove_tracks_from_remote_playlist(
+            playlist_id=playlist_id,
+            playlist_track_ids=playlist_track_ids,
+        )
+
+    def follow_playlist(self, playlist_id: str | int) -> None:
+        """
+        Follow / subscribe to a public Qobuz playlist.
+        Raises PoolModeError in pool mode.
+        """
+        self.client.subscribe_to_playlist(playlist_id)
+
+    def unfollow_playlist(self, playlist_id: str | int) -> None:
+        """
+        Unfollow / unsubscribe from a Qobuz playlist.
+        Raises PoolModeError in pool mode.
+        """
+        self.client.unsubscribe_from_playlist(playlist_id)
 
     # ── Artist discography ─────────────────────────────────────────────────
 
@@ -969,7 +1228,15 @@ class QobuzSession:
         on_track_done: Optional[TrackDoneCallback] = None,
         workers: Optional[int] = None,
     ) -> PlaylistDownloadResult:
-        """Download all favorited tracks or albums."""
+        """
+        Download all favorited tracks or albums.
+
+        Parameters:
+            type:     'tracks' — download each favorited track as a single.
+                      'albums' — download each favorited album in full.
+            quality:  Quality tier. Defaults to config value.
+            dest_dir: Output directory. Defaults to config value.
+        """
         cfg  = self.config
         q    = quality or Quality[cfg.download.quality.upper()]
         dest = dest_dir or Path(cfg.download.output_dir)
@@ -1005,7 +1272,9 @@ class QobuzSession:
                 if on_track_start:
                     on_track_start(track_obj.display_title, i, 0)
                 try:
-                    url_info = self.client.get_track_url(str(track_obj.id), quality=q)
+                    url_info = self.client.get_track_url(
+                        str(track_obj.id), quality=q
+                    )
                     dl_result = dl.download_track(
                         track=track_obj, url_info=url_info,
                         dest_dir=dest, album=None,
@@ -1032,7 +1301,14 @@ class QobuzSession:
         on_track_done: Optional[TrackDoneCallback] = None,
         workers: Optional[int] = None,
     ) -> PlaylistDownloadResult:
-        """Download all purchased albums or tracks."""
+        """
+        Download all purchased albums or tracks.
+
+        Parameters:
+            type:     'albums' (default) or 'tracks'.
+            quality:  Quality tier. Defaults to config value.
+            dest_dir: Output directory. Defaults to config value.
+        """
         cfg  = self.config
         q    = quality or Quality[cfg.download.quality.upper()]
         dest = dest_dir or Path(cfg.download.output_dir)
@@ -1070,7 +1346,9 @@ class QobuzSession:
                         getattr(track_obj, "display_title", str(track_obj)), i, 0
                     )
                 try:
-                    url_info = self.client.get_track_url(str(track_obj.id), quality=q)
+                    url_info = self.client.get_track_url(
+                        str(track_obj.id), quality=q
+                    )
                     dl_result = dl.download_track(
                         track=track_obj, url_info=url_info,
                         dest_dir=dest, album=None,
@@ -1085,6 +1363,61 @@ class QobuzSession:
                     on_track_done(tdr)
 
         return agg
+
+    # ── Discovery ──────────────────────────────────────────────────────────
+
+    def get_featured_playlists(
+        self,
+        type: str = "editor-picks",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Fetch editorially curated playlists.
+
+        Parameters:
+            type:     Curation type: 'editor-picks', 'last-created',
+                      'best-of'. See client.get_featured_playlists() for
+                      the full list of accepted values.
+            genre_id: Filter by genre ID.
+            limit:    Max results (default 25, max 100).
+            offset:   Pagination offset.
+        """
+        return self.client.get_featured_playlists(
+            type=type, genre_id=genre_id, limit=limit, offset=offset,
+        )
+
+    def get_new_releases(
+        self,
+        type: str = "new-releases",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Fetch new or featured album releases.
+
+        Parameters:
+            type:     Feed type: 'new-releases', 'press-awards',
+                      'editor-picks', 'most-streamed', 'best-sellers', etc.
+            genre_id: Filter by genre ID.
+            limit:    Max results (default 25, max 100).
+            offset:   Pagination offset.
+        """
+        return self.client.get_new_releases(
+            type=type, genre_id=genre_id, limit=limit, offset=offset,
+        )
+
+    def get_genres(self, parent_id: Optional[int] = None) -> dict:
+        """
+        Fetch the Qobuz genre tree.
+
+        Parameters:
+            parent_id: Fetch sub-genres of this ID.
+                       Omit to fetch top-level genres.
+        """
+        return self.client.get_genres(parent_id=parent_id)
 
     # ── Internals ──────────────────────────────────────────────────────────
 

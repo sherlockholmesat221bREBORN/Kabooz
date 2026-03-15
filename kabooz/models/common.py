@@ -1,4 +1,4 @@
-# models/common.py
+# kabooz/models/common.py
 
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -50,8 +50,6 @@ class Composer:
 class Label:
     id: int
     name: str
-    # slug and supplier_id are absent on some older catalog entries —
-    # treat them as optional to avoid KeyError on incomplete API responses.
     slug: Optional[str] = None
     supplier_id: Optional[int] = None
 
@@ -69,7 +67,11 @@ class Label:
 class Genre:
     id: int
     name: str
-    slug: str
+    # FIX: slug is absent on genre objects returned by /artist/getReleasesList
+    # for some releases (particularly classical). Using data["slug"] caused a
+    # KeyError that surfaced as 'Failed: slug' when downloading a discography.
+    # Changed to data.get("slug", "") so partial genre objects parse cleanly.
+    slug: str = ""
     path: list[Any] = field(default_factory=list)
 
     @classmethod
@@ -77,7 +79,7 @@ class Genre:
         return cls(
             id=data["id"],
             name=data["name"],
-            slug=data["slug"],
+            slug=data.get("slug", ""),
             path=data.get("path", []),
         )
 
@@ -102,8 +104,6 @@ class Image:
         url = self.large or self.small
         if not url:
             return None
-        # rsplit on '_' once from the right to drop the size token,
-        # then reattach the _org.jpg suffix.
         base = url.rsplit("_", 1)[0]
         return f"{base}_org.jpg"
 

@@ -53,7 +53,10 @@ _MAGIC_COMMENT   = "# qobuz-playlist v1\n"
 class LocalPlaylistTrack:
     id: str
     title: str
-    artist: str
+    # FIX: artist was a required positional arg; give it a default so callers
+    # can construct a minimal track with just id + title (e.g. for duplicate
+    # checks or placeholder entries).
+    artist: str = ""
     album: str = ""
     duration: int = 0
     isrc: str = ""
@@ -198,10 +201,11 @@ def playlist_from_store_tracks(
     for t in tracks:
         pl.add_track(LocalPlaylistTrack(
             id=str(t.get("track_id", "")),
-            title=t.get("title", ""),
-            artist=t.get("artist", ""),
-            album=t.get("album", ""),
+            # FIX: use `or ""` so SQLite NULL columns don't pass None through
+            title=t.get("title") or "",
+            artist=t.get("artist") or "",
+            album=t.get("album") or "",
             duration=int(t.get("duration") or 0),
-            isrc=t.get("isrc", ""),
+            isrc=t.get("isrc") or "",
         ))
     return pl

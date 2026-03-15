@@ -30,6 +30,7 @@ from .models.artist import Artist
 from .models.playlist import Playlist
 from .models.release import Release, ReleasesList
 from .models.favorites import UserFavorites, UserFavoriteIds, LabelDetail
+from .models.user import UserProfile
 
 _BASE_URL = "https://www.qobuz.com/api.json/0.2"
 
@@ -101,10 +102,6 @@ class QobuzClient:
         catalog call to find the first one that returns real results.
         Tokens from accounts without an active subscription pass auth
         but return empty catalogs — this filters them out automatically.
-
-        Validation always runs with dev=False regardless of the dev flag,
-        so that probe requests are never cached. dev is enabled on the
-        returned instance only after a working token is confirmed.
 
         Pool-mode clients are read-only. Write operations raise PoolModeError.
         """
@@ -188,9 +185,9 @@ class QobuzClient:
         """
         Raise PoolModeError if the client is in pool mode.
 
-        Call this at the top of every method that modifies account state
-        (favourites, library). Pool tokens belong to shared accounts —
-        writes against them would corrupt state for all pool users.
+        Call this at the top of every method that modifies account state.
+        Pool tokens belong to shared accounts — writes against them would
+        corrupt state for all pool users.
         """
         if self._token_pool is not None:
             raise PoolModeError(
@@ -228,11 +225,7 @@ class QobuzClient:
             "login() requires either (username + password) or (token + user_id)."
         )
 
-    def _login_with_token(
-        self,
-        token: str,
-        user_id: Optional[str],
-    ) -> AuthSession:
+    def _login_with_token(self, token: str, user_id: Optional[str]) -> AuthSession:
         if not user_id:
             raise ValueError(
                 "login(token=...) also requires user_id. "
@@ -266,11 +259,7 @@ class QobuzClient:
         self.session = None
 
     def rotate_token(self) -> AuthSession:
-        """
-        Advance to the next token in the pool. Call this when you catch
-        a TokenExpiredError and want to try the next token without
-        re-authenticating from scratch.
-        """
+        """Advance to the next token in the pool."""
         if self._token_pool is None:
             raise AuthError(
                 "rotate_token() is only available on clients created via "
@@ -286,12 +275,7 @@ class QobuzClient:
     # ── Session persistence ────────────────────────────────────────────────
 
     def save_session(self, path: str | Path) -> None:
-        """
-        Persist the current session to a JSON file.
-        Parent directories are created automatically.
-
-        Raises NoAuthError if there is no active session to save.
-        """
+        """Persist the current session to a JSON file."""
         if self.session is None:
             raise NoAuthError("No active session to save. Call login() first.")
         dest = Path(path).expanduser()
@@ -299,12 +283,7 @@ class QobuzClient:
         dest.write_text(json.dumps(self.session.to_dict(), indent=2))
 
     def load_session(self, path: str | Path) -> AuthSession:
-        """
-        Restore a previously saved session from a JSON file and set it
-        as the active session on this client.
-
-        Raises FileNotFoundError if the file does not exist.
-        """
+        """Restore a previously saved session from a JSON file."""
         src = Path(path).expanduser()
         data = json.loads(src.read_text())
         self.session = AuthSession.from_dict(data)
@@ -330,15 +309,12 @@ class QobuzClient:
             all_params["user_auth_token"] = self.session.user_auth_token
             headers["X-User-Auth-Token"]  = self.session.user_auth_token
 
-        # ── Dev mode: cache check ──────────────────────────────────────────
         if self._dev:
             from .dev import load_cached, save_cached, dev_log
-
             cached = load_cached(method, endpoint, all_params)
             if cached is not None:
                 dev_log(f"[green]CACHE HIT[/green] {method} {endpoint}")
                 return cached
-
             visible = [k for k in all_params if k not in ("user_auth_token",)]
             dev_log(f"{method} {endpoint} params={visible} → fetching…")
 
@@ -347,7 +323,6 @@ class QobuzClient:
         )
         body = self._handle_response(response)
 
-        # ── Dev mode: cache the fresh response ────────────────────────────
         if self._dev:
             from .dev import save_cached, dev_log
             save_cached(method, endpoint, all_params, body)
@@ -389,9 +364,7 @@ class QobuzClient:
         track_id: str,
         format_id: int,
     ) -> tuple[str, str]:
-        """
-        Compute the timestamp + MD5 signature required by getFileUrl.
-        """
+        """Compute the timestamp + MD5 signature required by getFileUrl."""
         ts = str(int(time.time()))
         canonical = (
             f"trackgetFileUrl"
@@ -404,7 +377,7 @@ class QobuzClient:
         sig = hashlib.md5(canonical.encode("utf-8")).hexdigest()
         return ts, sig
 
-    # ── Catalog endpoints — single-item fetches ────────────────────────────
+    # ── Catalog — single-item fetches ──────────────────────────────────────
 
     def get_track(self, track_id: str | int) -> Track:
         """Fetch a single track by ID."""
@@ -425,10 +398,9 @@ class QobuzClient:
         Fetch a single album by ID.
 
         Parameters:
-            extra:  Additional data to include. Accepted values:
-                    'albumsFromSameArtist', 'focus', 'focusAll', 'track_ids'.
-                    Combine with commas for multiple: 'focus,albumsFromSameArtist'.
-            limit:  Maximum number of tracks to include (default 1200, API max).
+            extra:  Additional data: 'albumsFromSameArtist', 'focus',
+                    'focusAll', 'track_ids'. Combine with commas.
+            limit:  Maximum number of tracks to include (default 1200).
             offset: Offset into the track list.
         """
         params: dict[str, Any] = {"album_id": album_id, "limit": limit, "offset": offset}
@@ -449,10 +421,10 @@ class QobuzClient:
         Fetch artist info and optionally their discography.
 
         Parameters:
-            extras: Comma-separated extras. Values: 'albums', 'playlists',
+            extras: Comma-separated extras: 'albums', 'playlists',
                     'albums_with_last_release', 'focusAll'.
-                    Pass '' to skip extras entirely.
-            sort:   Sort extra results. Values: 'release_desc', 'official'.
+                    Pass '' to skip extras.
+            sort:   Sort extras: 'release_desc', 'official'.
             limit:  Max number of extra items (default 50, max 500).
             offset: Offset into extra items.
         """
@@ -492,14 +464,7 @@ class QobuzClient:
         limit: int = 25,
         offset: int = 0,
     ) -> LabelDetail:
-        """
-        Fetch a record label and optionally its album catalogue.
-
-        Parameters:
-            extra:  Comma-separated extras. Values: 'albums', 'focus', 'focusAll'.
-            limit:  Max albums to include (default 25, max 500).
-            offset: Offset into album list.
-        """
+        """Fetch a record label and optionally its album catalogue."""
         params: dict[str, Any] = {
             "label_id": str(label_id),
             "limit":    limit,
@@ -524,14 +489,11 @@ class QobuzClient:
         Fetch a page of releases for an artist from /artist/getReleasesList.
 
         Parameters:
-            release_type: Filter by type. Values: 'all', 'album', 'live',
-                          'compilation', 'epSingle', 'other', 'download'.
-                          Combine with commas.
-            sort:         Sort by: 'release_date', 'relevant',
-                          'release_date_by_priority'.
+            release_type: 'all', 'album', 'live', 'compilation', 'epSingle',
+                          'other', 'download'. Combine with commas.
+            sort:         'release_date', 'relevant', 'release_date_by_priority'.
             order:        'desc' (default) or 'asc'.
-            track_size:   Max tracks to include per release (1–30, default 1).
-                          Use 1 unless you need track listings — it's faster.
+            track_size:   Max tracks per release (1–30). Use 1 for speed.
             limit:        Max releases per page (default 50, max 100).
             offset:       Offset into results.
         """
@@ -557,12 +519,8 @@ class QobuzClient:
         """
         Return a list of artists similar to the given artist.
 
-        Qobuz surfaces similar artists as a list of IDs on the Artist
-        object (similar_artist_ids). This method fetches them and returns
-        the full Artist objects, up to `limit` results.
-
-        Note: each similar artist requires a separate API call. Use a
-        small limit if you only need a few results.
+        Note: each similar artist requires a separate API call.
+        Use a small limit if you only need a few results.
         """
         artist = self.get_artist(artist_id, extras="")
         similar_ids = (artist.similar_artist_ids or [])[:limit]
@@ -574,7 +532,7 @@ class QobuzClient:
                 continue
         return result
 
-    # ── Catalog endpoints — search ─────────────────────────────────────────
+    # ── Catalog — search ──────────────────────────────────────────────────
 
     def search(
         self,
@@ -585,63 +543,43 @@ class QobuzClient:
     ) -> dict:
         """
         Search the Qobuz catalog.
-        type is one of: "tracks", "albums", "artists", "playlists",
-        "articles", "focus", "stories".
+        type: 'tracks', 'albums', 'artists', 'playlists', 'articles',
+              'focus', 'stories'.
         """
         return self._request(
             "GET", "/catalog/search",
             params={"query": query, "type": type, "limit": limit, "offset": offset},
         )
 
-    def search_tracks(
-        self,
-        query: str,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> dict:
+    def search_tracks(self, query: str, limit: int = 50, offset: int = 0) -> dict:
         """Search tracks via the dedicated /track/search endpoint."""
         return self._request(
             "GET", "/track/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
 
-    def search_albums(
-        self,
-        query: str,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> dict:
+    def search_albums(self, query: str, limit: int = 50, offset: int = 0) -> dict:
         """Search albums via the dedicated /album/search endpoint."""
         return self._request(
             "GET", "/album/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
 
-    def search_artists(
-        self,
-        query: str,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> dict:
+    def search_artists(self, query: str, limit: int = 50, offset: int = 0) -> dict:
         """Search artists via the dedicated /artist/search endpoint."""
         return self._request(
             "GET", "/artist/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
 
-    def search_playlists(
-        self,
-        query: str,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> dict:
+    def search_playlists(self, query: str, limit: int = 50, offset: int = 0) -> dict:
         """Search playlists via the dedicated /playlist/search endpoint."""
         return self._request(
             "GET", "/playlist/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
 
-    # ── User library — single-page reads ──────────────────────────────────
+    # ── User library — reads ───────────────────────────────────────────────
 
     def get_user_favorites(
         self,
@@ -654,10 +592,9 @@ class QobuzClient:
         Fetch the authenticated user's favourites.
 
         Parameters:
-            type:    Filter by type: 'tracks', 'albums', 'artists', 'articles'.
-                     Pass None (default) to return all types at once.
-            user_id: Fetch another user's public favourites by their ID.
-                     Omit to use the authenticated user.
+            type:    'tracks', 'albums', 'artists', 'articles'.
+                     None returns all types at once.
+            user_id: Fetch another user's public favourites.
             limit:   Max items per type (default 50, max 500).
             offset:  Offset into results.
         """
@@ -678,10 +615,6 @@ class QobuzClient:
         """
         Fetch just the IDs of the user's favourites.
         Useful for quickly checking membership without fetching full objects.
-
-        Parameters:
-            user_id: Fetch another user's IDs by their user ID.
-            limit:   Max IDs to return (default 5000, max 999999).
         """
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if user_id:
@@ -689,11 +622,7 @@ class QobuzClient:
         data = self._request("GET", "/favorite/getUserFavoriteIds", params=params)
         return UserFavoriteIds.from_dict(data)
 
-    def get_user_playlists(
-        self,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> dict:
+    def get_user_playlists(self, limit: int = 50, offset: int = 0) -> dict:
         """Fetch playlists owned by the authenticated user."""
         return self._request(
             "GET", "/playlist/getUserPlaylists",
@@ -706,16 +635,13 @@ class QobuzClient:
         limit: int = 50,
         offset: int = 0,
     ) -> dict:
-        """
-        Fetch albums or tracks the user has purchased outright.
-        type is 'albums' or 'tracks'.
-        """
+        """Fetch albums or tracks the user has purchased. type: 'albums' or 'tracks'."""
         return self._request(
             "GET", "/purchase/getUserPurchases",
             params={"type": type, "limit": limit, "offset": offset},
         )
 
-    # ── Favourites — write operations (personal session only) ─────────────
+    # ── Favourites — write (personal session only) ─────────────────────────
 
     def add_favorite(
         self,
@@ -726,12 +652,7 @@ class QobuzClient:
         """
         Add tracks, albums, and/or artists to the user's favourites.
         At least one list must be non-empty.
-
         Raises PoolModeError if called from a token-pool client.
-
-        Example:
-            client.add_favorite(track_ids=[12345, 67890])
-            client.add_favorite(album_ids=["abc123"], artist_ids=[999])
         """
         self._guard_write("add_favorite")
         if not any([track_ids, album_ids, artist_ids]):
@@ -752,7 +673,6 @@ class QobuzClient:
         """
         Remove tracks, albums, and/or artists from the user's favourites.
         At least one list must be non-empty.
-
         Raises PoolModeError if called from a token-pool client.
         """
         self._guard_write("remove_favorite")
@@ -775,17 +695,12 @@ class QobuzClient:
         """
         Resolve a track to a signed CDN download URL.
 
-        The returned dict contains "url" plus format metadata:
-        "bit_depth", "sampling_rate", "mime_type", "format_id".
+        The returned dict contains 'url' plus format metadata:
+        'bit_depth', 'sampling_rate', 'mime_type', 'format_id'.
 
         The URL expires in roughly 30 minutes — don't cache it.
 
-        Note: Qobuz silently downgrades quality when a track is not
-        available at the requested tier. Check format_id in the response
-        to see what quality was actually granted.
-
-        Raises NotStreamableError if the track cannot be streamed at all
-        (geo-block, label restriction, subscription tier).
+        Raises NotStreamableError if the track cannot be streamed at all.
         """
         if not self.session:
             raise NoAuthError("get_track_url() requires authentication.")
@@ -811,16 +726,6 @@ class QobuzClient:
         return result
 
     # ── Pagination — lazy generators ───────────────────────────────────────
-    #
-    # All iter_* methods yield individual items one at a time.
-    # Pages are fetched on demand — iteration stops as soon as you break.
-    #
-    # Usage:
-    #     for album in client.iter_artist_albums(artist_id):
-    #         print(album.display_title)
-    #
-    #     # Collect everything:
-    #     all_albums = list(client.iter_artist_albums(artist_id))
 
     def iter_artist_albums(
         self,
@@ -828,21 +733,12 @@ class QobuzClient:
         sort: Optional[str] = None,
         page_size: int = 50,
     ) -> Generator[Album, None, None]:
-        """
-        Lazily iterate over all albums for an artist.
-
-        Parameters:
-            sort:      'release_desc' or 'official'.
-            page_size: Items per API call (default 50, max 500).
-        """
+        """Lazily iterate over all albums for an artist."""
         offset = 0
         while True:
             artist = self.get_artist(
-                artist_id,
-                extras="albums",
-                sort=sort,
-                limit=page_size,
-                offset=offset,
+                artist_id, extras="albums", sort=sort,
+                limit=page_size, offset=offset,
             )
             if not artist.albums or not artist.albums.items:
                 break
@@ -861,30 +757,13 @@ class QobuzClient:
         order: str = "desc",
         page_size: int = 50,
     ) -> Generator[Release, None, None]:
-        """
-        Lazily iterate over all releases for an artist via
-        /artist/getReleasesList.
-
-        Yields Release objects (richer than Album — includes rights,
-        structured dates, and per-track format info).
-
-        Parameters:
-            release_type: 'album', 'live', 'compilation', 'epSingle',
-                          'other', 'download', or combinations.
-            sort:         'release_date', 'relevant', 'release_date_by_priority'.
-            order:        'desc' (default) or 'asc'.
-            page_size:    Items per API call (default 50, max 100).
-        """
+        """Lazily iterate over all releases for an artist."""
         offset = 0
         while True:
             page = self.get_release_list(
-                artist_id,
-                release_type=release_type,
-                sort=sort,
-                order=order,
-                track_size=1,
-                limit=page_size,
-                offset=offset,
+                artist_id, release_type=release_type,
+                sort=sort, order=order, track_size=1,
+                limit=page_size, offset=offset,
             )
             for release in (page.items or []):
                 yield release
@@ -897,20 +776,10 @@ class QobuzClient:
         label_id: str | int,
         page_size: int = 50,
     ) -> Generator[Album, None, None]:
-        """
-        Lazily iterate over all albums on a record label.
-
-        Parameters:
-            page_size: Items per API call (default 50, max 500).
-        """
+        """Lazily iterate over all albums on a record label."""
         offset = 0
         while True:
-            label = self.get_label(
-                label_id,
-                extra="albums",
-                limit=page_size,
-                offset=offset,
-            )
+            label = self.get_label(label_id, extra="albums", limit=page_size, offset=offset)
             if not label.albums or not label.albums.items:
                 break
             for album in label.albums.items:
@@ -928,27 +797,22 @@ class QobuzClient:
     ) -> Generator[Any, None, None]:
         """
         Lazily iterate over all user favourites.
+        Yields Track, Album, or Artist objects depending on type.
 
         Parameters:
-            type:      'tracks', 'albums', or 'artists'. Pass None to
-                       iterate all types in a single pass (tracks first,
-                       then albums, then artists).
+            type:      'tracks', 'albums', or 'artists'.
+                       None iterates all types (tracks → albums → artists).
             user_id:   Fetch another user's public favourites.
             page_size: Items per API call (default 50, max 500).
-
-        Yields Track, Album, or Artist objects depending on type.
         """
         types = [type] if type else ["tracks", "albums", "artists"]
         for t in types:
             offset = 0
             while True:
                 fav = self.get_user_favorites(
-                    type=t,
-                    user_id=user_id,
-                    limit=page_size,
-                    offset=offset,
+                    type=t, user_id=user_id, limit=page_size, offset=offset,
                 )
-                page = getattr(fav, t, None)   # fav.tracks / fav.albums / fav.artists
+                page = getattr(fav, t, None)
                 if not page or not page.items:
                     break
                 for item in page.items:
@@ -962,20 +826,10 @@ class QobuzClient:
         type: str = "albums",
         page_size: int = 50,
     ) -> Generator[Any, None, None]:
-        """
-        Lazily iterate over all purchased albums or tracks.
-
-        Parameters:
-            type:      'albums' (default) or 'tracks'.
-            page_size: Items per API call (default 50).
-        """
+        """Lazily iterate over all purchased albums or tracks."""
         offset = 0
         while True:
-            data = self.get_user_purchases(
-                type=type,
-                limit=page_size,
-                offset=offset,
-            )
+            data = self.get_user_purchases(type=type, limit=page_size, offset=offset)
             collection = data.get(type, {})
             items = collection.get("items", [])
             if not items:
@@ -985,7 +839,7 @@ class QobuzClient:
                 try:
                     yield item_cls.from_dict(item_data)
                 except Exception:
-                    yield item_data   # fall back to raw dict on parse error
+                    yield item_data
             offset += page_size
             total = collection.get("total", 0)
             if offset >= total:
@@ -1020,10 +874,7 @@ class QobuzClient:
     ) -> Generator[Track, None, None]:
         """
         Lazily iterate over all tracks in an album.
-
-        Useful for very long albums or box sets where the default
-        get_album() call might miss tracks if they exceed the page.
-        For most albums get_album() with the default limit=1200 is enough.
+        For most albums get_album() with limit=1200 is sufficient.
         """
         offset = 0
         while True:
@@ -1031,7 +882,6 @@ class QobuzClient:
             if not album.tracks or not album.tracks.items:
                 break
             for track_summary in album.tracks.items:
-                # TrackSummary → full Track
                 try:
                     yield self.get_track(track_summary.id)
                 except Exception:
@@ -1047,15 +897,8 @@ class QobuzClient:
         page_size: int = 500,
     ) -> Generator[Any, None, None]:
         """
-        Lazily yield all PlaylistTrack items from a playlist, across all
-        pages. Pagination-proof regardless of playlist size.
-
-        Returns lightweight PlaylistTrack objects — one API call per
-        page rather than one per track. Use this for clone, download,
-        and any operation where you only need track IDs and basic metadata.
-
-        Parameters:
-            page_size: Items per API call (default 500, Qobuz max).
+        Lazily yield all PlaylistTrack items across all pages.
+        Pagination-proof regardless of playlist size.
         """
         offset = 0
         while True:
@@ -1074,14 +917,9 @@ class QobuzClient:
         page_size: int = 500,
     ) -> Generator[Track, None, None]:
         """
-        Lazily yield full Track objects for every track in a playlist,
-        across all pages. Pagination-proof.
-
-        Makes one extra API call per track to get the full Track object
-        (AudioInfo, performers string, composer, work, version, etc.).
-
-        Use iter_playlist_track_summaries() when you only need IDs and
-        basic display metadata — it's much faster for large playlists.
+        Lazily yield full Track objects for every track in a playlist.
+        Makes one extra API call per track — use iter_playlist_track_summaries()
+        when only IDs and basic metadata are needed.
         """
         for summary in self.iter_playlist_track_summaries(playlist_id, page_size):
             try:
@@ -1089,31 +927,593 @@ class QobuzClient:
             except (NotFoundError, APIError):
                 continue
 
-    # ── User account endpoints ─────────────────────────────────────────────
+    # ── User account — read ────────────────────────────────────────────────
 
-    def get_user_info(self) -> dict:
+    def get_user_info(self) -> UserProfile:
         """
-        Fetch the authenticated user's profile information.
+        Fetch the authenticated user's full profile.
 
-        Returns the raw API dict containing fields like:
-        id, login, email, firstname, lastname, avatar, credential,
-        subscription, store_features, and so on.
+        Returns a typed UserProfile with subscription tier, credential
+        parameters, display names, avatar URL, and so on.
         """
-        return self._request("GET", "/user/get")
+        data = self._request("GET", "/user/get")
+        return UserProfile.from_dict(data)
 
     def reset_password(self, username_or_email: str) -> dict:
         """
         Request a password reset email for a Qobuz account.
 
-        Works for both username and email address. Qobuz sends a reset
-        link to the account's registered email address.
-
-        Does NOT require authentication — can be called before login.
-
-        Returns a status dict with a 'status' key ('success' or error).
+        Works for both username and email address. Does NOT require
+        authentication — can be called before login.
         """
         return self._request(
             "GET", "/user/resetPassword",
             params={"username": username_or_email},
             require_auth=False,
         )
+
+    # ── User account — update (personal session only) ──────────────────────
+
+    def update_user(
+        self,
+        email: Optional[str] = None,
+        firstname: Optional[str] = None,
+        lastname: Optional[str] = None,
+        display_name: Optional[str] = None,
+        country_code: Optional[str] = None,
+        language_code: Optional[str] = None,
+        newsletter: Optional[bool] = None,
+    ) -> UserProfile:
+        """
+        Update the authenticated user's profile fields.
+
+        Only the fields you pass are changed — omit a parameter to leave
+        the corresponding field unchanged.
+
+        Parameters:
+            email:         New email address.
+            firstname:     Given name.
+            lastname:      Family name.
+            display_name:  Public display name (separate from login username).
+            country_code:  ISO 3166-1 alpha-2 country code, e.g. 'US', 'GB'.
+            language_code: Preferred interface language, e.g. 'en', 'fr'.
+            newsletter:    Subscribe / unsubscribe from the Qobuz newsletter.
+
+        Returns the updated UserProfile.
+        Raises PoolModeError in pool mode.
+        Raises APIError if the server rejects the update (e.g. email taken).
+        """
+        self._guard_write("update_user")
+        params: dict[str, Any] = {}
+        if email         is not None: params["email"]         = email
+        if firstname     is not None: params["firstname"]     = firstname
+        if lastname      is not None: params["lastname"]      = lastname
+        if display_name  is not None: params["display_name"]  = display_name
+        if country_code  is not None: params["country_code"]  = country_code
+        if language_code is not None: params["language_code"] = language_code
+        if newsletter    is not None: params["newsletter"]    = int(newsletter)
+        if not params:
+            raise ValueError("update_user() called with no fields to update.")
+        data = self._request("POST", "/user/update", params=params)
+        return UserProfile.from_dict(data)
+
+    def update_password(
+        self,
+        current_password: str,
+        new_password: str,
+    ) -> dict:
+        """
+        Change the password for the authenticated account.
+
+        Parameters:
+            current_password: The user's existing password (plain text — it
+                              is MD5-hashed before transmission).
+            new_password:     The desired new password (plain text — hashed
+                              before transmission).
+
+        Returns a status dict from the API.
+        Raises PoolModeError in pool mode.
+        Raises InvalidCredentialsError if current_password is wrong.
+        """
+        self._guard_write("update_password")
+        return self._request(
+            "POST", "/user/update",
+            params={
+                "old_password": hashlib.md5(current_password.encode("utf-8")).hexdigest(),
+                "new_password": hashlib.md5(new_password.encode("utf-8")).hexdigest(),
+            },
+        )
+
+    # ── Remote playlist management (personal session only) ─────────────────
+
+    def create_remote_playlist(
+        self,
+        name: str,
+        description: str = "",
+        is_public: bool = False,
+        is_collaborative: bool = False,
+    ) -> Playlist:
+        """
+        Create a new playlist on the user's Qobuz account.
+
+        Parameters:
+            name:             Playlist title (required).
+            description:      Optional description shown in the app.
+            is_public:        If True, the playlist is publicly visible.
+            is_collaborative: If True, other users can add tracks.
+
+        Returns the newly created Playlist object.
+        Raises PoolModeError in pool mode.
+        """
+        self._guard_write("create_remote_playlist")
+        data = self._request(
+            "POST", "/playlist/create",
+            params={
+                "name":             name,
+                "description":      description,
+                "is_public":        int(is_public),
+                "is_collaborative": int(is_collaborative),
+            },
+        )
+        return Playlist.from_dict(data)
+
+    def update_remote_playlist(
+        self,
+        playlist_id: str | int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        is_public: Optional[bool] = None,
+        is_collaborative: Optional[bool] = None,
+    ) -> Playlist:
+        """
+        Update the metadata of an existing Qobuz playlist.
+
+        Only the fields you pass are changed. The playlist must be owned
+        by the authenticated user.
+
+        Returns the updated Playlist object.
+        Raises PoolModeError in pool mode.
+        """
+        self._guard_write("update_remote_playlist")
+        params: dict[str, Any] = {"playlist_id": str(playlist_id)}
+        if name             is not None: params["name"]             = name
+        if description      is not None: params["description"]      = description
+        if is_public        is not None: params["is_public"]        = int(is_public)
+        if is_collaborative is not None: params["is_collaborative"] = int(is_collaborative)
+        if len(params) == 1:
+            raise ValueError("update_remote_playlist() called with no fields to update.")
+        data = self._request("POST", "/playlist/update", params=params)
+        return Playlist.from_dict(data)
+
+    def delete_remote_playlist(self, playlist_id: str | int) -> dict:
+        """
+        Permanently delete a Qobuz playlist owned by the authenticated user.
+
+        This is irreversible. Raises PoolModeError in pool mode.
+        """
+        self._guard_write("delete_remote_playlist")
+        return self._request(
+            "POST", "/playlist/delete",
+            params={"playlist_id": str(playlist_id)},
+        )
+
+    def add_tracks_to_remote_playlist(
+        self,
+        playlist_id: str | int,
+        track_ids: list[str | int],
+        no_duplicate: bool = True,
+    ) -> dict:
+        """
+        Add tracks to a Qobuz playlist owned by the authenticated user.
+
+        Parameters:
+            playlist_id:  Playlist to add tracks to.
+            track_ids:    List of Qobuz track IDs to append.
+            no_duplicate: If True (default), Qobuz will silently skip
+                          tracks already in the playlist.
+
+        Returns a status dict with 'tracks_count' (new total).
+        Raises PoolModeError in pool mode.
+        """
+        self._guard_write("add_tracks_to_remote_playlist")
+        if not track_ids:
+            raise ValueError("track_ids must not be empty.")
+        return self._request(
+            "POST", "/playlist/addTracks",
+            params={
+                "playlist_id":  str(playlist_id),
+                "track_ids":    ",".join(str(i) for i in track_ids),
+                "no_duplicate": int(no_duplicate),
+            },
+        )
+
+    def remove_tracks_from_remote_playlist(
+        self,
+        playlist_id: str | int,
+        playlist_track_ids: list[int],
+    ) -> dict:
+        """
+        Remove tracks from a Qobuz playlist by their *playlist_track_id*
+        (the join-table ID, not the track ID).
+
+        The playlist_track_id field is present on every PlaylistTrack
+        object returned by get_playlist() or iter_playlist_track_summaries().
+        You must collect these IDs first, then pass them here.
+
+        Example:
+            pl = client.get_playlist("12345")
+            ids_to_remove = [
+                t.playlist_track_id
+                for t in pl.tracks.items
+                if t.title == "Some Track"
+            ]
+            client.remove_tracks_from_remote_playlist("12345", ids_to_remove)
+
+        Returns a status dict.
+        Raises PoolModeError in pool mode.
+        """
+        self._guard_write("remove_tracks_from_remote_playlist")
+        if not playlist_track_ids:
+            raise ValueError("playlist_track_ids must not be empty.")
+        return self._request(
+            "POST", "/playlist/deleteTracks",
+            params={
+                "playlist_id":        str(playlist_id),
+                "playlist_track_ids": ",".join(str(i) for i in playlist_track_ids),
+            },
+        )
+
+    def subscribe_to_playlist(self, playlist_id: str | int) -> dict:
+        """
+        Follow / subscribe to a public Qobuz playlist.
+
+        The playlist appears in the user's library after this call.
+        Raises PoolModeError in pool mode.
+        """
+        self._guard_write("subscribe_to_playlist")
+        return self._request(
+            "POST", "/playlist/subscribe",
+            params={"playlist_id": str(playlist_id)},
+        )
+
+    def unsubscribe_from_playlist(self, playlist_id: str | int) -> dict:
+        """
+        Unfollow / unsubscribe from a Qobuz playlist.
+
+        Raises PoolModeError in pool mode.
+        """
+        self._guard_write("unsubscribe_from_playlist")
+        return self._request(
+            "POST", "/playlist/unsubscribe",
+            params={"playlist_id": str(playlist_id)},
+        )
+
+    # ── Editorial / discovery ──────────────────────────────────────────────
+
+    def get_featured_playlists(
+        self,
+        type: str = "editor-picks",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Fetch editorially curated playlists.
+
+        Parameters:
+            type:     Curation type. Common values:
+                        'editor-picks'     — editorial staff picks
+                        'last-created'     — newest public playlists
+                        'best-of'          — best-of collections
+                      Check the Qobuz app for current values as the API
+                      may support additional types.
+            genre_id: Filter by genre ID (optional).
+            limit:    Max playlists to return (default 25, max 100).
+            offset:   Offset into results.
+
+        Returns a raw dict with a 'playlists' key containing items and
+        pagination info.
+        """
+        params: dict[str, Any] = {
+            "type":   type,
+            "limit":  limit,
+            "offset": offset,
+        }
+        if genre_id is not None:
+            params["genre_id"] = genre_id
+        return self._request("GET", "/playlist/getFeatured", params=params)
+
+    def get_new_releases(
+        self,
+        type: str = "new-releases",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Fetch new or featured album releases from the editorial catalogue.
+
+        Parameters:
+            type:     Release feed type. Common values:
+                        'new-releases'          — newest releases
+                        'new-releases-full'     — full catalog new releases
+                        'press-awards'          — critic award winners
+                        'editor-picks'          — editorial album picks
+                        'most-streamed'         — trending albums
+                        'ideal-discography'     — canonical artist picks
+                        'best-sellers'          — current bestsellers
+                      Check the Qobuz app for current values.
+            genre_id: Filter by genre ID (optional).
+            limit:    Max albums to return (default 25, max 100).
+            offset:   Offset into results.
+
+        Returns a raw dict with an 'albums' key.
+        """
+        params: dict[str, Any] = {
+            "type":   type,
+            "limit":  limit,
+            "offset": offset,
+        }
+        if genre_id is not None:
+            params["genre_id"] = genre_id
+        return self._request("GET", "/album/getFeatured", params=params)
+
+    def get_genres(self, parent_id: Optional[int] = None) -> dict:
+        """
+        Fetch the Qobuz genre tree.
+
+        Parameters:
+            parent_id: Fetch sub-genres of this genre ID.
+                       Omit to fetch top-level genres.
+
+        Returns a raw dict with a 'genres' key containing the list.
+        """
+        params: dict[str, Any] = {}
+        if parent_id is not None:
+            params["parent_id"] = parent_id
+        return self._request("GET", "/genre/list", params=params)
+        
+    # ── User profile ───────────────────────────────────────────────────────────
+
+    def get_profile(self) -> "UserProfile":
+        """
+        Fetch the authenticated user's full profile.
+
+        Returns a typed UserProfile containing subscription tier,
+        credential parameters, display names, avatar URL, etc.
+        """
+        from .models.user import UserProfile
+        return self.client.get_user_info()
+
+    def update_profile(
+        self,
+        email: Optional[str] = None,
+        firstname: Optional[str] = None,
+        lastname: Optional[str] = None,
+        display_name: Optional[str] = None,
+        country_code: Optional[str] = None,
+        language_code: Optional[str] = None,
+        newsletter: Optional[bool] = None,
+    ) -> "UserProfile":
+        """
+        Update the authenticated user's profile fields.
+
+        Only the fields you pass are changed — omit a parameter to leave
+        the corresponding field unchanged on the Qobuz account.
+
+        Parameters:
+            email:         New email address.
+            firstname:     Given name.
+            lastname:      Family name.
+            display_name:  Public display name.
+            country_code:  ISO 3166-1 alpha-2 country code, e.g. 'US', 'GB'.
+            language_code: Preferred interface language, e.g. 'en', 'fr'.
+            newsletter:    Subscribe / unsubscribe from the Qobuz newsletter.
+
+        Returns the updated UserProfile.
+        Raises PoolModeError in pool mode.
+        Raises APIError if the server rejects the update (e.g. email taken).
+        """
+        return self.client.update_user(
+            email=email,
+            firstname=firstname,
+            lastname=lastname,
+            display_name=display_name,
+            country_code=country_code,
+            language_code=language_code,
+            newsletter=newsletter,
+        )
+
+    def change_password(
+        self,
+        current_password: str,
+        new_password: str,
+    ) -> None:
+        """
+        Change the password for the authenticated Qobuz account.
+
+        Parameters:
+            current_password: Existing password in plain text.
+            new_password:     Desired new password in plain text.
+
+        Raises PoolModeError in pool mode.
+        Raises InvalidCredentialsError if current_password is wrong.
+        Raises APIError for other server-side errors (e.g. password too weak).
+        """
+        self.client.update_password(current_password, new_password)
+
+    # ── Remote playlist management ─────────────────────────────────────────
+
+    def create_remote_playlist(
+        self,
+        name: str,
+        description: str = "",
+        is_public: bool = False,
+        is_collaborative: bool = False,
+        also_save_locally: bool = True,
+    ) -> "Playlist":
+        """
+        Create a new playlist on the user's Qobuz account.
+
+        Parameters:
+            name:               Playlist title.
+            description:        Optional description.
+            is_public:          Make the playlist publicly visible.
+            is_collaborative:   Allow other users to add tracks.
+            also_save_locally:  If True (default), also create a matching
+                                entry in the local store so it shows up in
+                                local playlist commands.
+
+        Returns the newly created remote Playlist object.
+        Raises PoolModeError in pool mode.
+        """
+        pl = self.client.create_remote_playlist(
+            name=name,
+            description=description,
+            is_public=is_public,
+            is_collaborative=is_collaborative,
+        )
+        if also_save_locally:
+            self.store.create_playlist(name, description)
+        return pl
+
+    def update_remote_playlist(
+        self,
+        playlist_id: str | int,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        is_public: Optional[bool] = None,
+        is_collaborative: Optional[bool] = None,
+    ) -> "Playlist":
+        """
+        Update the metadata of a Qobuz playlist owned by the user.
+
+        Only the fields you pass are changed.
+        Raises PoolModeError in pool mode.
+        """
+        return self.client.update_remote_playlist(
+            playlist_id=playlist_id,
+            name=name,
+            description=description,
+            is_public=is_public,
+            is_collaborative=is_collaborative,
+        )
+
+    def delete_remote_playlist(
+        self,
+        playlist_id: str | int,
+    ) -> None:
+        """
+        Permanently delete a Qobuz playlist owned by the user.
+        Raises PoolModeError in pool mode.
+        """
+        self.client.delete_remote_playlist(playlist_id)
+
+    def add_tracks_to_remote_playlist(
+        self,
+        playlist_id: str | int,
+        track_ids: list[str | int],
+        no_duplicate: bool = True,
+    ) -> None:
+        """
+        Add tracks to a Qobuz playlist owned by the user.
+
+        Parameters:
+            playlist_id:  Target playlist ID.
+            track_ids:    Qobuz track IDs to add.
+            no_duplicate: Skip tracks already in the playlist (default True).
+
+        Raises PoolModeError in pool mode.
+        """
+        self.client.add_tracks_to_remote_playlist(
+            playlist_id=playlist_id,
+            track_ids=track_ids,
+            no_duplicate=no_duplicate,
+        )
+
+    def remove_tracks_from_remote_playlist(
+        self,
+        playlist_id: str | int,
+        playlist_track_ids: list[int],
+    ) -> None:
+        """
+        Remove tracks from a Qobuz playlist by playlist_track_id.
+
+        The playlist_track_id is the join-table ID on each PlaylistTrack
+        object — NOT the track ID. Collect these from get_playlist() first.
+
+        Raises PoolModeError in pool mode.
+        """
+        self.client.remove_tracks_from_remote_playlist(
+            playlist_id=playlist_id,
+            playlist_track_ids=playlist_track_ids,
+        )
+
+    def follow_playlist(self, playlist_id: str | int) -> None:
+        """
+        Follow / subscribe to a public Qobuz playlist.
+        Raises PoolModeError in pool mode.
+        """
+        self.client.subscribe_to_playlist(playlist_id)
+
+    def unfollow_playlist(self, playlist_id: str | int) -> None:
+        """
+        Unfollow / unsubscribe from a Qobuz playlist.
+        Raises PoolModeError in pool mode.
+        """
+        self.client.unsubscribe_from_playlist(playlist_id)
+
+    # ── Discovery ──────────────────────────────────────────────────────────
+
+    def get_featured_playlists(
+        self,
+        type: str = "editor-picks",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Fetch editorially curated playlists.
+
+        Parameters:
+            type:     Curation type: 'editor-picks', 'last-created',
+                      'best-of'. See client.get_featured_playlists() for
+                      full list.
+            genre_id: Filter by genre ID.
+            limit:    Max results (default 25, max 100).
+            offset:   Pagination offset.
+        """
+        return self.client.get_featured_playlists(
+            type=type, genre_id=genre_id, limit=limit, offset=offset,
+        )
+
+    def get_new_releases(
+        self,
+        type: str = "new-releases",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Fetch new or featured album releases.
+
+        Parameters:
+            type:     Feed type: 'new-releases', 'press-awards',
+                      'editor-picks', 'most-streamed', 'best-sellers', etc.
+            genre_id: Filter by genre ID.
+            limit:    Max results (default 25, max 100).
+            offset:   Pagination offset.
+        """
+        return self.client.get_new_releases(
+            type=type, genre_id=genre_id, limit=limit, offset=offset,
+        )
+
+    def get_genres(self, parent_id: Optional[int] = None) -> dict:
+        """
+        Fetch the Qobuz genre tree.
+
+        Parameters:
+            parent_id: Fetch sub-genres of this ID.
+                       Omit to fetch top-level genres.
+        """
+        return self.client.get_genres(parent_id=parent_id)    
