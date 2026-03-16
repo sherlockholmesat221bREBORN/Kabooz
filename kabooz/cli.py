@@ -33,18 +33,18 @@ from .exceptions import (
     PoolModeError, TokenExpiredError,
 )
 from .quality import Quality
-from .session import QobuzSession
+from .session import QobuzSession, _parse_quality
 from .url import parse_url
 
 # ── Sub-apps ───────────────────────────────────────────────────────────────
 
-app          = typer.Typer(name="qobuz", add_completion=False,
-                           help="Unofficial Qobuz CLI.")
-library_app  = typer.Typer(help="Manage local and remote favourites.")
-lpl_app      = typer.Typer(help="Create, manage, and share local playlists.")
-export_app   = typer.Typer(help="Export, import, and back up your library.")
-account_app  = typer.Typer(help="View and update your Qobuz account profile.")
-remote_app   = typer.Typer(help="Manage playlists on your Qobuz account.")
+app         = typer.Typer(name="qobuz", add_completion=False,
+                          help="Unofficial Qobuz CLI.")
+library_app = typer.Typer(help="Manage local and remote favourites.")
+lpl_app     = typer.Typer(help="Create, manage, and share local playlists.")
+export_app  = typer.Typer(help="Export, import, and back up your library.")
+account_app = typer.Typer(help="View and update your Qobuz account profile.")
+remote_app  = typer.Typer(help="Manage playlists on your Qobuz account.")
 
 app.add_typer(library_app, name="library")
 app.add_typer(lpl_app,     name="lpl")
@@ -57,13 +57,77 @@ err_console = Console(stderr=True)
 _dev: bool  = False
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Presentation helpers — display concerns only, no business logic
+# ══════════════════════════════════════════════════════════════════════════
+
+def _quality(s: Optional[str]) -> Optional[Quality]:
+    """
+    Parse a quality flag string. Exits with a helpful error on bad input.
+    Single source of truth — never duplicate this try/except in commands.
+    """
+    if not s:
+        return None
+    try:
+        return _parse_quality(s)
+    except (ValueError, ConfigError) as exc:
+        err_console.print(f"[red]Invalid quality:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+
+def _resolve_id(url_or_id: str, expected_type: Optional[str] = None) -> str:
+    """Parse a Qobuz URL or bare ID and return the entity ID string."""
+    if url_or_id.startswith("http"):
+        try:
+            entity_type, entity_id = parse_url(url_or_id)
+        except ValueError as exc:
+            err_console.print(f"[red]Invalid URL:[/red] {exc}")
+            raise typer.Exit(code=1)
+        if expected_type and entity_type != expected_type:
+            err_console.print(
+                f"[red]Expected a {expected_type} URL but got {entity_type}.[/red]"
+            )
+            raise typer.Exit(code=1)
+        return entity_id
+    return url_or_id
+
+
+def _make_progress() -> Progress:
+    return Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(), DownloadColumn(),
+        TransferSpeedColumn(), TimeRemainingColumn(),
+        console=console, transient=True,
+    )
+
+
+def _yn(v: bool) -> str:
+    return "[green]yes[/green]" if v else "[dim]no[/dim]"
+
+
+def _on_track_start(title: str, index: int, total: int) -> None:
+    pad = f"/{total}" if total else ""
+    console.print(f"  [{index}{pad}] {title}")
+
+
+def _on_track_done(result) -> None:
+    if result.download.skipped and not result.download.dev_stub:
+        console.print("    [yellow]Already complete — skipped.[/yellow]")
+
+
+def _on_album_start(title: str, index: int, total: int) -> None:
+    console.print(
+        f"\n[bold cyan][{index}/{total}][/bold cyan]  [bold]{title}[/bold]"
+    )
+
+
 # ── Global callback ────────────────────────────────────────────────────────
 
 @app.callback()
 def main(
     dev: bool = typer.Option(
         False, "--dev", envvar="QOBUZ_DEV", is_eager=True,
-        help="Developer mode: cache API responses and write dev audio.",
+        help="Developer mode: cache API responses, write dev audio.",
     ),
 ) -> None:
     """Unofficial Qobuz CLI."""
@@ -79,7 +143,7 @@ def main(
         )
 
 
-# ── Shared helpers ─────────────────────────────────────────────────────────
+# ── Shared session factory ─────────────────────────────────────────────────
 
 def _cfg() -> QobuzConfig:
     return load_config()
@@ -97,45 +161,9 @@ def _handle_auth_error(exc: Exception) -> None:
     raise typer.Exit(code=1)
 
 
-def _resolve_id(url_or_id: str, expected_type: Optional[str] = None) -> str:
-    if url_or_id.startswith("http"):
-        try:
-            entity_type, entity_id = parse_url(url_or_id)
-        except ValueError as exc:
-            err_console.print(f"[red]Invalid URL:[/red] {exc}")
-            raise typer.Exit(code=1)
-        if expected_type and entity_type != expected_type:
-            err_console.print(
-                f"[red]Expected a {expected_type} URL but got a {entity_type} URL.[/red]"
-            )
-            raise typer.Exit(code=1)
-        return entity_id
-    return url_or_id
-
-
-def _make_progress() -> Progress:
-    return Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(), DownloadColumn(),
-        TransferSpeedColumn(), TimeRemainingColumn(),
-        console=console, transient=True,
-    )
-
-
-def _track_start_cb(title: str, index: int, total: int) -> None:
-    console.print(f"  [{index}/{total}] {title}")
-
-
-def _track_done_cb(result) -> None:
-    if result.download.skipped and not result.download.dev_stub:
-        console.print("    [yellow]Already complete, skipped.[/yellow]")
-
-
-def _yn(v: bool) -> str:
-    return "[green]yes[/green]" if v else "[dim]no[/dim]"
-
-
-# ── Core commands ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# Core commands
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.command()
 def login(
@@ -148,7 +176,7 @@ def login(
     app_secret: Optional[str] = typer.Option(None, "--app-secret", hide_input=True),
 ) -> None:
     """
-    Authenticate with Qobuz. Three modes:
+    Authenticate with Qobuz.
 
     \b
     1. Username + password:  qobuz login -u me@example.com -p secret
@@ -170,7 +198,6 @@ def login(
 
     resolved_app_id     = app_id     or os.environ.get("QOBUZ_APP_ID")     or cfg.credentials.app_id
     resolved_app_secret = app_secret or os.environ.get("QOBUZ_APP_SECRET") or cfg.credentials.app_secret
-
     if not resolved_app_id:
         resolved_app_id = typer.prompt("App ID")
     if not resolved_app_secret:
@@ -213,7 +240,7 @@ def login(
     if cfg.local_data.auto_sync_favorites and not cfg.credentials.pool:
         console.print("[dim]Syncing favorites to local store…[/dim]")
         try:
-            s = QobuzSession.from_client(client, cfg)
+            s      = QobuzSession.from_client(client, cfg)
             counts = s.sync_favorites()
             for t, n in counts.items():
                 if n:
@@ -229,9 +256,9 @@ def login(
 
 @app.command()
 def config(
-    show: bool = typer.Option(False, "--show"),
-    set_: Optional[str] = typer.Option(None, "--set",
-        help="section.key=value  e.g. local_data.track_history=true"),
+    show: bool            = typer.Option(False, "--show"),
+    set_: Optional[str]   = typer.Option(None, "--set",
+        help="section.key=value  e.g. download.max_workers=4"),
 ) -> None:
     """
     View or update the configuration file.
@@ -240,14 +267,12 @@ def config(
     Examples:
         qobuz config --show
         qobuz config --set download.max_workers=4
-        qobuz config --set local_data.data_dir=/sdcard/qobuz-data
-        qobuz config --set local_data.auto_sync_favorites=true
+        qobuz config --set streaming.report_streams=false
+        qobuz config --set download.quality=flac_16
     """
     if show:
-        import dataclasses
-        console.print_json(
-            __import__("json").dumps(dataclasses.asdict(_cfg()), indent=2)
-        )
+        import dataclasses, json
+        console.print_json(json.dumps(dataclasses.asdict(_cfg()), indent=2))
         return
 
     if set_:
@@ -302,7 +327,9 @@ def dev_cache(
     )
 
 
-# ── Download commands ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# Download commands
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.command()
 def track(
@@ -316,28 +343,20 @@ def track(
     template:   Optional[str]  = typer.Option(None,  "--template"),
 ) -> None:
     """Download a single track."""
-    cfg = _cfg()
-    q   = None
-    if quality:
-        try:
-            q = Quality[quality.upper()]
-        except KeyError:
-            err_console.print(f"[red]Unknown quality:[/red] {quality}")
-            raise typer.Exit(code=1)
-
+    cfg  = _cfg()
+    q    = _quality(quality)
     sess = _session(cfg)
     task_ref: list = []
 
     def on_progress(done: int, total: int) -> None:
         if task_ref:
-            prog, task = task_ref
-            prog.update(task, completed=done, total=total or None)
+            task_ref[0][0].update(task_ref[0][1], completed=done, total=total or None)
 
     with _make_progress() as prog:
         try:
-            track_obj = sess.client.get_track(_resolve_id(url_or_id, "track"))
+            track_obj = sess.get_track(_resolve_id(url_or_id, "track"))
             task = prog.add_task(track_obj.title, total=None)
-            task_ref.extend([prog, task])
+            task_ref.append((prog, task))
             result = sess.download_track(
                 url_or_id,
                 quality=q,
@@ -358,10 +377,11 @@ def track(
             err_console.print(f"[red]API error:[/red] {exc}")
             raise typer.Exit(code=1)
 
-    if result.download.skipped and not result.download.dev_stub:
-        console.print(f"[yellow]Skipped[/yellow] (already complete): {result.download.path}")
-        return
-    console.print(f"[green]Done:[/green] {result.download.path}")
+    dl = result.download
+    if dl.skipped and not dl.dev_stub:
+        console.print(f"[yellow]Skipped[/yellow] (already complete): {dl.path}")
+    else:
+        console.print(f"[green]Done:[/green] {dl.path}")
 
 
 @app.command()
@@ -377,15 +397,8 @@ def album(
     template:   Optional[str]  = typer.Option(None,  "--template"),
 ) -> None:
     """Download a full album."""
-    cfg = _cfg()
-    q   = None
-    if quality:
-        try:
-            q = Quality[quality.upper()]
-        except KeyError:
-            err_console.print(f"[red]Unknown quality:[/red] {quality}")
-            raise typer.Exit(code=1)
-
+    cfg  = _cfg()
+    q    = _quality(quality)
     sess = _session(cfg)
     try:
         result = sess.download_album(
@@ -397,8 +410,8 @@ def album(
             fetch_lyrics_flag=lyrics,
             save_cover_file=save_cover,
             download_goodies=goodies if goodies is not None else True,
-            on_track_start=_track_start_cb,
-            on_track_done=_track_done_cb,
+            on_track_start=_on_track_start,
+            on_track_done=_on_track_done,
             workers=workers,
         )
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
@@ -409,7 +422,8 @@ def album(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped."
+        f"{result.succeeded} downloaded, {result.skipped} skipped"
+        + (f", [yellow]{result.failed} failed[/yellow]" if result.failed else "") + "."
     )
 
 
@@ -426,15 +440,8 @@ def playlist(
     m3u:        bool           = typer.Option(False, "--m3u"),
 ) -> None:
     """Download a full playlist (all pages, pagination-proof)."""
-    cfg = _cfg()
-    q   = None
-    if quality:
-        try:
-            q = Quality[quality.upper()]
-        except KeyError:
-            err_console.print(f"[red]Unknown quality:[/red] {quality}")
-            raise typer.Exit(code=1)
-
+    cfg  = _cfg()
+    q    = _quality(quality)
     sess = _session(cfg)
     try:
         result = sess.download_playlist(
@@ -445,8 +452,8 @@ def playlist(
             embed_cover=cover,
             fetch_lyrics_flag=lyrics,
             save_cover_file=save_cover,
-            on_track_start=_track_start_cb,
-            on_track_done=_track_done_cb,
+            on_track_start=_on_track_start,
+            on_track_done=_on_track_done,
             workers=workers,
             write_m3u=m3u,
         )
@@ -458,7 +465,8 @@ def playlist(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, {result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped, "
+        f"{result.failed} failed."
     )
 
 
@@ -480,44 +488,36 @@ def artist(
 
     \b
     Examples:
-        qobuz artist 999
-        qobuz artist https://open.qobuz.com/artist/999
-        qobuz artist 999 --type album
-        qobuz artist 999 --type album,live -q flac_16
+        qobuz artist 298
+        qobuz artist https://open.qobuz.com/artist/298 --type album
+        qobuz artist 298 --type album,live -q flac_16
     """
-    cfg = _cfg()
-    q   = None
-    if quality:
-        try:
-            q = Quality[quality.upper()]
-        except KeyError:
-            err_console.print(f"[red]Unknown quality:[/red] {quality}")
-            raise typer.Exit(code=1)
-
+    cfg  = _cfg()
+    q    = _quality(quality)
     sess = _session(cfg)
+
     try:
-        artist_obj = sess.client.get_artist(_resolve_id(url_or_id, "artist"), extras="")
+        artist_id  = _resolve_id(url_or_id, "artist")
+        artist_obj = sess.get_artist(artist_id, extras="")
         console.print(
-            f"[cyan]Downloading discography:[/cyan] {artist_obj.name}"
-            + (f" [dim](type: {release_type})[/dim]" if release_type else "")
+            f"[cyan]Downloading discography:[/cyan] [bold]{artist_obj.name}[/bold]"
+            + (f"  [dim](type: {release_type})[/dim]" if release_type else "")
         )
     except Exception as exc:
         err_console.print(f"[red]Could not fetch artist:[/red] {exc}")
         raise typer.Exit(code=1)
 
-    total_albums = 0
-    total_tracks = 0
-    total_failed = 0
+    grand_ok   = 0
+    grand_skip = 0
+    grand_fail = 0
 
-    def on_start(title: str, index: int, total: int) -> None:
-        console.print(f"  [{index}] {title}")
-
-    def on_done(result) -> None:
-        nonlocal total_tracks
-        if result.download.skipped and not result.download.dev_stub:
-            console.print("    [yellow]skipped[/yellow]")
+    def on_done(r) -> None:
+        nonlocal grand_ok, grand_skip
+        if r.download.skipped:
+            grand_skip += 1
+            console.print("       [yellow]↩ already complete[/yellow]")
         else:
-            total_tracks += 1
+            grand_ok += 1
 
     try:
         results = sess.download_artist_discography(
@@ -526,12 +526,12 @@ def artist(
             quality=q,
             dest_dir=output or Path(cfg.download.output_dir),
             template=template,
-            on_track_start=on_start,
+            on_album_start=_on_album_start,
+            on_track_start=_on_track_start,
             on_track_done=on_done,
             workers=workers,
         )
-        total_albums = len(results)
-        total_failed = sum(r.failed for r in results)
+        grand_fail = sum(r.failed for r in results)
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
         _handle_auth_error(exc)
     except Exception as exc:
@@ -540,18 +540,19 @@ def artist(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{total_albums} albums, {total_tracks} tracks downloaded."
-        + (f"  [yellow]{total_failed} failed.[/yellow]" if total_failed else "")
+        f"{len(results)} albums · {grand_ok} tracks downloaded · "
+        f"{grand_skip} skipped"
+        + (f" · [yellow]{grand_fail} failed[/yellow]" if grand_fail else "") + "."
     )
 
 
 @app.command()
 def favorites(
-    type:    str            = typer.Option("tracks", "--type", "-t",
-                                           help="tracks or albums"),
-    output:  Optional[Path] = typer.Option(None, "-o", "--output"),
-    quality: Optional[str]  = typer.Option(None, "-q", "--quality"),
-    workers: Optional[int]  = typer.Option(None, "-j", "--workers"),
+    fav_type: str            = typer.Option("tracks", "--type", "-t",
+                                            help="tracks or albums"),
+    output:   Optional[Path] = typer.Option(None, "-o", "--output"),
+    quality:  Optional[str]  = typer.Option(None, "-q", "--quality"),
+    workers:  Optional[int]  = typer.Option(None, "-j", "--workers"),
 ) -> None:
     """
     Download all favorited tracks or albums.
@@ -559,31 +560,23 @@ def favorites(
     \b
     Examples:
         qobuz favorites
-        qobuz favorites --type albums
-        qobuz favorites --type tracks -q flac_16
+        qobuz favorites --type albums -q flac_16
     """
-    if type not in ("tracks", "albums"):
+    if fav_type not in ("tracks", "albums"):
         err_console.print("[red]--type must be 'tracks' or 'albums'[/red]")
         raise typer.Exit(code=1)
 
-    cfg = _cfg()
-    q   = None
-    if quality:
-        try:
-            q = Quality[quality.upper()]
-        except KeyError:
-            err_console.print(f"[red]Unknown quality:[/red] {quality}")
-            raise typer.Exit(code=1)
-
+    cfg  = _cfg()
+    q    = _quality(quality)
     sess = _session(cfg)
-    console.print(f"[cyan]Downloading favorite {type}…[/cyan]")
+    console.print(f"[cyan]Downloading favorite {fav_type}…[/cyan]")
     try:
         result = sess.download_favorites(
-            type=type,
+            fav_type=fav_type,
             quality=q,
             dest_dir=output or Path(cfg.download.output_dir),
-            on_track_start=_track_start_cb,
-            on_track_done=_track_done_cb,
+            on_track_start=_on_track_start,
+            on_track_done=_on_track_done,
             workers=workers,
         )
     except PoolModeError as exc:
@@ -597,49 +590,35 @@ def favorites(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, {result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped, "
+        f"{result.failed} failed."
     )
 
 
 @app.command()
 def purchases(
-    type:    str            = typer.Option("albums", "--type", "-t",
-                                           help="albums or tracks"),
-    output:  Optional[Path] = typer.Option(None, "-o", "--output"),
-    quality: Optional[str]  = typer.Option(None, "-q", "--quality"),
-    workers: Optional[int]  = typer.Option(None, "-j", "--workers"),
+    purchase_type: str            = typer.Option("albums", "--type", "-t",
+                                                 help="albums or tracks"),
+    output:        Optional[Path] = typer.Option(None, "-o", "--output"),
+    quality:       Optional[str]  = typer.Option(None, "-q", "--quality"),
+    workers:       Optional[int]  = typer.Option(None, "-j", "--workers"),
 ) -> None:
-    """
-    Download all purchased albums or tracks.
-
-    \b
-    Examples:
-        qobuz purchases
-        qobuz purchases --type tracks
-        qobuz purchases --type albums -q hi_res
-    """
-    if type not in ("albums", "tracks"):
+    """Download all purchased albums or tracks."""
+    if purchase_type not in ("albums", "tracks"):
         err_console.print("[red]--type must be 'albums' or 'tracks'[/red]")
         raise typer.Exit(code=1)
 
-    cfg = _cfg()
-    q   = None
-    if quality:
-        try:
-            q = Quality[quality.upper()]
-        except KeyError:
-            err_console.print(f"[red]Unknown quality:[/red] {quality}")
-            raise typer.Exit(code=1)
-
+    cfg  = _cfg()
+    q    = _quality(quality)
     sess = _session(cfg)
-    console.print(f"[cyan]Downloading purchased {type}…[/cyan]")
+    console.print(f"[cyan]Downloading purchased {purchase_type}…[/cyan]")
     try:
         result = sess.download_purchases(
-            type=type,
+            purchase_type=purchase_type,
             quality=q,
             dest_dir=output or Path(cfg.download.output_dir),
-            on_track_start=_track_start_cb,
-            on_track_done=_track_done_cb,
+            on_track_start=_on_track_start,
+            on_track_done=_on_track_done,
             workers=workers,
         )
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
@@ -650,25 +629,29 @@ def purchases(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, {result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped, "
+        f"{result.failed} failed."
     )
 
 
 @app.command()
 def search(
     query:       str  = typer.Argument(...),
-    type:        str  = typer.Option("tracks", "--type", "-t"),
+    search_type: str  = typer.Option("tracks", "--type", "-t"),
     limit:       int  = typer.Option(10, "-n"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     """Search the Qobuz catalog."""
     valid = {"tracks", "albums", "artists", "playlists"}
-    if type not in valid:
-        err_console.print(f"[red]Invalid type.[/red] Choose from: {', '.join(sorted(valid))}")
+    if search_type not in valid:
+        err_console.print(
+            f"[red]Invalid type.[/red] Choose from: {', '.join(sorted(valid))}"
+        )
         raise typer.Exit(code=1)
 
+    sess = _session()
     try:
-        results = _session().client.search(query=query, type=type, limit=limit)
+        results = sess.search(query=query, search_type=search_type, limit=limit)
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
         _handle_auth_error(exc)
     except APIError as exc:
@@ -680,13 +663,13 @@ def search(
         console.print(json.dumps(results, indent=2, ensure_ascii=False))
         return
 
-    items = results.get(type, {}).get("items", [])
+    items = results.get(search_type, {}).get("items", [])
     if not items:
         console.print(f"No results for [bold]{query!r}[/bold].")
         return
 
-    table = Table(title=f'Search: "{query}" ({type})', show_lines=False)
-    if type == "tracks":
+    table = Table(title=f'Search: "{query}" ({search_type})', show_lines=False)
+    if search_type == "tracks":
         table.add_column("ID", style="dim", no_wrap=True)
         table.add_column("Title", style="bold")
         table.add_column("Artist")
@@ -695,7 +678,7 @@ def search(
             table.add_row(str(i.get("id", "")), i.get("title", ""),
                           (i.get("performer") or {}).get("name", ""),
                           (i.get("album") or {}).get("title", ""))
-    elif type == "albums":
+    elif search_type == "albums":
         table.add_column("ID", style="dim", no_wrap=True)
         table.add_column("Title", style="bold")
         table.add_column("Artist")
@@ -704,14 +687,14 @@ def search(
             table.add_row(str(i.get("id", "")), i.get("title", ""),
                           (i.get("artist") or {}).get("name", ""),
                           (i.get("release_date_original") or "")[:4])
-    elif type == "artists":
+    elif search_type == "artists":
         table.add_column("ID", style="dim", no_wrap=True)
         table.add_column("Name", style="bold")
         table.add_column("Albums", style="dim")
         for i in items:
             table.add_row(str(i.get("id", "")), i.get("name", ""),
                           str(i.get("albums_count", "")))
-    elif type == "playlists":
+    elif search_type == "playlists":
         table.add_column("ID", style="dim", no_wrap=True)
         table.add_column("Name", style="bold")
         table.add_column("Tracks", style="dim")
@@ -723,117 +706,84 @@ def search(
     console.print(table)
 
 
-# ── Discovery commands ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# Discovery commands
+# ══════════════════════════════════════════════════════════════════════════
 
 @app.command("new-releases")
 def cmd_new_releases(
-    type:     str           = typer.Option("new-releases", "--type", "-t",
-                                           help="Feed type: new-releases, press-awards, "
-                                                "editor-picks, most-streamed, best-sellers, etc."),
-    genre_id: Optional[int] = typer.Option(None, "--genre", help="Filter by genre ID."),
-    limit:    int           = typer.Option(25, "-n"),
+    release_type: str           = typer.Option("new-releases", "--type", "-t"),
+    genre_id:     Optional[int] = typer.Option(None, "--genre"),
+    limit:        int           = typer.Option(25, "-n"),
 ) -> None:
-    """
-    Browse new or editorially featured album releases.
-
-    \b
-    Examples:
-        qobuz new-releases
-        qobuz new-releases --type press-awards
-        qobuz new-releases --type most-streamed --genre 14
-    """
+    """Browse new or featured album releases."""
     sess = _session()
     try:
-        data = sess.get_new_releases(type=type, genre_id=genre_id, limit=limit)
+        data = sess.get_new_releases(release_type=release_type,
+                                     genre_id=genre_id, limit=limit)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
 
     albums = data.get("albums", {}).get("items", [])
     if not albums:
-        console.print("[dim]No results.[/dim]")
-        return
+        console.print("[dim]No results.[/dim]"); return
 
-    table = Table(title=f"New releases ({type})", show_lines=False)
-    table.add_column("ID",     style="dim", no_wrap=True)
-    table.add_column("Title",  style="bold")
+    table = Table(title=f"New releases ({release_type})", show_lines=False)
+    table.add_column("ID", style="dim", no_wrap=True)
+    table.add_column("Title", style="bold")
     table.add_column("Artist")
-    table.add_column("Date",   style="dim")
+    table.add_column("Date", style="dim")
     for a in albums:
-        table.add_row(
-            str(a.get("id", "")), a.get("title", ""),
-            (a.get("artist") or {}).get("name", ""),
-            (a.get("release_date_original") or "")[:10],
-        )
+        table.add_row(str(a.get("id", "")), a.get("title", ""),
+                      (a.get("artist") or {}).get("name", ""),
+                      (a.get("release_date_original") or "")[:10])
     console.print(table)
 
 
 @app.command("featured")
 def cmd_featured(
-    type:     str           = typer.Option("editor-picks", "--type", "-t",
-                                           help="Curation type: editor-picks, last-created, best-of."),
-    genre_id: Optional[int] = typer.Option(None, "--genre", help="Filter by genre ID."),
+    pl_type:  str           = typer.Option("editor-picks", "--type", "-t"),
+    genre_id: Optional[int] = typer.Option(None, "--genre"),
     limit:    int           = typer.Option(25, "-n"),
 ) -> None:
-    """
-    Browse editorially curated playlists.
-
-    \b
-    Examples:
-        qobuz featured
-        qobuz featured --type last-created
-        qobuz featured --genre 14
-    """
+    """Browse editorially curated playlists."""
     sess = _session()
     try:
-        data = sess.get_featured_playlists(type=type, genre_id=genre_id, limit=limit)
+        data = sess.get_featured_playlists(pl_type=pl_type,
+                                           genre_id=genre_id, limit=limit)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
 
-    playlists = data.get("playlists", {}).get("items", [])
-    if not playlists:
-        console.print("[dim]No results.[/dim]")
-        return
+    pls = data.get("playlists", {}).get("items", [])
+    if not pls:
+        console.print("[dim]No results.[/dim]"); return
 
-    table = Table(title=f"Featured playlists ({type})", show_lines=False)
-    table.add_column("ID",     style="dim", no_wrap=True)
-    table.add_column("Name",   style="bold")
+    table = Table(title=f"Featured playlists ({pl_type})", show_lines=False)
+    table.add_column("ID", style="dim", no_wrap=True)
+    table.add_column("Name", style="bold")
     table.add_column("Tracks", style="dim")
     table.add_column("Owner")
-    for p in playlists:
-        table.add_row(
-            str(p.get("id", "")), p.get("name", ""),
-            str(p.get("tracks_count", "")),
-            (p.get("owner") or {}).get("name", ""),
-        )
+    for p in pls:
+        table.add_row(str(p.get("id", "")), p.get("name", ""),
+                      str(p.get("tracks_count", "")),
+                      (p.get("owner") or {}).get("name", ""))
     console.print(table)
 
 
 @app.command("genres")
 def cmd_genres(
-    parent: Optional[int] = typer.Option(None, "--parent",
-                                         help="Show sub-genres of this genre ID."),
+    parent: Optional[int] = typer.Option(None, "--parent"),
 ) -> None:
-    """
-    List Qobuz genres (or sub-genres of a parent).
-
-    \b
-    Examples:
-        qobuz genres
-        qobuz genres --parent 14
-    """
+    """List Qobuz genres (or sub-genres of a parent)."""
     sess = _session()
     try:
         data = sess.get_genres(parent_id=parent)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
 
     genres = data.get("genres", {}).get("items", [])
     if not genres:
-        console.print("[dim]No genres found.[/dim]")
-        return
+        console.print("[dim]No genres found.[/dim]"); return
 
     table = Table(title="Genres", show_lines=False)
     table.add_column("ID",   style="dim", width=6)
@@ -844,23 +794,25 @@ def cmd_genres(
     console.print(table)
 
 
-# ── library subcommands ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# library subcommands
+# ══════════════════════════════════════════════════════════════════════════
 
 @library_app.command("show")
 def library_show(
-    type:  str = typer.Option("all", "--type", "-t"),
-    limit: int = typer.Option(50, "-n"),
+    show_type: str = typer.Option("all", "--type", "-t"),
+    limit:     int = typer.Option(50, "-n"),
 ) -> None:
     """Show local favorites."""
     store = _session().store
-    types = ["track", "album", "artist"] if type == "all" else [type]
+    types = ["track", "album", "artist"] if show_type == "all" else [show_type]
     for t in types:
         items = store.get_favorites(t, limit=limit)
         if not items:
             continue
         table = Table(title=f"Favorite {t}s ({len(items)})", show_lines=False)
-        table.add_column("ID",     style="dim", no_wrap=True)
-        table.add_column("Title",  style="bold")
+        table.add_column("ID",    style="dim", no_wrap=True)
+        table.add_column("Title", style="bold")
         table.add_column("Artist")
         if t == "track":
             table.add_column("Album", style="dim")
@@ -874,61 +826,59 @@ def library_show(
 
 @library_app.command("add")
 def library_add(
-    url_or_id: str  = typer.Argument(...),
-    type:      str  = typer.Option("track", "--type", "-t"),
-    remote:    bool = typer.Option(False, "--remote/--local-only"),
+    url_or_id:   str  = typer.Argument(...),
+    entity_type: str  = typer.Option("track", "--type", "-t"),
+    remote:      bool = typer.Option(False, "--remote/--local-only"),
 ) -> None:
     """Add a track, album, or artist to local favorites."""
-    sess    = _session()
-    item_id = _resolve_id(url_or_id)
+    sess      = _session()
+    entity_id = _resolve_id(url_or_id)
     try:
-        sess.add_favorite(item_id, type, remote=remote)
-        console.print(f"[green]Added[/green] {type} {item_id}.")
+        sess.add_favorite(entity_id, entity_type, remote=remote)
+        console.print(f"[green]Added[/green] {entity_type} {entity_id}.")
         if remote:
             console.print("  [dim]Also added to Qobuz account.[/dim]")
     except PoolModeError:
         err_console.print("[red]--remote not available in pool mode.[/red]")
         raise typer.Exit(code=1)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
 
 
 @library_app.command("remove")
 def library_remove(
-    url_or_id: str  = typer.Argument(...),
-    type:      str  = typer.Option("track", "--type", "-t"),
-    remote:    bool = typer.Option(False, "--remote/--local-only"),
+    url_or_id:   str  = typer.Argument(...),
+    entity_type: str  = typer.Option("track", "--type", "-t"),
+    remote:      bool = typer.Option(False, "--remote/--local-only"),
 ) -> None:
     """Remove a track, album, or artist from local favorites."""
-    sess    = _session()
-    item_id = _resolve_id(url_or_id)
+    sess      = _session()
+    entity_id = _resolve_id(url_or_id)
     try:
-        removed = sess.remove_favorite(item_id, type, remote=remote)
+        removed = sess.remove_favorite(entity_id, entity_type, remote=remote)
         if removed:
-            console.print(f"[green]Removed[/green] {type} {item_id}.")
+            console.print(f"[green]Removed[/green] {entity_type} {entity_id}.")
         else:
-            console.print(f"[yellow]{type} {item_id} was not in local favorites.[/yellow]")
+            console.print(f"[yellow]{entity_type} {entity_id} was not in local favorites.[/yellow]")
         if remote:
             console.print("  [dim]Also removed from Qobuz account.[/dim]")
     except PoolModeError:
         err_console.print("[red]--remote not available in pool mode.[/red]")
         raise typer.Exit(code=1)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
 
 
 @library_app.command("sync")
 def library_sync(
-    type:  str  = typer.Option("all", "--type", "-t"),
-    clear: bool = typer.Option(False, "--clear"),
+    sync_type: str  = typer.Option("all", "--type", "-t"),
+    clear:     bool = typer.Option(False, "--clear"),
 ) -> None:
     """Sync favorites from your Qobuz account into the local store."""
     sess = _session()
     try:
         counts = sess.sync_favorites(
-            type=None if type == "all" else type,
+            fav_type=None if sync_type == "all" else sync_type,
             clear=clear,
         )
         for t, n in counts.items():
@@ -937,8 +887,7 @@ def library_sync(
         err_console.print("[red]sync requires a personal session (not pool mode).[/red]")
         raise typer.Exit(code=1)
     except Exception as exc:
-        err_console.print(f"[red]Sync failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Sync failed:[/red] {exc}"); raise typer.Exit(code=1)
 
 
 @library_app.command("history")
@@ -953,24 +902,21 @@ def library_history(
         return
     rows = store.get_history(limit=limit)
     if not rows:
-        console.print("[dim]No history yet.[/dim]")
-        return
+        console.print("[dim]No history yet.[/dim]"); return
     table = Table(title=f"Recent history (last {limit})", show_lines=False)
     table.add_column("Time",   style="dim", no_wrap=True)
     table.add_column("Title",  style="bold")
     table.add_column("Artist")
     table.add_column("Album",  style="dim")
     for row in rows:
-        table.add_row(
-            row.get("played_at", "")[:16],
-            row.get("title", ""),
-            row.get("artist", ""),
-            row.get("album", ""),
-        )
+        table.add_row(row.get("played_at", "")[:16], row.get("title", ""),
+                      row.get("artist", ""), row.get("album", ""))
     console.print(table)
 
 
-# ── lpl subcommands ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# lpl subcommands
+# ══════════════════════════════════════════════════════════════════════════
 
 @lpl_app.command("list")
 def lpl_list() -> None:
@@ -978,18 +924,15 @@ def lpl_list() -> None:
     store = _session().store
     pls   = store.list_playlists()
     if not pls:
-        console.print("[dim]No local playlists yet. Use [bold]qobuz lpl create[/bold].[/dim]")
-        return
+        console.print("[dim]No local playlists yet.[/dim]"); return
     table = Table(title="Local playlists", show_lines=False)
     table.add_column("ID",      style="dim", no_wrap=True, max_width=10)
     table.add_column("Name",    style="bold")
     table.add_column("Tracks",  style="dim")
     table.add_column("Updated", style="dim")
     for pl in pls:
-        table.add_row(
-            pl["id"][:8], pl["name"],
-            str(pl.get("track_count", 0)), pl.get("updated_at", "")[:10],
-        )
+        table.add_row(pl["id"][:8], pl["name"],
+                      str(pl.get("track_count", 0)), pl.get("updated_at", "")[:10])
     console.print(table)
 
 
@@ -1007,52 +950,43 @@ def lpl_create(
 @lpl_app.command("show")
 def lpl_show(name: str = typer.Argument(...)) -> None:
     """Show tracks in a local playlist."""
-    store = _session().store
-    pl    = store.get_playlist_by_name(name) or next(
-        (c for c in store.list_playlists() if c["id"].startswith(name)), None
-    )
+    sess  = _session()
+    pl    = sess._find_local_playlist(name)
     if not pl:
         err_console.print(f"[red]Playlist not found:[/red] {name}")
         raise typer.Exit(code=1)
-    tracks = store.get_playlist_tracks(pl["id"])
+    tracks = sess.store.get_playlist_tracks(pl["id"])
     console.print(f"[bold]{pl['name']}[/bold]  [dim]{pl.get('description', '')}[/dim]")
     if not tracks:
-        console.print("[dim]Empty.[/dim]")
-        return
+        console.print("[dim]Empty.[/dim]"); return
     table = Table(show_lines=False)
     table.add_column("#",      style="dim", width=4)
     table.add_column("ID",     style="dim", no_wrap=True)
     table.add_column("Title",  style="bold")
     table.add_column("Artist")
     for t in tracks:
-        table.add_row(
-            str(t["position"] + 1), str(t["track_id"]),
-            t.get("title", ""), t.get("artist", ""),
-        )
+        table.add_row(str(t["position"] + 1), str(t["track_id"]),
+                      t.get("title", ""), t.get("artist", ""))
     console.print(table)
 
 
 @lpl_app.command("add")
 def lpl_add(
     playlist: str = typer.Argument(..., help="Playlist name or ID prefix"),
-    track:    str = typer.Argument(..., help="Track ID or Qobuz URL"),
+    track_arg: str = typer.Argument(..., help="Track ID or Qobuz URL"),
 ) -> None:
     """Add a track to a local playlist."""
     sess     = _session()
-    track_id = _resolve_id(track, "track")
-    store    = sess.store
-    pl       = store.get_playlist_by_name(playlist) or next(
-        (c for c in store.list_playlists() if c["id"].startswith(playlist)), None
-    )
+    track_id = _resolve_id(track_arg, "track")
+    pl       = sess._find_local_playlist(playlist)
     if not pl:
         err_console.print(f"[red]Playlist not found:[/red] {playlist}")
         raise typer.Exit(code=1)
 
-    title = artist = album = ""
+    title = artist = album = isrc = ""
     duration = 0
-    isrc = ""
     try:
-        obj      = sess.client.get_track(track_id)
+        obj      = sess.get_track(track_id)
         title    = obj.display_title
         artist   = obj.performer.name if obj.performer else ""
         album    = obj.album.title if obj.album else ""
@@ -1061,7 +995,7 @@ def lpl_add(
     except Exception:
         pass
 
-    store.add_track_to_playlist(
+    sess.store.add_track_to_playlist(
         pl["id"], track_id,
         title=title, artist=artist, album=album, duration=duration, isrc=isrc,
     )
@@ -1070,21 +1004,19 @@ def lpl_add(
 
 @lpl_app.command("remove")
 def lpl_remove(
-    playlist: str = typer.Argument(...),
-    track:    str = typer.Argument(...),
+    playlist:  str = typer.Argument(...),
+    track_arg: str = typer.Argument(...),
 ) -> None:
     """Remove a track from a local playlist."""
-    store = _session().store
-    pl    = store.get_playlist_by_name(playlist) or next(
-        (c for c in store.list_playlists() if c["id"].startswith(playlist)), None
-    )
+    sess  = _session()
+    pl    = sess._find_local_playlist(playlist)
     if not pl:
         err_console.print(f"[red]Playlist not found:[/red] {playlist}")
         raise typer.Exit(code=1)
-    if store.remove_track_from_playlist(pl["id"], track):
-        console.print(f"[green]Removed[/green] track {track} from [bold]{pl['name']}[/bold].")
+    if sess.store.remove_track_from_playlist(pl["id"], track_arg):
+        console.print(f"[green]Removed[/green] track {track_arg} from [bold]{pl['name']}[/bold].")
     else:
-        console.print(f"[yellow]Track {track} was not in that playlist.[/yellow]")
+        console.print(f"[yellow]Track {track_arg} was not in that playlist.[/yellow]")
 
 
 @lpl_app.command("delete")
@@ -1093,41 +1025,30 @@ def lpl_delete(
     confirm: bool = typer.Option(False, "--yes", "-y"),
 ) -> None:
     """Delete a local playlist."""
-    store = _session().store
-    pl    = store.get_playlist_by_name(name) or next(
-        (c for c in store.list_playlists() if c["id"].startswith(name)), None
-    )
+    sess = _session()
+    pl   = sess._find_local_playlist(name)
     if not pl:
         err_console.print(f"[red]Playlist not found:[/red] {name}")
         raise typer.Exit(code=1)
     if not confirm:
         typer.confirm(f"Delete playlist '{pl['name']}'?", abort=True)
-    store.delete_playlist(pl["id"])
+    sess.store.delete_playlist(pl["id"])
     console.print(f"[green]Deleted[/green] [bold]{pl['name']}[/bold].")
 
 
 @lpl_app.command("clone")
 def lpl_clone(
-    url_or_id: str           = typer.Argument(..., help="Qobuz playlist ID or URL"),
+    url_or_id: str           = typer.Argument(...),
     name:      Optional[str] = typer.Option(None, "--name", "-n"),
 ) -> None:
-    """
-    Clone a Qobuz playlist into the local store (pagination-proof).
-
-    \b
-    Examples:
-        qobuz lpl clone 8898080
-        qobuz lpl clone https://open.qobuz.com/playlist/8898080
-        qobuz lpl clone 8898080 --name "My Copy"
-    """
+    """Clone a Qobuz playlist into the local store."""
     sess = _session()
     try:
         pl_id = sess.clone_playlist(url_or_id, name=name)
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
         _handle_auth_error(exc)
     except Exception as exc:
-        err_console.print(f"[red]Clone failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Clone failed:[/red] {exc}"); raise typer.Exit(code=1)
 
     pl     = sess.store.get_playlist(pl_id)
     tracks = sess.store.get_playlist_tracks(pl_id)
@@ -1135,27 +1056,19 @@ def lpl_clone(
         f"[green]Cloned[/green] [bold]{pl['name']}[/bold] "
         f"({len(tracks)} tracks saved locally)."
     )
-    console.print(f"  Download with: [bold]qobuz lpl download {pl['name']!r}[/bold]")
 
 
 @lpl_app.command("download")
 def lpl_download(
-    name:     str            = typer.Argument(..., help="Playlist name or ID prefix"),
+    name:     str            = typer.Argument(...),
     output:   Optional[Path] = typer.Option(None, "-o"),
     quality:  Optional[str]  = typer.Option(None, "-q"),
     workers:  Optional[int]  = typer.Option(None, "-j"),
     template: Optional[str]  = typer.Option(None, "--template"),
 ) -> None:
     """Download all tracks in a local playlist."""
-    cfg = _cfg()
-    q   = None
-    if quality:
-        try:
-            q = Quality[quality.upper()]
-        except KeyError:
-            err_console.print(f"[red]Unknown quality:[/red] {quality}")
-            raise typer.Exit(code=1)
-
+    cfg  = _cfg()
+    q    = _quality(quality)
     sess = _session(cfg)
     try:
         result = sess.download_local_playlist(
@@ -1163,22 +1076,21 @@ def lpl_download(
             quality=q,
             dest_dir=output or Path(cfg.download.output_dir),
             template=template,
-            on_track_start=_track_start_cb,
-            on_track_done=_track_done_cb,
+            on_track_start=_on_track_start,
+            on_track_done=_on_track_done,
             workers=workers,
         )
     except ValueError as exc:
-        err_console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]{exc}[/red]"); raise typer.Exit(code=1)
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
         _handle_auth_error(exc)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, {result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped, "
+        f"{result.failed} failed."
     )
 
 
@@ -1193,28 +1105,16 @@ def lpl_share(
     try:
         path = sess.share_playlist(name, output=output, author=author)
     except ValueError as exc:
-        err_console.print(f"[red]{exc}[/red]")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]{exc}[/red]"); raise typer.Exit(code=1)
     console.print(f"[green]Exported[/green] → {path}")
 
 
 @lpl_app.command("import")
 def lpl_import(
     file:      Path = typer.Argument(...),
-    overwrite: bool = typer.Option(
-        False, "--overwrite/--no-overwrite",
-        help="Replace an existing playlist with the same name instead of "
-             "appending '(imported)' to the name.",
-    ),
+    overwrite: bool = typer.Option(False, "--overwrite/--no-overwrite"),
 ) -> None:
-    """
-    Import a shared TOML playlist file into the local store.
-
-    \b
-    Examples:
-        qobuz lpl import evening-classical.toml
-        qobuz lpl import evening-classical.toml --overwrite
-    """
+    """Import a shared TOML playlist file into the local store."""
     if not file.exists():
         err_console.print(f"[red]File not found:[/red] {file}")
         raise typer.Exit(code=1)
@@ -1222,42 +1122,41 @@ def lpl_import(
     try:
         pl_id = sess.import_playlist(file, overwrite=overwrite)
     except Exception as exc:
-        err_console.print(f"[red]Import failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Import failed:[/red] {exc}"); raise typer.Exit(code=1)
     pl     = sess.store.get_playlist(pl_id)
     tracks = sess.store.get_playlist_tracks(pl_id)
     console.print(f"[green]Imported[/green] [bold]{pl['name']}[/bold] ({len(tracks)} tracks)")
 
 
-# ── export subcommands ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# export subcommands
+# ══════════════════════════════════════════════════════════════════════════
 
 @export_app.command("backup")
-def export_backup(
-    output: Optional[Path] = typer.Option(None, "-o"),
-) -> None:
+def export_backup(output: Optional[Path] = typer.Option(None, "-o")) -> None:
     """Create a full .tar.gz backup of your local library."""
     sess = _session()
     try:
         path = sess.backup(output)
     except Exception as exc:
-        err_console.print(f"[red]Backup failed:[/red] {exc}")
-        raise typer.Exit(code=1)
-    size_kb = path.stat().st_size / 1024
-    console.print(f"[green]Backup saved:[/green] {path}  [dim]({size_kb:.1f} KB)[/dim]")
+        err_console.print(f"[red]Backup failed:[/red] {exc}"); raise typer.Exit(code=1)
+    console.print(
+        f"[green]Backup saved:[/green] {path}  "
+        f"[dim]({path.stat().st_size / 1024:.1f} KB)[/dim]"
+    )
 
 
 @export_app.command("favorites")
-def export_favorites(
-    output: Optional[Path] = typer.Option(None, "-o"),
-    type:   str            = typer.Option("all", "--type", "-t"),
+def export_favorites_cmd(
+    output:   Optional[Path] = typer.Option(None, "-o"),
+    fav_type: str            = typer.Option("all", "--type", "-t"),
 ) -> None:
     """Export local favorites to a TOML file."""
     sess = _session()
     try:
-        path = sess.export_favorites(output, type=None if type == "all" else type)
+        path = sess.export_favorites(output, fav_type=None if fav_type == "all" else fav_type)
     except Exception as exc:
-        err_console.print(f"[red]Export failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Export failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Favorites exported:[/green] {path}")
 
 
@@ -1273,129 +1172,65 @@ def export_playlist(
 
 @export_app.command("import-favorites")
 def export_import_favorites(
-    file:     Path = typer.Argument(..., help="Path to a favorites TOML export file"),
-    no_merge: bool = typer.Option(
-        False, "--replace/--merge",
-        help="--replace clears each type present in the file before importing. "
-             "--merge (default) upserts without removing existing records.",
-    ),
+    file:     Path = typer.Argument(...),
+    no_merge: bool = typer.Option(False, "--replace/--merge"),
 ) -> None:
-    """
-    Import favorites from a TOML file created by 'export favorites'.
-
-    \b
-    Examples:
-        qobuz export import-favorites favorites-2026-03-15.toml
-        qobuz export import-favorites favorites-2026-03-15.toml --replace
-    """
+    """Import favorites from a TOML file created by 'export favorites'."""
     if not file.exists():
         err_console.print(f"[red]File not found:[/red] {file}")
         raise typer.Exit(code=1)
     sess = _session()
     try:
         n = sess.import_favorites(file, merge=not no_merge)
-    except ValueError as exc:
-        err_console.print(f"[red]Invalid file:[/red] {exc}")
-        raise typer.Exit(code=1)
-    except Exception as exc:
-        err_console.print(f"[red]Import failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+    except (ValueError, Exception) as exc:
+        err_console.print(f"[red]Import failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Imported[/green] {n} favorite(s) from {file.name}.")
 
 
 @export_app.command("restore")
 def export_restore(
-    archive:       Path           = typer.Argument(..., help="Path to a .tar.gz backup archive"),
-    favorites:     bool           = typer.Option(True,  "--favorites/--no-favorites",
-                                                 help="Restore favorites from the archive."),
-    playlists:     bool           = typer.Option(True,  "--playlists/--no-playlists",
-                                                 help="Restore playlists from the archive."),
-    db:            bool           = typer.Option(False, "--db",
-                                                 help="Full DB replacement (destructive). "
-                                                      "Re-open the app after this."),
-    replace:       bool           = typer.Option(False, "--replace/--merge",
-                                                 help="--replace clears existing data before "
-                                                      "restoring. --merge (default) upserts."),
-    playlists_dir: Optional[Path] = typer.Option(
-        None, "--playlists-dir",
-        help="Also extract playlist TOML files to this directory.",
-    ),
+    archive:       Path           = typer.Argument(...),
+    do_favorites:  bool           = typer.Option(True,  "--favorites/--no-favorites"),
+    do_playlists:  bool           = typer.Option(True,  "--playlists/--no-playlists"),
+    db:            bool           = typer.Option(False, "--db"),
+    replace:       bool           = typer.Option(False, "--replace/--merge"),
 ) -> None:
-    """
-    Restore from a backup archive created by 'export backup'.
-
-    By default favorites and playlists are merged into the live store so
-    existing data is preserved. Use --replace to clear before restoring.
-    Use --db for a full atomic database swap (everything is replaced).
-
-    \b
-    Examples:
-        qobuz export restore qobuz-backup-2026-03-15.tar.gz
-        qobuz export restore backup.tar.gz --no-favorites
-        qobuz export restore backup.tar.gz --replace
-        qobuz export restore backup.tar.gz --db
-        qobuz export restore backup.tar.gz --playlists-dir ~/Music/playlists
-    """
+    """Restore from a backup archive created by 'export backup'."""
     if not archive.exists():
         err_console.print(f"[red]File not found:[/red] {archive}")
         raise typer.Exit(code=1)
-
     sess = _session()
     try:
         result = sess.restore(
             archive,
-            restore_favorites=favorites,
-            restore_playlists=playlists,
+            restore_favorites=do_favorites,
+            restore_playlists=do_playlists,
             restore_db=db,
             merge=not replace,
         )
-        # Also honour --playlists-dir if given
-        if playlists_dir and not db:
-            from .local.export import restore_from_tar
-            restore_from_tar(
-                sess.store, archive,
-                restore_favorites=False,
-                restore_playlists=True,
-                merge=not replace,
-                playlists_dir=playlists_dir,
-            )
-    except (FileNotFoundError, ValueError) as exc:
-        err_console.print(f"[red]Restore failed:[/red] {exc}")
-        raise typer.Exit(code=1)
     except Exception as exc:
-        err_console.print(f"[red]Restore failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Restore failed:[/red] {exc}"); raise typer.Exit(code=1)
 
     if result.db_restored:
         console.print("[green]Database restored.[/green] Please re-open the application.")
         return
-
     console.print(
         f"[green]Restore complete.[/green]  "
         f"Favorites: {result.favorites_imported}  "
         f"Playlists: {result.playlists_imported} imported, "
         f"{result.playlists_skipped} skipped."
     )
-    if result.errors:
-        err_console.print(f"[yellow]{len(result.errors)} non-fatal error(s):[/yellow]")
-        for e in result.errors:
-            err_console.print(f"  [dim]{e}[/dim]")
+    for e in result.errors:
+        err_console.print(f"  [dim yellow]{e}[/dim yellow]")
 
 
-# ── account subcommands ────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# account subcommands
+# ══════════════════════════════════════════════════════════════════════════
 
 @account_app.command("show")
-def account_show(
-    json_output: bool = typer.Option(False, "--json"),
-) -> None:
-    """
-    Show your Qobuz account profile and subscription tier.
-
-    \b
-    Examples:
-        qobuz account show
-        qobuz account show --json
-    """
+def account_show(json_output: bool = typer.Option(False, "--json")) -> None:
+    """Show your Qobuz account profile and subscription tier."""
     sess = _session()
     try:
         profile = sess.get_profile()
@@ -1427,8 +1262,7 @@ def account_show(
 
     if profile.credential:
         cred = profile.credential
-        console.print()
-        sub = Table(title="Subscription", show_lines=False, box=None)
+        sub  = Table(title="Subscription", show_lines=False, box=None)
         sub.add_column("Field", style="dim", width=20)
         sub.add_column("Value", style="bold")
         sub.add_row("Plan",              cred.label)
@@ -1442,51 +1276,28 @@ def account_show(
 
 @account_app.command("update")
 def account_update(
-    email:        Optional[str]  = typer.Option(None, "--email",
-                                                help="New email address."),
-    firstname:    Optional[str]  = typer.Option(None, "--firstname",
-                                                help="Given name."),
-    lastname:     Optional[str]  = typer.Option(None, "--lastname",
-                                                help="Family name."),
-    display_name: Optional[str]  = typer.Option(None, "--display-name",
-                                                help="Public display name."),
-    country:      Optional[str]  = typer.Option(None, "--country",
-                                                help="ISO 3166-1 alpha-2 country code, e.g. GB."),
-    language:     Optional[str]  = typer.Option(None, "--language",
-                                                help="Preferred language code, e.g. en."),
-    newsletter:   Optional[bool] = typer.Option(None, "--newsletter/--no-newsletter",
-                                                help="Subscribe or unsubscribe from the newsletter."),
+    email:        Optional[str]  = typer.Option(None, "--email"),
+    firstname:    Optional[str]  = typer.Option(None, "--firstname"),
+    lastname:     Optional[str]  = typer.Option(None, "--lastname"),
+    display_name: Optional[str]  = typer.Option(None, "--display-name"),
+    country:      Optional[str]  = typer.Option(None, "--country"),
+    language:     Optional[str]  = typer.Option(None, "--language"),
+    newsletter:   Optional[bool] = typer.Option(None, "--newsletter/--no-newsletter"),
 ) -> None:
-    """
-    Update your Qobuz account profile fields.
-
-    \b
-    Examples:
-        qobuz account update --firstname Alice --lastname Doe
-        qobuz account update --email newemail@example.com
-        qobuz account update --country GB --language en
-        qobuz account update --no-newsletter
-    """
+    """Update your Qobuz account profile fields."""
     if not any([email, firstname, lastname, display_name, country, language,
                 newsletter is not None]):
         err_console.print("[red]Provide at least one field to update.[/red]")
         raise typer.Exit(code=1)
-
     sess = _session()
     try:
         profile = sess.update_profile(
-            email=email,
-            firstname=firstname,
-            lastname=lastname,
-            display_name=display_name,
-            country_code=country,
-            language_code=language,
-            newsletter=newsletter,
+            email=email, firstname=firstname, lastname=lastname,
+            display_name=display_name, country_code=country,
+            language_code=language, newsletter=newsletter,
         )
     except Exception as exc:
-        err_console.print(f"[red]Update failed:[/red] {exc}")
-        raise typer.Exit(code=1)
-
+        err_console.print(f"[red]Update failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(
         f"[green]Profile updated.[/green] "
         f"Name: {profile.full_name}  Email: {profile.email or '—'}"
@@ -1495,42 +1306,27 @@ def account_update(
 
 @account_app.command("password")
 def account_password(
-    current: Optional[str] = typer.Option(None, "--current", hide_input=True,
-                                           help="Current password (prompted if omitted)."),
-    new:     Optional[str] = typer.Option(None, "--new",     hide_input=True,
-                                           help="New password (prompted if omitted)."),
-    confirm: Optional[str] = typer.Option(None, "--confirm", hide_input=True,
-                                           help="Confirm new password (prompted if omitted)."),
+    current: Optional[str] = typer.Option(None, "--current", hide_input=True),
+    new:     Optional[str] = typer.Option(None, "--new",     hide_input=True),
+    confirm: Optional[str] = typer.Option(None, "--confirm", hide_input=True),
 ) -> None:
-    """
-    Change your Qobuz account password.
-
-    \b
-    Example:
-        qobuz account password
-    """
+    """Change your Qobuz account password."""
     if current is None:
         current = typer.prompt("Current password", hide_input=True)
     if new is None:
         new = typer.prompt("New password", hide_input=True)
     if confirm is None:
         confirm = typer.prompt("Confirm new password", hide_input=True)
-
     if new != confirm:
         err_console.print("[red]New passwords do not match.[/red]")
         raise typer.Exit(code=1)
-
     sess = _session()
     try:
         sess.change_password(current, new)
     except Exception as exc:
         err_console.print(f"[red]Password change failed:[/red] {exc}")
         raise typer.Exit(code=1)
-
-    console.print(
-        "[green]Password changed successfully.[/green] "
-        "You may need to log in again on other devices."
-    )
+    console.print("[green]Password changed successfully.[/green]")
 
 
 @account_app.command("subscription")
@@ -1540,13 +1336,9 @@ def account_subscription() -> None:
     try:
         profile = sess.get_profile()
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
-
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     if not profile.credential:
-        console.print("[yellow]No subscription information available.[/yellow]")
-        return
-
+        console.print("[yellow]No subscription information available.[/yellow]"); return
     cred  = profile.credential
     table = Table(title="Subscription", show_lines=False, box=None)
     table.add_column("", style="dim", width=28)
@@ -1557,42 +1349,35 @@ def account_subscription() -> None:
     table.add_row("Lossy streaming",        _yn(cred.lossy_streaming))
     table.add_row("Lossless streaming",     _yn(cred.lossless_streaming))
     table.add_row("Hi-res streaming",       _yn(cred.hires_streaming))
-    table.add_row("Hi-res purchases",       _yn(cred.hires_purchases_streaming))
     table.add_row("Mobile streaming",       _yn(cred.mobile_streaming))
     table.add_row("Offline listening",      _yn(cred.offline_listening))
     console.print(table)
 
 
-# ── remote subcommands ─────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# remote subcommands
+# ══════════════════════════════════════════════════════════════════════════
 
 @remote_app.command("list")
-def remote_list(
-    limit: int = typer.Option(50, "-n"),
-) -> None:
+def remote_list(limit: int = typer.Option(50, "-n")) -> None:
     """List playlists on your Qobuz account."""
     sess = _session()
     try:
-        pls = list(sess.client.iter_user_playlists(page_size=limit))
+        pls = list(sess.iter_user_playlists(page_size=limit))
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
-
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     if not pls:
-        console.print("[dim]No playlists on your Qobuz account.[/dim]")
-        return
-
+        console.print("[dim]No playlists on your Qobuz account.[/dim]"); return
     table = Table(title="Remote playlists", show_lines=False)
-    table.add_column("ID",      style="dim", no_wrap=True)
-    table.add_column("Name",    style="bold")
-    table.add_column("Tracks",  style="dim")
-    table.add_column("Public",  style="dim")
-    table.add_column("Owner",   style="dim")
+    table.add_column("ID",     style="dim", no_wrap=True)
+    table.add_column("Name",   style="bold")
+    table.add_column("Tracks", style="dim")
+    table.add_column("Public", style="dim")
+    table.add_column("Owner",  style="dim")
     for pl in pls:
-        table.add_row(
-            str(pl.id), pl.name, str(pl.tracks_count),
-            "yes" if pl.is_public else "no",
-            pl.owner.name if pl.owner else "—",
-        )
+        table.add_row(str(pl.id), pl.name, str(pl.tracks_count),
+                      "yes" if pl.is_public else "no",
+                      pl.owner.name if pl.owner else "—")
     console.print(table)
 
 
@@ -1601,42 +1386,30 @@ def remote_show(
     playlist_id: str = typer.Argument(...),
     limit:       int = typer.Option(50, "-n"),
 ) -> None:
-    """Show tracks in a Qobuz account playlist (with playlist_track_id column)."""
+    """Show tracks in a Qobuz account playlist."""
     sess = _session()
     try:
-        pl = sess.client.get_playlist(playlist_id, limit=limit)
+        pl = sess.get_playlist(playlist_id, limit=limit)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
-
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(
         f"[bold]{pl.name}[/bold]  "
         f"[dim]{pl.tracks_count} tracks · "
         f"{'public' if pl.is_public else 'private'} · "
         f"owner: {pl.owner.name}[/dim]"
     )
-    if pl.description:
-        console.print(f"[dim]{pl.description}[/dim]")
     if not pl.tracks or not pl.tracks.items:
-        console.print("[dim]Empty.[/dim]")
-        return
-
+        console.print("[dim]Empty.[/dim]"); return
     table = Table(show_lines=False)
     table.add_column("Pos",      style="dim", width=4)
-    table.add_column("PT-ID",    style="dim", no_wrap=True, width=10,
-                     header_style="dim",
-                     footer="Use PT-ID with 'qobuz remote remove'")
+    table.add_column("PT-ID",    style="dim", no_wrap=True, width=10)
     table.add_column("Track ID", style="dim", no_wrap=True)
     table.add_column("Title",    style="bold")
     table.add_column("Artist")
     for t in pl.tracks.items:
-        table.add_row(
-            str(t.position or "—"),
-            str(t.playlist_track_id or "—"),
-            str(t.id),
-            t.title,
-            t.performer.name if t.performer else "—",
-        )
+        table.add_row(str(t.position or "—"), str(t.playlist_track_id or "—"),
+                      str(t.id), t.title,
+                      t.performer.name if t.performer else "—")
     console.print(table)
 
 
@@ -1644,20 +1417,11 @@ def remote_show(
 def remote_create(
     name:          str  = typer.Argument(...),
     desc:          str  = typer.Option("",    "--desc",            "-d"),
-    public:        bool = typer.Option(False, "--public/--private",
-                                       help="Make playlist publicly visible."),
+    public:        bool = typer.Option(False, "--public/--private"),
     collaborative: bool = typer.Option(False, "--collaborative/--no-collaborative"),
-    save_locally:  bool = typer.Option(True,  "--save-locally/--no-save-locally",
-                                       help="Also create a matching local playlist."),
+    save_locally:  bool = typer.Option(True,  "--save-locally/--no-save-locally"),
 ) -> None:
-    """
-    Create a new playlist on your Qobuz account.
-
-    \b
-    Examples:
-        qobuz remote create "Evening Classical"
-        qobuz remote create "Shared Mix" --public --collaborative
-    """
+    """Create a new playlist on your Qobuz account."""
     sess = _session()
     try:
         pl = sess.create_remote_playlist(
@@ -1666,29 +1430,19 @@ def remote_create(
             also_save_locally=save_locally,
         )
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Created[/green] remote playlist [bold]{pl.name}[/bold] (id: {pl.id})")
-    if save_locally:
-        console.print("  [dim]Also saved to local store.[/dim]")
 
 
 @remote_app.command("update")
 def remote_update(
-    playlist_id:   str           = typer.Argument(..., help="Playlist ID"),
-    name:          Optional[str] = typer.Option(None, "--name",          "-n"),
-    desc:          Optional[str] = typer.Option(None, "--desc",          "-d"),
-    public:        Optional[bool]= typer.Option(None, "--public/--private"),
-    collaborative: Optional[bool]= typer.Option(None, "--collaborative/--no-collaborative"),
+    playlist_id:   str            = typer.Argument(...),
+    name:          Optional[str]  = typer.Option(None, "--name",  "-n"),
+    desc:          Optional[str]  = typer.Option(None, "--desc",  "-d"),
+    public:        Optional[bool] = typer.Option(None, "--public/--private"),
+    collaborative: Optional[bool] = typer.Option(None, "--collaborative/--no-collaborative"),
 ) -> None:
-    """
-    Update a Qobuz playlist's metadata.
-
-    \b
-    Examples:
-        qobuz remote update 12345 --name "New Name"
-        qobuz remote update 12345 --public
-    """
+    """Update a Qobuz playlist's metadata."""
     if not any([name, desc, public is not None, collaborative is not None]):
         err_console.print("[red]Provide at least one field to update.[/red]")
         raise typer.Exit(code=1)
@@ -1699,8 +1453,7 @@ def remote_update(
             is_public=public, is_collaborative=collaborative,
         )
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Updated[/green] [bold]{pl.name}[/bold].")
 
 
@@ -1711,31 +1464,22 @@ def remote_delete(
 ) -> None:
     """Permanently delete a playlist from your Qobuz account."""
     if not confirm:
-        typer.confirm(
-            f"Delete remote playlist {playlist_id!r}? This cannot be undone.", abort=True
-        )
+        typer.confirm(f"Delete remote playlist {playlist_id!r}?", abort=True)
     sess = _session()
     try:
         sess.delete_remote_playlist(playlist_id)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Deleted[/green] remote playlist {playlist_id}.")
 
 
 @remote_app.command("add")
 def remote_add(
-    playlist_id: str       = typer.Argument(..., help="Playlist ID"),
-    track_ids:   list[str] = typer.Argument(..., help="One or more track IDs or URLs"),
+    playlist_id: str       = typer.Argument(...),
+    track_ids:   list[str] = typer.Argument(...),
     duplicates:  bool      = typer.Option(False, "--allow-duplicates"),
 ) -> None:
-    """
-    Add one or more tracks to a Qobuz playlist.
-
-    \b
-    Example:
-        qobuz remote add 12345 111111 222222 333333
-    """
+    """Add one or more tracks to a Qobuz playlist."""
     resolved = [_resolve_id(t, "track") for t in track_ids]
     sess = _session()
     try:
@@ -1743,35 +1487,21 @@ def remote_add(
             playlist_id, resolved, no_duplicate=not duplicates,
         )
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Added[/green] {len(resolved)} track(s) to playlist {playlist_id}.")
 
 
 @remote_app.command("remove")
 def remote_remove(
-    playlist_id:        str       = typer.Argument(..., help="Playlist ID"),
-    playlist_track_ids: list[int] = typer.Argument(
-        ...,
-        help="playlist_track_id value(s) from 'qobuz remote show' — NOT track IDs.",
-    ),
+    playlist_id:        str       = typer.Argument(...),
+    playlist_track_ids: list[int] = typer.Argument(...),
 ) -> None:
-    """
-    Remove tracks from a Qobuz playlist by playlist_track_id.
-
-    The PT-ID column in 'qobuz remote show' gives the playlist_track_id.
-    This is the join-table row identifier, not the track ID.
-
-    \b
-    Example:
-        qobuz remote remove 12345 9901 9902
-    """
+    """Remove tracks from a Qobuz playlist by playlist_track_id (PT-ID from 'remote show')."""
     sess = _session()
     try:
         sess.remove_tracks_from_remote_playlist(playlist_id, playlist_track_ids)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(
         f"[green]Removed[/green] {len(playlist_track_ids)} track(s) "
         f"from playlist {playlist_id}."
@@ -1779,16 +1509,13 @@ def remote_remove(
 
 
 @remote_app.command("follow")
-def remote_follow(
-    playlist_id: str = typer.Argument(..., help="Playlist ID to follow"),
-) -> None:
-    """Follow a public Qobuz playlist so it appears in your library."""
+def remote_follow(playlist_id: str = typer.Argument(...)) -> None:
+    """Follow a public Qobuz playlist."""
     sess = _session()
     try:
         sess.follow_playlist(playlist_id)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Following[/green] playlist {playlist_id}.")
 
 
@@ -1804,8 +1531,7 @@ def remote_unfollow(
     try:
         sess.unfollow_playlist(playlist_id)
     except Exception as exc:
-        err_console.print(f"[red]Failed:[/red] {exc}")
-        raise typer.Exit(code=1)
+        err_console.print(f"[red]Failed:[/red] {exc}"); raise typer.Exit(code=1)
     console.print(f"[green]Unfollowed[/green] playlist {playlist_id}.")
 
 

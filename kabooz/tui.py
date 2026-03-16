@@ -1,133 +1,151 @@
 #!/usr/bin/env python3
+# kabooz/tui.py
 """
-kabooz/tui.py — Terminal music player for Qobuz.
+Qobuz TUI — terminal music player.
+
+Architecture rule: presentation layer only.  Never imports from
+kabooz.client, never calls sess.client.anything, never duplicates
+quality / URL logic.  Everything goes through QobuzSession methods.
 
 Requirements
 ────────────
-    pip install textual>=0.61
-    mpv must be on PATH  (brew install mpv  /  apt install mpv)
+    pip install 'textual>=0.61'
+    pkg install mpv      (Termux)
+    apt install mpv      (Debian/Ubuntu)
+    brew install mpv     (macOS)
 
-Usage
-─────
+Run from the project root:
     python -m kabooz.tui
-    qobuz tui               # if registered in pyproject.toml
+    python -m kabooz.tui --dev
+
+Layout
+──────
+    ┌─────────────────────────────────────┐
+    │  Header                             │
+    ├─────────────────────────────────────┤
+    │  🔍 Search: ___________________     │  ← always visible, focused on start
+    │  / = focus  Esc = results           │
+    ├─────────────────────────────────────┤
+    │  Results │ Album │ Queue │ For You  │
+    │  (tab content)                      │
+    ├─────────────────────────────────────┤
+    │  Now playing bar                    │
+    └─────────────────────────────────────┘
+
+Threading rule
+──────────────
+Every @work(thread=True) body runs in an OS thread.  Textual's DOM is
+NOT thread-safe.  Inside widget workers, all DOM access must go through
+self.app.call_from_thread(fn).  Inside App workers, self.call_from_thread(fn).
+Never call query_one / set reactives directly from a worker thread.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-# ── Dependency checks ──────────────────────────────────────────────────────
+# ── Loud import errors ────────────────────────────────────────────────────
 try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Container, Horizontal, Vertical
     from textual.message import Message
     from textual.reactive import reactive
     from textual.widget import Widget
     from textual.widgets import (
-        DataTable, Footer, Header, Input, Label,
-        LoadingIndicator, Static, TabbedContent, TabPane,
+        DataTable, Footer, Header, Input,
+        Label, Static, TabbedContent, TabPane,
     )
     from textual import on, work
-    from textual.worker import WorkerError
-except ImportError:
-    print(
-        "Textual ≥ 0.61 is required.\n"
-        "Install: pip install 'textual>=0.61'",
-        file=sys.stderr,
-    )
+except ImportError as _e:
+    print(f"\n[tui] textual not installed: {_e}", file=sys.stderr)
+    print("  Fix: pip install 'textual>=0.61'\n", file=sys.stderr)
     sys.exit(1)
 
 try:
-    from kabooz.session import QobuzSession
+    from kabooz.session import QobuzSession, StreamInfo
     from kabooz.quality import Quality
     from kabooz.exceptions import QobuzError, NotStreamableError
 except ImportError:
     try:
-        import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
-        from kabooz.session import QobuzSession
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from kabooz.session import QobuzSession, StreamInfo
         from kabooz.quality import Quality
         from kabooz.exceptions import QobuzError, NotStreamableError
-    except ImportError:
-        print("kabooz not found. pip install -e .", file=sys.stderr)
+    except ImportError as _e:
+        print(f"\n[tui] kabooz not found: {_e}", file=sys.stderr)
+        print("  Fix: cd project_root && pip install -e .\n", file=sys.stderr)
         sys.exit(1)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Audio backend — mpv via JSON IPC
+# mpv IPC backend
 # ══════════════════════════════════════════════════════════════════════════
 
 class MpvPlayer:
-    """
-    Controls an mpv subprocess via its JSON IPC socket.
-    All methods are safe to call even when mpv is not running.
-    """
+    """Controls an mpv subprocess via its JSON IPC socket."""
 
     def __init__(self) -> None:
-        self._sock_path = Path(tempfile.gettempdir()) / "qobuz-tui-mpv.sock"
+        self._sock = Path(tempfile.gettempdir()) / "qobuz-tui-mpv.sock"
         self._proc: Optional[subprocess.Popen] = None
         self.available: bool = bool(shutil.which("mpv"))
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────
-
     def start(self) -> bool:
-        """Start mpv in idle mode. Returns True when the socket is ready."""
         if not self.available:
             return False
         if self._proc and self._proc.poll() is None:
             return True
-        self._sock_path.unlink(missing_ok=True)
+        self._sock.unlink(missing_ok=True)
         self._proc = subprocess.Popen(
             [
                 "mpv", "--no-video", "--idle=yes", "--keep-open=yes",
-                f"--input-ipc-server={self._sock_path}",
-                "--no-terminal",
+                f"--input-ipc-server={self._sock}",
+                "--no-terminal", "--really-quiet",
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        for _ in range(30):          # wait up to 3 s for socket
+        for _ in range(50):
             time.sleep(0.1)
-            if self._sock_path.exists():
+            if self._sock.exists():
                 return True
         return False
 
     def quit(self) -> None:
         if self._proc and self._proc.poll() is None:
-            self._cmd("quit")
+            self._ipc("quit")
             try:
                 self._proc.wait(timeout=3)
             except Exception:
                 self._proc.kill()
 
-    # ── IPC ────────────────────────────────────────────────────────────────
-
-    def _cmd(self, *args: Any) -> Any:
-        if not self._sock_path.exists():
+    def _ipc(self, *args: Any) -> Any:
+        if not self._sock.exists():
             return None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(1.0)
-                s.connect(str(self._sock_path))
-                payload = json.dumps({"command": list(args)}) + "\n"
-                s.sendall(payload.encode())
+                s.settimeout(2.0)
+                s.connect(str(self._sock))
+                s.sendall((json.dumps({"command": list(args)}) + "\n").encode())
                 buf = b""
-                while b"\n" not in buf:
-                    chunk = s.recv(4096)
-                    if not chunk:
+                deadline = time.monotonic() + 2.0
+                while b"\n" not in buf and time.monotonic() < deadline:
+                    try:
+                        chunk = s.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    except socket.timeout:
                         break
-                    buf += chunk
                 for line in buf.split(b"\n"):
                     line = line.strip()
                     if line:
@@ -139,45 +157,17 @@ class MpvPlayer:
             pass
         return None
 
-    # ── Playback control ───────────────────────────────────────────────────
-
-    def load(self, url: str) -> None:
-        self._cmd("loadfile", url, "replace")
-
-    def toggle_pause(self) -> None:
-        self._cmd("cycle", "pause")
-
-    def set_pause(self, paused: bool) -> None:
-        self._cmd("set_property", "pause", paused)
-
-    def stop(self) -> None:
-        self._cmd("stop")
-
-    def seek(self, seconds: float) -> None:
-        self._cmd("seek", seconds, "relative")
-
-    def set_volume(self, vol: int) -> None:
-        self._cmd("set_property", "volume", max(0, min(150, vol)))
-
-    # ── State queries ──────────────────────────────────────────────────────
-
-    def position(self) -> float:
-        v = self._cmd("get_property", "time-pos")
-        return float(v) if v is not None else 0.0
-
-    def duration(self) -> float:
-        v = self._cmd("get_property", "duration")
-        return float(v) if v is not None else 0.0
-
-    def is_paused(self) -> bool:
-        return bool(self._cmd("get_property", "pause"))
-
-    def is_idle(self) -> bool:
-        return self._cmd("get_property", "idle-active") is True
-
-    def volume(self) -> int:
-        v = self._cmd("get_property", "volume")
-        return int(v) if v is not None else 80
+    def load(self, url: str) -> None:       self._ipc("loadfile", url, "replace")
+    def toggle_pause(self) -> None:         self._ipc("cycle", "pause")
+    def set_pause(self, v: bool) -> None:   self._ipc("set_property", "pause", v)
+    def stop(self) -> None:                 self._ipc("stop")
+    def seek(self, s: float) -> None:       self._ipc("seek", s, "relative")
+    def set_volume(self, v: int) -> None:   self._ipc("set_property", "volume", max(0, min(150, v)))
+    def position(self) -> float:            return float(self._ipc("get_property", "time-pos") or 0)
+    def duration(self) -> float:            return float(self._ipc("get_property", "duration") or 0)
+    def is_paused(self) -> bool:            return bool(self._ipc("get_property", "pause"))
+    def is_idle(self) -> bool:              return self._ipc("get_property", "idle-active") is True
+    def volume(self) -> int:                return int(self._ipc("get_property", "volume") or 80)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -187,11 +177,11 @@ class MpvPlayer:
 @dataclass
 class QueueEntry:
     track_id: str
-    title: str
-    artist: str
-    album: str = ""
+    title:    str
+    artist:   str
+    album:    str = ""
     duration: int = 0
-    url: str = ""       # filled in just before playback
+    stream:   Optional[StreamInfo] = None
 
 
 class TrackQueue:
@@ -199,12 +189,9 @@ class TrackQueue:
         self._items: list[QueueEntry] = []
         self._index: int = -1
 
-    def add(self, entry: QueueEntry) -> None:
-        self._items.append(entry)
-
-    def clear(self) -> None:
-        self._items.clear()
-        self._index = -1
+    def add(self, e: QueueEntry) -> None:           self._items.append(e)
+    def extend(self, es: list[QueueEntry]) -> None: self._items.extend(es)
+    def clear(self) -> None:                        self._items.clear(); self._index = -1
 
     def current(self) -> Optional[QueueEntry]:
         return self._items[self._index] if 0 <= self._index < len(self._items) else None
@@ -227,318 +214,279 @@ class TrackQueue:
             return self.current()
         return None
 
-    @property
-    def items(self) -> list[QueueEntry]:
-        return list(self._items)
+    def remove_index(self, i: int) -> None:
+        if 0 <= i < len(self._items):
+            del self._items[i]
+            if self._index >= i and self._index > 0:
+                self._index -= 1
 
     @property
-    def current_index(self) -> int:
-        return self._index
-
-    def __len__(self) -> int:
-        return len(self._items)
+    def items(self) -> list[QueueEntry]: return list(self._items)
+    @property
+    def current_index(self) -> int:      return self._index
+    def __len__(self) -> int:            return len(self._items)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Widgets
+# Search bar — always docked at the top, outside the tabs
+# ══════════════════════════════════════════════════════════════════════════
+
+class SearchBar(Widget):
+    """
+    Persistent top bar. Always visible, focused at startup.
+    Pressing / anywhere in the app refocuses it.
+    Typing any printable character while something else has focus also
+    redirects here (handled in QobuzTUI.on_key).
+    """
+    DEFAULT_CSS = """
+    SearchBar {
+        height: 3;
+        dock: top;
+        background: $surface;
+        border-bottom: solid $primary-darken-2;
+        padding: 0 1;
+        layout: horizontal;
+    }
+    #sb-label { width: 12; height: 3; content-align: left middle;
+                color: $primary; text-style: bold; }
+    #sb-input { width: 1fr; height: 3; }
+    #sb-hint  { width: 28; height: 3; content-align: right middle;
+                color: $text-muted; text-style: dim; }
+    """
+
+    class Submitted(Message):
+        def __init__(self, query: str) -> None:
+            super().__init__()
+            self.query = query
+
+    def compose(self) -> ComposeResult:
+        yield Static("🔍 Search:", id="sb-label")
+        yield Input(placeholder="Type an artist, album or track…  then press Enter", id="sb-input")
+        yield Static("/ = focus here  Esc = results", id="sb-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#sb-input", Input).focus()
+
+    def focus_input(self) -> None:
+        self.query_one("#sb-input", Input).focus()
+
+    def get_input(self) -> Input:
+        return self.query_one("#sb-input", Input)
+
+    @on(Input.Submitted, "#sb-input")
+    def _submitted(self, ev: Input.Submitted) -> None:
+        q = ev.value.strip()
+        if q:
+            self.post_message(self.Submitted(q))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Now-playing bar — always docked at the bottom
 # ══════════════════════════════════════════════════════════════════════════
 
 class NowPlayingBar(Widget):
-    """Bottom bar: track name, scrubber, volume, controls."""
-
     DEFAULT_CSS = """
     NowPlayingBar {
-        height: 4;
+        height: 5;
+        dock: bottom;
         background: $surface;
-        border-top: solid $primary-darken-2;
+        border-top: tall $primary-darken-3;
         padding: 0 2;
+        layout: vertical;
     }
-    NowPlayingBar .np-title   { color: $text; text-style: bold; height: 1; }
-    NowPlayingBar .np-sub     { color: $text-muted; height: 1; }
-    NowPlayingBar .np-bar     { color: $primary; height: 1; }
-    NowPlayingBar .np-controls{ color: $text-muted; height: 1; }
+    NowPlayingBar Static { height: 1; }
+    #np-title    { color: $text;       text-style: bold; }
+    #np-sub      { color: $text-muted; }
+    #np-progress { color: $primary;    }
+    #np-controls { color: $text-muted; text-style: dim; }
     """
 
     title   = reactive("No track loaded")
     artist  = reactive("")
+    album   = reactive("")
+    quality = reactive("")
     pos     = reactive(0.0)
     dur     = reactive(0.0)
     paused  = reactive(True)
     volume  = reactive(80)
 
     def compose(self) -> ComposeResult:
-        yield Static("", classes="np-title",    id="np-title")
-        yield Static("", classes="np-sub",      id="np-sub")
-        yield Static("", classes="np-bar",      id="np-bar")
-        yield Static("", classes="np-controls", id="np-controls")
+        yield Static("", id="np-title")
+        yield Static("", id="np-sub")
+        yield Static("", id="np-progress")
+        yield Static("", id="np-controls")
 
-    def _fmt_time(self, secs: float) -> str:
-        s = int(secs)
+    @staticmethod
+    def _fmt(s: float) -> str:
+        s = int(max(0, s))
         return f"{s // 60}:{s % 60:02d}"
 
-    def watch_title(self, v: str)  -> None: self._refresh_all()
-    def watch_artist(self, v: str) -> None: self._refresh_all()
-    def watch_pos(self, v: float)  -> None: self._refresh_bar()
-    def watch_dur(self, v: float)  -> None: self._refresh_bar()
-    def watch_paused(self, v: bool)-> None: self._refresh_controls()
-    def watch_volume(self, v: int) -> None: self._refresh_controls()
+    def _redraw(self) -> None:
+        title_line = self.title
+        if self.quality:
+            title_line += f"  [dim cyan]{self.quality}[/dim cyan]"
+        self.query_one("#np-title", Static).update(title_line)
 
-    def _refresh_all(self) -> None:
-        self._refresh_bar()
-        self._refresh_controls()
-        t = self.query_one("#np-title", Static)
-        t.update(self.title)
-        s = self.query_one("#np-sub", Static)
-        s.update(self.artist)
+        sub = self.artist
+        if self.album:
+            sub += f"  [dim]—[/dim]  {self.album}"
+        self.query_one("#np-sub", Static).update(sub)
 
-    def _refresh_bar(self) -> None:
-        bar_w = 40
+        bar_width = 40
         if self.dur > 0:
-            frac  = min(self.pos / self.dur, 1.0)
-            filled = int(frac * bar_w)
-            bar   = "█" * filled + "░" * (bar_w - filled)
-            times = f"  {self._fmt_time(self.pos)} / {self._fmt_time(self.dur)}"
+            frac   = min(self.pos / self.dur, 1.0)
+            filled = int(frac * bar_width)
+            bar    = f"[bold cyan]{'█' * filled}[/bold cyan][dim]{'░' * (bar_width - filled)}[/dim]"
+            times  = f"  {self._fmt(self.pos)} [dim]/[/dim] {self._fmt(self.dur)}"
         else:
-            bar   = "░" * bar_w
-            times = "  --:-- / --:--"
-        self.query_one("#np-bar", Static).update(bar + times)
+            bar   = f"[dim]{'░' * bar_width}[/dim]"
+            times = "  --:-- [dim]/[/dim] --:--"
+        self.query_one("#np-progress", Static).update(bar + times)
 
-    def _refresh_controls(self) -> None:
-        icon = "⏸" if not self.paused else "▶"
-        vol  = f"🔊 {self.volume}%"
+        play_icon = "[green]▶ PLAYING[/green]" if not self.paused else "[yellow]⏸ PAUSED[/yellow]"
         self.query_one("#np-controls", Static).update(
-            f"{icon}  [space] play/pause   [←/→] seek   [↑/↓] volume   {vol}"
+            f"{play_icon}  "
+            "[dim]space[/dim]=pause  [dim]←/→[/dim]=±10s  "
+            f"[dim]\\[/\\][/dim]=vol [bold]{self.volume}%[/bold]  "
+            "[dim]n[/dim]=next  [dim]p[/dim]=prev  "
+            "[dim]r[/dim]=radio  [dim]q[/dim]=quit"
         )
 
+    def watch_title(self,   _: Any) -> None: self._redraw()
+    def watch_artist(self,  _: Any) -> None: self._redraw()
+    def watch_album(self,   _: Any) -> None: self._redraw()
+    def watch_quality(self, _: Any) -> None: self._redraw()
+    def watch_pos(self,     _: Any) -> None: self._redraw()
+    def watch_dur(self,     _: Any) -> None: self._redraw()
+    def watch_paused(self,  _: Any) -> None: self._redraw()
+    def watch_volume(self,  _: Any) -> None: self._redraw()
 
-class SearchPane(Widget):
-    """Search input + results table."""
 
+# ══════════════════════════════════════════════════════════════════════════
+# Results pane  (search results — Input lives in SearchBar, not here)
+# ══════════════════════════════════════════════════════════════════════════
+
+_WELCOME = (
+    "[dim]Type in the search bar above and press [bold white]Enter[/bold white] to search.\n"
+    "Results will appear below.\n\n"
+    "[bold white]Shortcuts:[/bold white]  "
+    "[bold]/[/bold]=focus search  [bold]Enter[/bold]=play/browse  "
+    "[bold]↑↓[/bold]=navigate  [bold]Esc[/bold]=back to search  "
+    "[bold]space[/bold]=pause  [bold]n/p[/bold]=next/prev  "
+    "[bold]←/→[/bold]=±10s  [bold][][/bold]=volume  "
+    "[bold]r[/bold]=radio  [bold]q[/bold]=quit[/dim]"
+)
+
+
+class ResultsPane(Widget):
+    # No competing 1fr widgets — status is auto-height, table fills the rest.
     DEFAULT_CSS = """
-    SearchPane {
-        width: 100%;
-        height: 100%;
-    }
-    SearchPane Input {
-        margin: 1 2;
-        border: solid $primary-darken-1;
-    }
-    SearchPane DataTable {
-        margin: 0 2;
-        height: 1fr;
-        border: solid $primary-darken-2;
-    }
+    ResultsPane           { width: 100%; height: 100%; layout: vertical; }
+    #rp-status            { height: auto; margin: 1 2 0 2; color: $text-muted; }
+    ResultsPane DataTable { height: 1fr;  margin: 0 2; }
     """
 
-    class TrackSelected(Message):
+    class TrackChosen(Message):
         def __init__(self, entry: QueueEntry) -> None:
-            super().__init__()
-            self.entry = entry
+            super().__init__(); self.entry = entry
 
-    class AlbumSelected(Message):
-        def __init__(self, album_id: str, title: str) -> None:
-            super().__init__()
-            self.album_id = album_id
-            self.title    = title
+    class AlbumChosen(Message):
+        def __init__(self, entity_id: str, title: str) -> None:
+            super().__init__(); self.entity_id = entity_id; self.title = title
 
-    def __init__(self, session: QobuzSession) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._session = session
-        self._results: list[dict] = []
-        self._mode = "tracks"
+        self._rows: list[dict] = []
 
     def compose(self) -> ComposeResult:
-        yield Input(placeholder="Search tracks, albums, artists… (Enter to search)", id="search-input")
-        yield DataTable(id="search-table", cursor_type="row")
+        # Single status label whose text we swap; no separate welcome widget
+        # so there is no competing height that could steal space from the table.
+        yield Static(_WELCOME, id="rp-status")
+        yield DataTable(id="rp-table", cursor_type="row")
 
     def on_mount(self) -> None:
-        table = self.query_one("#search-table", DataTable)
-        table.add_columns("Type", "Title / Name", "Artist / Owner", "Album / Year", "ID")
+        self.query_one("#rp-table", DataTable).add_columns(
+            "", "Title / Name", "Artist / Owner", "Context", "ID"
+        )
 
-    @on(Input.Submitted, "#search-input")
-    def do_search(self, event: Input.Submitted) -> None:
-        if not event.value.strip():
-            return
-        self.run_search(event.value.strip())
+    # ── Called from the main thread by the App ─────────────────────────
 
-    @work(thread=True)
-    def run_search(self, query: str) -> None:
-        table = self.query_one("#search-table", DataTable)
-        self.app.call_from_thread(table.clear)
-        self._results = []
+    def show_searching(self, query: str) -> None:
+        self.query_one("#rp-status", Static).update(
+            f"[dim]Searching for [bold]{query}[/bold]…[/dim]"
+        )
+        self.query_one("#rp-table", DataTable).clear()
 
+    def show_results(self, rows: list[tuple], new_rows: list[dict]) -> None:
+        self._rows = new_rows
+        table = self.query_one("#rp-table", DataTable)
+        table.clear()   # guard against duplicate keys on rapid re-searches
+        for i, r in enumerate(rows):
+            table.add_row(*r, key=str(i))
+        count = len(rows)
+        self.query_one("#rp-status", Static).update(
+            f"[dim]{count} result{'s' if count != 1 else ''} — "
+            "↑↓=navigate  Enter=play/browse  Esc=back to search[/dim]"
+            if count else "[dim]No results.[/dim]"
+        )
+        if count:
+            table.focus()
+
+    def show_error(self, msg: str) -> None:
+        self.query_one("#rp-status", Static).update(
+            f"[red]{msg}[/red]\n\n{_WELCOME}"
+        )
+
+    @on(DataTable.RowSelected, "#rp-table")
+    def _selected(self, ev: DataTable.RowSelected) -> None:
         try:
-            tracks = self._session.client.search(query=query, type="tracks", limit=10)
-            albums = self._session.client.search(query=query, type="albums", limit=5)
-        except QobuzError as exc:
-            self.app.call_from_thread(
-                self.app.notify, f"Search failed: {exc}", severity="error"
-            )
+            idx = int(str(ev.row_key.value))
+        except (TypeError, ValueError):
             return
-
-        rows: list[tuple] = []
-
-        for t in tracks.get("tracks", {}).get("items", []):
-            self._results.append({"type": "track", "data": t})
-            rows.append((
-                "🎵 track",
-                t.get("title", ""),
-                (t.get("performer") or {}).get("name", ""),
-                (t.get("album") or {}).get("title", ""),
-                str(t.get("id", "")),
-            ))
-
-        for a in albums.get("albums", {}).get("items", []):
-            self._results.append({"type": "album", "data": a})
-            rows.append((
-                "💿 album",
-                a.get("title", ""),
-                (a.get("artist") or {}).get("name", ""),
-                (a.get("release_date_original") or "")[:4],
-                str(a.get("id", "")),
-            ))
-
-        def _fill():
-            for row in rows:
-                table.add_row(*row)
-        self.app.call_from_thread(_fill)
-
-    @on(DataTable.RowSelected, "#search-table")
-    def row_selected(self, event: DataTable.RowSelected) -> None:
-        row_key = event.row_key.value
-        if row_key is None:
+        if idx >= len(self._rows):
             return
-        # DataTable row keys default to the ordinal index
-        try:
-            idx = list(event.data_table._row_locations.keys()).index(event.row_key)
-        except Exception:
-            # Fallback: parse the key as an index
-            try:
-                idx = int(str(event.row_key.value))
-            except Exception:
-                return
-
-        if idx >= len(self._results):
-            return
-        item = self._results[idx]
-
+        item = self._rows[idx]
         if item["type"] == "track":
             t = item["data"]
-            entry = QueueEntry(
+            self.post_message(self.TrackChosen(QueueEntry(
                 track_id=str(t.get("id", "")),
                 title=t.get("title", ""),
                 artist=(t.get("performer") or {}).get("name", ""),
                 album=(t.get("album") or {}).get("title", ""),
                 duration=t.get("duration", 0),
-            )
-            self.post_message(self.TrackSelected(entry))
-        else:
-            a = item["data"]
-            self.post_message(self.AlbumSelected(
-                album_id=str(a.get("id", "")),
-                title=a.get("title", ""),
-            ))
+            )))
+        elif item["type"] in ("album", "artist"):
+            d         = item["data"]
+            aid       = str(d.get("id", ""))
+            entity_id = f"artist:{aid}" if item["type"] == "artist" else aid
+            name      = d.get("title") or d.get("name", "")
+            self.post_message(self.AlbumChosen(entity_id, name))
+
+    def on_key(self, ev: Any) -> None:
+        if ev.key == "escape":
+            self.app.query_one(SearchBar).focus_input()
+            ev.stop()
 
 
-class QueuePane(Widget):
-    """Shows the current playback queue."""
-
-    DEFAULT_CSS = """
-    QueuePane {
-        width: 100%;
-        height: 100%;
-    }
-    QueuePane DataTable {
-        margin: 1 2;
-        height: 1fr;
-        border: solid $primary-darken-2;
-    }
-    QueuePane #queue-label {
-        margin: 1 2 0 2;
-        color: $text-muted;
-    }
-    """
-
-    class PlayRequested(Message):
-        def __init__(self, index: int) -> None:
-            super().__init__()
-            self.index = index
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._queue: TrackQueue | None = None
-
-    def compose(self) -> ComposeResult:
-        yield Label("Queue  (Enter to jump to track, D to remove)", id="queue-label")
-        yield DataTable(id="queue-table", cursor_type="row")
-
-    def on_mount(self) -> None:
-        table = self.query_one("#queue-table", DataTable)
-        table.add_columns("", "Title", "Artist", "Duration")
-
-    def attach_queue(self, queue: TrackQueue) -> None:
-        self._queue = queue
-        self.refresh_table()
-
-    def refresh_table(self) -> None:
-        if not self._queue:
-            return
-        table = self.query_one("#queue-table", DataTable)
-        table.clear()
-        for i, entry in enumerate(self._queue.items):
-            marker = "▶" if i == self._queue.current_index else " "
-            dur = f"{entry.duration // 60}:{entry.duration % 60:02d}" if entry.duration else "—"
-            table.add_row(marker, entry.title, entry.artist, dur)
-
-    @on(DataTable.RowSelected, "#queue-table")
-    def row_selected(self, event: DataTable.RowSelected) -> None:
-        try:
-            idx = int(str(event.row_key.value))
-        except Exception:
-            return
-        self.post_message(self.PlayRequested(idx))
-
-    def on_key(self, event) -> None:
-        if event.key == "d" and self._queue:
-            table = self.query_one("#queue-table", DataTable)
-            if table.cursor_row is not None:
-                # Remove from queue (simple list manipulation)
-                try:
-                    del self._queue._items[table.cursor_row]
-                    self.refresh_table()
-                except IndexError:
-                    pass
-
+# ══════════════════════════════════════════════════════════════════════════
+# Album / artist drill-down pane
+# ══════════════════════════════════════════════════════════════════════════
 
 class AlbumPane(Widget):
-    """Shows tracks in a selected album."""
-
     DEFAULT_CSS = """
-    AlbumPane {
-        width: 100%;
-        height: 100%;
-    }
-    AlbumPane #album-title {
-        margin: 1 2 0 2;
-        text-style: bold;
-        color: $primary;
-    }
-    AlbumPane DataTable {
-        margin: 1 2;
-        height: 1fr;
-        border: solid $primary-darken-2;
-    }
+    AlbumPane           { width: 100%; height: 100%; }
+    #a-header           { margin: 1 2 0 2; color: $primary; text-style: bold; }
+    #a-hint             { margin: 0 2;     color: $text-muted; text-style: dim; }
+    AlbumPane DataTable { margin: 1 2;     height: 1fr; }
     """
 
-    class TrackSelected(Message):
+    class TrackChosen(Message):
         def __init__(self, entry: QueueEntry) -> None:
-            super().__init__()
-            self.entry = entry
+            super().__init__(); self.entry = entry
 
-    class AddAllRequested(Message):
+    class AddAllChosen(Message):
         def __init__(self, entries: list[QueueEntry]) -> None:
-            super().__init__()
-            self.entries = entries
+            super().__init__(); self.entries = entries
 
     def __init__(self, session: QobuzSession) -> None:
         super().__init__()
@@ -546,307 +494,649 @@ class AlbumPane(Widget):
         self._entries: list[QueueEntry] = []
 
     def compose(self) -> ComposeResult:
-        yield Label("No album selected", id="album-title")
-        yield DataTable(id="album-table", cursor_type="row")
+        yield Static("Select an album or artist from Results", id="a-header")
+        yield Static("[dim]Enter=play  A=add all  Esc=back to search[/dim]", id="a-hint")
+        yield DataTable(id="a-table", cursor_type="row")
 
     def on_mount(self) -> None:
-        table = self.query_one("#album-table", DataTable)
-        table.add_columns("#", "Title", "Duration")
+        self.query_one("#a-table", DataTable).add_columns("#", "Title", "Artist", "Duration")
+
+    def load(self, entity_id: str, title: str) -> None:
+        self.query_one("#a-header", Static).update(f"[dim]Loading:[/dim]  {title}")
+        self.query_one("#a-hint",   Static).update("")
+        self._load(entity_id, title)
 
     @work(thread=True)
-    def load_album(self, album_id: str, title: str) -> None:
-        self.app.call_from_thread(
-            self.query_one("#album-title", Label).update,
-            f"Loading {title}…",
-        )
+    def _load(self, entity_id: str, title: str) -> None:
+        entries: list[QueueEntry] = []
+        header = title
+        hint   = ""
+
         try:
-            album = self._session.client.get_album(album_id)
-        except QobuzError as exc:
-            self.app.call_from_thread(
-                self.app.notify, f"Album error: {exc}", severity="error"
-            )
+            if entity_id.startswith("artist:"):
+                aid    = entity_id.split(":", 1)[1]
+                artist = self._session.get_artist(aid, extras="albums", limit=20)
+                n_alb  = len(artist.albums.items) if artist.albums else 0
+                header = f"{artist.name}  [dim]({n_alb} albums)[/dim]"
+                hint   = "Enter=browse album  Esc=back to search"
+                for alb in (artist.albums.items if artist.albums else [])[:20]:
+                    alb_id    = str(alb.id)
+                    alb_title = getattr(alb, "display_title", None) or getattr(alb, "title", alb_id)
+                    entries.append(QueueEntry(
+                        track_id=f"album:{alb_id}",
+                        title=alb_title,
+                        artist=artist.name,
+                    ))
+            else:
+                album       = self._session.get_album(entity_id)
+                artist_name = album.artist.name if album.artist else ""
+                year        = (album.release_date_original or "")[:4]
+                n_tracks    = album.tracks_count or 0
+                header = (
+                    f"{getattr(album, 'display_title', album.title)}"
+                    f"  [dim]—[/dim]  {artist_name}"
+                    f"  [dim]({n_tracks} tracks"
+                    + (f", {year}" if year else "") + ")[/dim]"
+                )
+                hint = "Enter=play  A=add all  R=radio  Esc=back to search"
+                for t in (album.tracks.items if album.tracks else []):
+                    entries.append(QueueEntry(
+                        track_id=str(t.id),
+                        title=getattr(t, "display_title", None) or t.title,
+                        artist=(t.performer.name if t.performer else artist_name),
+                        album=getattr(album, "display_title", album.title),
+                        duration=t.duration or 0,
+                    ))
+        except Exception as exc:
+            def _err() -> None:
+                self.query_one("#a-header", Static).update(f"[red]Load error: {exc}[/red]")
+            self.app.call_from_thread(_err)
             return
 
-        entries = []
-        if album.tracks and album.tracks.items:
-            for t in album.tracks.items:
-                entries.append(QueueEntry(
-                    track_id=str(t.id),
-                    title=getattr(t, "display_title", t.title),
-                    artist=t.performer.name if t.performer else (
-                        album.artist.name if album.artist else ""
-                    ),
-                    album=album.display_title,
-                    duration=t.duration or 0,
-                ))
-
-        def _fill():
+        def _fill() -> None:
             self._entries = entries
-            table = self.query_one("#album-table", DataTable)
+            table = self.query_one("#a-table", DataTable)
             table.clear()
-            title_label = self.query_one("#album-title", Label)
-            title_label.update(
-                f"{album.display_title}  —  {album.artist.name if album.artist else ''}  "
-                f"[dim]({album.tracks_count} tracks, "
-                f"{(album.release_date_original or '')[:4]})[/dim]"
-                f"  [grey50](A=add all  Enter=play)[/grey50]"
-            )
-            for e in entries:
-                n   = entries.index(e) + 1
+            self.query_one("#a-header", Static).update(header)
+            self.query_one("#a-hint",   Static).update(f"[dim]{hint}[/dim]" if hint else "")
+            for i, e in enumerate(entries):
                 dur = f"{e.duration // 60}:{e.duration % 60:02d}" if e.duration else "—"
-                table.add_row(str(n), e.title, dur)
+                table.add_row(str(i + 1), e.title, e.artist, dur, key=str(i))
+            if entries:
+                table.focus()
 
         self.app.call_from_thread(_fill)
 
-    @on(DataTable.RowSelected, "#album-table")
-    def row_selected(self, event: DataTable.RowSelected) -> None:
+    @on(DataTable.RowSelected, "#a-table")
+    def _selected(self, ev: DataTable.RowSelected) -> None:
         try:
-            idx = int(str(event.row_key.value))
-        except Exception:
+            idx = int(str(ev.row_key.value))
+        except (TypeError, ValueError):
             return
-        if 0 <= idx < len(self._entries):
-            self.post_message(self.TrackSelected(self._entries[idx]))
+        if idx >= len(self._entries):
+            return
+        e = self._entries[idx]
+        if e.track_id.startswith("album:"):
+            self.load(e.track_id, e.title)
+        else:
+            self.post_message(self.TrackChosen(e))
 
-    def on_key(self, event) -> None:
-        if event.key == "a" and self._entries:
-            self.post_message(self.AddAllRequested(list(self._entries)))
+    def on_key(self, ev: Any) -> None:
+        if ev.key == "a" and self._entries:
+            real = [e for e in self._entries if not e.track_id.startswith("album:")]
+            if real:
+                self.post_message(self.AddAllChosen(real))
+        elif ev.key == "escape":
+            self.app.query_one(SearchBar).focus_input()
+            ev.stop()
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Main app
+# Queue pane
+# ══════════════════════════════════════════════════════════════════════════
+
+class QueuePane(Widget):
+    DEFAULT_CSS = """
+    QueuePane           { width: 100%; height: 100%; }
+    #q-label            { margin: 1 2 0 2; color: $text-muted; }
+    QueuePane DataTable { margin: 1 2;     height: 1fr; }
+    """
+
+    class JumpTo(Message):
+        def __init__(self, index: int) -> None:
+            super().__init__(); self.index = index
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: Optional[TrackQueue] = None
+
+    def compose(self) -> ComposeResult:
+        yield Label("Queue  [dim](Enter=jump  D=remove  Esc=search)[/dim]", id="q-label")
+        yield DataTable(id="q-table", cursor_type="row")
+
+    def on_mount(self) -> None:
+        self.query_one("#q-table", DataTable).add_columns("", "Title", "Artist", "Duration")
+
+    def attach(self, q: TrackQueue) -> None:
+        self._queue = q
+        self.refresh_table()
+
+    def refresh_table(self) -> None:
+        if not self._queue:
+            return
+        table = self.query_one("#q-table", DataTable)
+        table.clear()
+        for i, e in enumerate(self._queue.items):
+            marker = "[bold green]▶[/bold green]" if i == self._queue.current_index else " "
+            dur    = f"{e.duration // 60}:{e.duration % 60:02d}" if e.duration else "—"
+            table.add_row(marker, e.title, e.artist, dur, key=str(i))
+
+    @on(DataTable.RowSelected, "#q-table")
+    def _selected(self, ev: DataTable.RowSelected) -> None:
+        try:
+            idx = int(str(ev.row_key.value))
+        except (TypeError, ValueError):
+            return
+        self.post_message(self.JumpTo(idx))
+
+    def on_key(self, ev: Any) -> None:
+        if ev.key == "d" and self._queue:
+            table = self.query_one("#q-table", DataTable)
+            if table.cursor_row is not None:
+                self._queue.remove_index(table.cursor_row)
+                self.refresh_table()
+        elif ev.key == "escape":
+            self.app.query_one(SearchBar).focus_input()
+            ev.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# For You / Recommendations pane
+# ══════════════════════════════════════════════════════════════════════════
+
+class RecsPane(Widget):
+    DEFAULT_CSS = """
+    RecsPane           { width: 100%; height: 100%; }
+    #r-label           { margin: 1 2 0 2; color: $text-muted; }
+    RecsPane DataTable { margin: 1 2;     height: 1fr; }
+    """
+
+    class AlbumChosen(Message):
+        def __init__(self, entity_id: str, title: str) -> None:
+            super().__init__(); self.entity_id = entity_id; self.title = title
+
+    def __init__(self, session: QobuzSession) -> None:
+        super().__init__()
+        self._session = session
+        self._rows:   list[dict] = []
+
+    def compose(self) -> ComposeResult:
+        yield Label("For You  [dim](loading…)[/dim]", id="r-label")
+        yield DataTable(id="r-table", cursor_type="row")
+
+    def on_mount(self) -> None:
+        self.query_one("#r-table", DataTable).add_columns("Category", "Title", "Artist", "Year")
+        self._fetch()
+
+    @work(thread=True)
+    def _fetch(self) -> None:
+        try:
+            recs = self._session.get_recommendations(limit=10)
+        except Exception as exc:
+            def _err() -> None:
+                self.query_one("#r-label", Label).update(
+                    f"[red]Recommendations failed: {exc}[/red]"
+                )
+            self.app.call_from_thread(_err)
+            return
+
+        rows:     list[tuple] = []
+        new_rows: list[dict]  = []
+
+        for item in recs.get("press_awards", [])[:5]:
+            iid   = str(item.get("id", ""))
+            title = item.get("title", "")
+            new_rows.append({"id": iid, "title": title})
+            rows.append(("🏆 Press award", title,
+                         (item.get("artist") or {}).get("name", ""),
+                         (item.get("release_date_original") or "")[:4]))
+
+        for item in recs.get("new_releases", [])[:5]:
+            iid   = str(item.get("id", ""))
+            title = item.get("title", "")
+            new_rows.append({"id": iid, "title": title})
+            rows.append(("🆕 New release", title,
+                         (item.get("artist") or {}).get("name", ""),
+                         (item.get("release_date_original") or "")[:4]))
+
+        for item in recs.get("similar_artists", [])[:4]:
+            aid  = str(getattr(item, "id",   "") or "")
+            name = str(getattr(item, "name", "") or "")
+            new_rows.append({"id": f"artist:{aid}", "title": name})
+            rows.append(("🎤 Similar artist", name, "", ""))
+
+        for item in recs.get("featured", [])[:4]:
+            iid   = str(item.get("id",   ""))
+            name  = str(item.get("name", ""))
+            owner = (item.get("owner") or {}).get("name", "")
+            new_rows.append({"id": iid, "title": name})
+            rows.append(("📋 Featured", name, owner, ""))
+
+        def _fill() -> None:
+            self._rows = new_rows
+            table = self.query_one("#r-table", DataTable)
+            table.clear()
+            for i, r in enumerate(rows):
+                table.add_row(*r, key=str(i))
+            self.query_one("#r-label", Label).update(
+                f"For You  [dim]({len(rows)} items — Enter=browse  R=refresh  Esc=search)[/dim]"
+            )
+            if rows:
+                table.focus()
+
+        self.app.call_from_thread(_fill)
+
+    @on(DataTable.RowSelected, "#r-table")
+    def _selected(self, ev: DataTable.RowSelected) -> None:
+        try:
+            idx = int(str(ev.row_key.value))
+        except (TypeError, ValueError):
+            return
+        if idx >= len(self._rows):
+            return
+        item = self._rows[idx]
+        self.post_message(self.AlbumChosen(item["id"], item["title"]))
+
+    def on_key(self, ev: Any) -> None:
+        if ev.key == "r":
+            self._rows = []
+            self._fetch()
+        elif ev.key == "escape":
+            self.app.query_one(SearchBar).focus_input()
+            ev.stop()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Main App
 # ══════════════════════════════════════════════════════════════════════════
 
 CSS = """
-Screen {
-    background: $background;
-}
-
-#main-tabs {
-    height: 1fr;
-}
-
-.tab-content {
-    height: 1fr;
-}
-
-NowPlayingBar {
-    dock: bottom;
-    height: 5;
-}
-
-Header {
-    background: $primary-darken-3;
-}
+Screen     { background: $background; }
+#main-tabs { height: 1fr; }
 """
 
 
 class QobuzTUI(App):
-    """Qobuz TUI — terminal music player."""
-
-    TITLE = "Qobuz TUI"
+    TITLE = "Qobuz"
     CSS   = CSS
 
     BINDINGS = [
-        Binding("q",         "quit",          "Quit"),
-        Binding("space",     "toggle_pause",  "Play/Pause"),
-        Binding("n",         "next_track",    "Next"),
-        Binding("p",         "prev_track",    "Prev"),
-        Binding("right",     "seek_fwd",      "→ 10s",  show=False),
-        Binding("left",      "seek_back",     "← 10s",  show=False),
-        Binding("up",        "vol_up",        "Vol +",  show=False),
-        Binding("down",      "vol_down",      "Vol -",  show=False),
-        Binding("ctrl+a",    "add_to_queue",  "Add to queue"),
+        Binding("q",            "quit",         "Quit",       priority=False),
+        Binding("slash",        "focus_search", "/=Search",   priority=True),
+        Binding("space",        "toggle_pause", "Play/Pause", priority=False),
+        Binding("n",            "next_track",   "Next"),
+        Binding("p",            "prev_track",   "Prev"),
+        Binding("r",            "radio",        "Radio",      priority=False),
+        Binding("right",        "seek_fwd",     "+10s",       show=False),
+        Binding("left",         "seek_back",    "−10s",       show=False),
+        Binding("bracketright", "vol_up",       "Vol+",       show=False),
+        Binding("bracketleft",  "vol_down",     "Vol−",       show=False),
     ]
 
     def __init__(self, session: QobuzSession) -> None:
         super().__init__()
-        self._session  = session
-        self._mpv      = MpvPlayer()
-        self._queue    = TrackQueue()
-        self._poll_task: asyncio.Task | None = None
+        self._session    = session
+        self._mpv        = MpvPlayer()
+        self._queue      = TrackQueue()
+        self._poll_task: Optional[asyncio.Task] = None
+        self._prev_entry: Optional[QueueEntry]  = None
+        self._advancing  = False
 
     # ── Compose ────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield SearchBar()                          # always visible, docked top
         with TabbedContent(id="main-tabs"):
-            with TabPane("Search", id="tab-search"):
-                yield SearchPane(self._session)
-            with TabPane("Album", id="tab-album"):
+            with TabPane("Results",   id="tab-results"):
+                yield ResultsPane()
+            with TabPane("💿 Album",  id="tab-album"):
                 yield AlbumPane(self._session)
-            with TabPane("Queue", id="tab-queue"):
+            with TabPane("📋 Queue",  id="tab-queue"):
                 yield QueuePane()
+            with TabPane("✨ For You", id="tab-recs"):
+                yield RecsPane(self._session)
         yield NowPlayingBar()
         yield Footer()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
-        queue_pane = self.query_one(QueuePane)
-        queue_pane.attach_queue(self._queue)
-
+        self.query_one(QueuePane).attach(self._queue)
         if not self._mpv.available:
             self.notify(
-                "mpv not found — audio playback disabled.\n"
-                "Install: brew install mpv  /  apt install mpv",
-                severity="warning",
-                timeout=8,
+                "mpv not found — playback disabled.\n"
+                "Termux: pkg install mpv  |  Linux: apt install mpv  |  macOS: brew install mpv",
+                severity="warning", timeout=12,
             )
-        else:
-            self._mpv.start()
-            self._poll_task = asyncio.create_task(self._poll_loop())
+        elif not self._mpv.start():
+            self.notify("mpv failed to start", severity="error")
+        self._poll_task = asyncio.create_task(self._poll_loop())
+        self.query_one(SearchBar).focus_input()
 
     def on_unmount(self) -> None:
         if self._poll_task:
             self._poll_task.cancel()
+        current = self._queue.current()
+        if current:
+            self._session.report_stream_cancel(current.track_id)
         self._mpv.quit()
 
-    # ── Poll mpv state ────────────────────────────────────────────────────
+    # ── Global key redirect ────────────────────────────────────────────────
+    # Typing a printable character while a DataTable (or similar) has focus
+    # silently redirects keystrokes to the search bar so the user never has
+    # to think about focus management.
+
+    def on_key(self, ev: Any) -> None:
+        focused = self.focused
+        if isinstance(focused, Input):
+            return   # Input already handles its own keys
+        key = ev.key
+        # Single printable character that isn't a reserved binding
+        if len(key) == 1 and key.isprintable() and key not in ("q", " ", "n", "p", "r"):
+            inp = self.query_one(SearchBar).get_input()
+            inp.focus()
+            inp.value += key
+            inp.cursor_position = len(inp.value)
+            ev.stop()
+
+    # ── mpv poll loop ──────────────────────────────────────────────────────
 
     async def _poll_loop(self) -> None:
-        bar = self.query_one(NowPlayingBar)
+        bar      = self.query_one(NowPlayingBar)
+        loop     = asyncio.get_running_loop()
+        was_idle = True
+
         while True:
             await asyncio.sleep(0.5)
             try:
-                pos    = await asyncio.get_event_loop().run_in_executor(None, self._mpv.position)
-                dur    = await asyncio.get_event_loop().run_in_executor(None, self._mpv.duration)
-                paused = await asyncio.get_event_loop().run_in_executor(None, self._mpv.is_paused)
-                vol    = await asyncio.get_event_loop().run_in_executor(None, self._mpv.volume)
+                pos    = await loop.run_in_executor(None, self._mpv.position)
+                dur    = await loop.run_in_executor(None, self._mpv.duration)
+                paused = await loop.run_in_executor(None, self._mpv.is_paused)
+                vol    = await loop.run_in_executor(None, self._mpv.volume)
+                idle   = await loop.run_in_executor(None, self._mpv.is_idle)
+
                 bar.pos    = pos
                 bar.dur    = dur
                 bar.paused = paused
                 bar.volume = vol
 
-                # Auto-advance when track ends
-                if dur > 0 and pos >= dur - 1.5:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, self._mpv.is_idle
-                    )
-                    if self._mpv.is_idle():
-                        self.action_next_track()
+                if idle and not was_idle and dur > 0 and not self._advancing:
+                    self._advancing = True
+                    self.call_later(self._auto_advance)
+
+                was_idle = idle
             except Exception:
                 pass
 
-    # ── Track playback ─────────────────────────────────────────────────────
+    def _auto_advance(self) -> None:
+        self._advancing = False
+        self.action_next_track()
+
+    # ── Search ─────────────────────────────────────────────────────────────
+
+    @on(SearchBar.Submitted)
+    def _search_submitted(self, ev: SearchBar.Submitted) -> None:
+        self.query_one(TabbedContent).active = "tab-results"
+        self.query_one(ResultsPane).show_searching(ev.query)
+        self._run_search(ev.query)
 
     @work(thread=True)
-    def _play_entry(self, entry: QueueEntry) -> None:
-        """Resolve the CDN URL then load it in mpv."""
+    def _run_search(self, query: str) -> None:
+        try:
+            tr = self._session.search(query, search_type="tracks",  limit=15)
+            al = self._session.search(query, search_type="albums",  limit=6)
+            ar = self._session.search(query, search_type="artists", limit=4)
+        except Exception as exc:
+            self.call_from_thread(
+                self.query_one(ResultsPane).show_error, f"Search error: {exc}"
+            )
+            return
+
+        rows:     list[tuple] = []
+        new_rows: list[dict]  = []
+
+        for t in tr.get("tracks", {}).get("items", []):
+            new_rows.append({"type": "track", "data": t})
+            rows.append((
+                "🎵",
+                t.get("title", ""),
+                (t.get("performer") or {}).get("name", ""),
+                (t.get("album") or {}).get("title", ""),
+                str(t.get("id", "")),
+            ))
+        for a in al.get("albums", {}).get("items", []):
+            new_rows.append({"type": "album", "data": a})
+            rows.append((
+                "💿",
+                a.get("title", ""),
+                (a.get("artist") or {}).get("name", ""),
+                (a.get("release_date_original") or "")[:4],
+                str(a.get("id", "")),
+            ))
+        for a in ar.get("artists", {}).get("items", []):
+            new_rows.append({"type": "artist", "data": a})
+            rows.append((
+                "👤",
+                a.get("name", ""),
+                f"{a.get('albums_count', '')} albums",
+                "",
+                str(a.get("id", "")),
+            ))
+
+        self.call_from_thread(
+            self.query_one(ResultsPane).show_results, rows, new_rows
+        )
+
+    # ── Playback ──────────────────────────────────────────────────────────
+
+    def _set_bar(self, **kw: Any) -> None:
         bar = self.query_one(NowPlayingBar)
-        self.app.call_from_thread(bar.__setattr__, "title",  f"⟳ Resolving…  {entry.title}")
-        self.app.call_from_thread(bar.__setattr__, "artist", entry.artist)
-        self.app.call_from_thread(bar.__setattr__, "pos",    0.0)
-        self.app.call_from_thread(bar.__setattr__, "dur",    0.0)
+        for k, v in kw.items():
+            setattr(bar, k, v)
+
+    @work(thread=True)
+    def _play_entry(self, entry: QueueEntry, prev: Optional[QueueEntry] = None) -> None:
+        self.call_from_thread(
+            self._set_bar,
+            title=f"[dim]⟳ Resolving…[/dim]  {entry.title}",
+            artist=entry.artist,
+            album=entry.album,
+            quality="",
+            pos=0.0,
+            dur=float(entry.duration),
+            paused=False,
+        )
+
+        if prev and prev.track_id != entry.track_id and prev.stream:
+            try:
+                self._session.report_stream_end(prev.track_id)
+            except Exception:
+                pass
 
         try:
-            url_info = self._session.client.get_track_url(
-                entry.track_id, quality=Quality.FLAC_16
+            stream_info = self._session.prepare_stream(
+                entry.track_id, quality=Quality.HI_RES,
             )
         except NotStreamableError:
-            self.app.call_from_thread(
-                self.notify, f"Not streamable: {entry.title}", severity="warning"
-            )
+            def _ns() -> None:
+                self.notify(f"Not streamable: {entry.title}", severity="warning")
+                self._set_bar(title="Not streamable", paused=True)
+            self.call_from_thread(_ns)
             return
-        except QobuzError as exc:
-            self.app.call_from_thread(
-                self.notify, f"URL error: {exc}", severity="error"
-            )
-            return
-
-        entry.url = url_info.get("url", "")
-        if not entry.url:
-            self.app.call_from_thread(self.notify, "No URL returned", severity="error")
+        except Exception as exc:
+            def _err() -> None:
+                self.notify(f"Stream error: {exc}", severity="error")
+                self._set_bar(title="Stream error", paused=True)
+            self.call_from_thread(_err)
             return
 
-        self._mpv.load(entry.url)
-        self.app.call_from_thread(bar.__setattr__, "title",  entry.title)
-        self.app.call_from_thread(bar.__setattr__, "artist", entry.artist)
-        self.app.call_from_thread(bar.__setattr__, "paused", False)
+        entry.stream = stream_info
 
-        # Refresh queue pane to update the ▶ marker
-        queue_pane = self.query_one(QueuePane)
-        self.app.call_from_thread(queue_pane.refresh_table)
+        if stream_info.bit_depth and stream_info.sampling_rate:
+            sr     = stream_info.sampling_rate
+            sr_str = f"{int(sr)}kHz" if sr == int(sr) else f"{sr}kHz"
+            quality_str = f"{stream_info.bit_depth}bit / {sr_str}"
+        elif stream_info.format_id == 5:
+            quality_str = "MP3 320"
+        elif stream_info.format_id == 6:
+            quality_str = "CD FLAC"
+        else:
+            quality_str = ""
 
-    # ── Message handlers ────────────────────────────────────────────────────
+        self._mpv.load(stream_info.url)
 
-    @on(SearchPane.TrackSelected)
-    def on_track_selected(self, event: SearchPane.TrackSelected) -> None:
-        self._queue.add(event.entry)
-        entry = self._queue.play_index(len(self._queue) - 1)
-        self.notify(f"Playing: {event.entry.title}")
-        self._play_entry(event.entry)
-        self.query_one(QueuePane).refresh_table()
+        def _ready() -> None:
+            self._set_bar(title=entry.title, quality=quality_str, paused=False)
+            self.query_one(QueuePane).refresh_table()
 
-    @on(SearchPane.AlbumSelected)
-    def on_album_selected(self, event: SearchPane.AlbumSelected) -> None:
-        album_pane = self.query_one(AlbumPane)
-        album_pane.load_album(event.album_id, event.title)
-        # Switch to Album tab
-        tabs = self.query_one(TabbedContent)
-        tabs.active = "tab-album"
+        self.call_from_thread(_ready)
 
-    @on(AlbumPane.TrackSelected)
-    def on_album_track_selected(self, event: AlbumPane.TrackSelected) -> None:
-        self._queue.add(event.entry)
+    def _start_entry(self, entry: QueueEntry) -> None:
+        prev = self._prev_entry
+        self._prev_entry = entry
+        self._play_entry(entry, prev=prev)
+
+    # ── Message routing ────────────────────────────────────────────────────
+
+    @on(ResultsPane.TrackChosen)
+    def _rp_track(self, ev: ResultsPane.TrackChosen) -> None:
+        self._queue.add(ev.entry)
         self._queue.play_index(len(self._queue) - 1)
-        self.notify(f"Playing: {event.entry.title}")
-        self._play_entry(event.entry)
+        self.notify(f"▶  {ev.entry.title}", timeout=2)
+        self._start_entry(ev.entry)
         self.query_one(QueuePane).refresh_table()
 
-    @on(AlbumPane.AddAllRequested)
-    def on_add_all(self, event: AlbumPane.AddAllRequested) -> None:
-        for e in event.entries:
-            self._queue.add(e)
-        self.notify(f"Added {len(event.entries)} tracks to queue")
+    @on(ResultsPane.AlbumChosen)
+    def _rp_album(self, ev: ResultsPane.AlbumChosen) -> None:
+        self.query_one(AlbumPane).load(ev.entity_id, ev.title)
+        self.query_one(TabbedContent).active = "tab-album"
+
+    @on(AlbumPane.TrackChosen)
+    def _a_track(self, ev: AlbumPane.TrackChosen) -> None:
+        self._queue.add(ev.entry)
+        self._queue.play_index(len(self._queue) - 1)
+        self.notify(f"▶  {ev.entry.title}", timeout=2)
+        self._start_entry(ev.entry)
         self.query_one(QueuePane).refresh_table()
 
-    @on(QueuePane.PlayRequested)
-    def on_queue_play(self, event: QueuePane.PlayRequested) -> None:
-        entry = self._queue.play_index(event.index)
+    @on(AlbumPane.AddAllChosen)
+    def _a_all(self, ev: AlbumPane.AddAllChosen) -> None:
+        start = len(self._queue)
+        self._queue.extend(ev.entries)
+        if self._queue.current_index < 0 or self._queue.current() is None:
+            self._queue.play_index(start)
+            self._start_entry(ev.entries[0])
+        self.notify(f"Added {len(ev.entries)} tracks to queue", timeout=2)
+        self.query_one(QueuePane).refresh_table()
+
+    @on(QueuePane.JumpTo)
+    def _q_jump(self, ev: QueuePane.JumpTo) -> None:
+        entry = self._queue.play_index(ev.index)
         if entry:
-            self._play_entry(entry)
+            self._start_entry(entry)
 
-    # ── Key actions ────────────────────────────────────────────────────────
+    @on(RecsPane.AlbumChosen)
+    def _r_album(self, ev: RecsPane.AlbumChosen) -> None:
+        self.query_one(AlbumPane).load(ev.entity_id, ev.title)
+        self.query_one(TabbedContent).active = "tab-album"
+
+    # ── Actions ────────────────────────────────────────────────────────────
+
+    def action_focus_search(self) -> None:
+        self.query_one(SearchBar).focus_input()
 
     def action_toggle_pause(self) -> None:
         self._mpv.toggle_pause()
 
     def action_next_track(self) -> None:
+        current = self._queue.current()
+        if current and current.stream:
+            try:
+                self._session.report_stream_end(current.track_id)
+            except Exception:
+                pass
         entry = self._queue.advance()
         if entry:
-            self._play_entry(entry)
+            self._start_entry(entry)
         else:
-            self.notify("End of queue", severity="information")
+            self.notify("End of queue — press [bold]r[/bold] for radio.", timeout=5)
 
     def action_prev_track(self) -> None:
         bar = self.query_one(NowPlayingBar)
         if bar.pos > 3.0:
-            self._mpv.seek(-bar.pos)   # restart current
+            self._mpv.seek(-bar.pos)
         else:
+            current = self._queue.current()
+            if current and current.stream:
+                try:
+                    self._session.report_stream_cancel(current.track_id)
+                except Exception:
+                    pass
             entry = self._queue.back()
             if entry:
-                self._play_entry(entry)
+                self._start_entry(entry)
 
-    def action_seek_fwd(self) -> None:
-        self._mpv.seek(10)
+    def action_radio(self) -> None:
+        current = self._queue.current()
+        if not current:
+            self.notify("Play a track first to seed radio.", severity="warning")
+            return
+        self.notify(f"Building radio from: {current.title}…", timeout=3)
+        self._build_radio(current.track_id)
 
-    def action_seek_back(self) -> None:
-        self._mpv.seek(-10)
+    @work(thread=True)
+    def _build_radio(self, track_id: str) -> None:
+        try:
+            tracks = self._session.get_track_radio(track_id, limit=20)
+        except Exception as exc:
+            self.call_from_thread(self.notify, f"Radio failed: {exc}", severity="error")
+            return
+
+        entries = []
+        for t in tracks:
+            try:
+                entries.append(QueueEntry(
+                    track_id=str(t.id),
+                    title=getattr(t, "display_title", None) or t.title,
+                    artist=t.performer.name if t.performer else "",
+                    album=t.album.title if t.album else "",
+                    duration=t.duration or 0,
+                ))
+            except Exception:
+                continue
+
+        def _add() -> None:
+            self._queue.extend(entries)
+            self.query_one(QueuePane).refresh_table()
+            self.notify(f"Radio: added {len(entries)} tracks", timeout=3)
+
+        self.call_from_thread(_add)
+
+    def action_seek_fwd(self)  -> None: self._mpv.seek(10)
+    def action_seek_back(self) -> None: self._mpv.seek(-10)
 
     def action_vol_up(self) -> None:
         bar = self.query_one(NowPlayingBar)
-        new_vol = min(150, bar.volume + 5)
-        self._mpv.set_volume(new_vol)
-        bar.volume = new_vol
+        v   = min(150, bar.volume + 5)
+        self._mpv.set_volume(v)
+        bar.volume = v
 
     def action_vol_down(self) -> None:
         bar = self.query_one(NowPlayingBar)
-        new_vol = max(0, bar.volume - 5)
-        self._mpv.set_volume(new_vol)
-        bar.volume = new_vol
-
-    def action_add_to_queue(self) -> None:
-        self.notify("Select a track from Search or Album to add", timeout=2)
+        v   = max(0, bar.volume - 5)
+        self._mpv.set_volume(v)
+        bar.volume = v
 
     def action_quit(self) -> None:
         self._mpv.quit()
@@ -862,21 +1152,27 @@ def main(dev: bool = False) -> None:
         sess = QobuzSession.from_config(dev=dev)
     except FileNotFoundError:
         print(
-            "Not logged in. Run: qobuz login -u EMAIL -p PASSWORD",
+            "\n[tui] Not logged in.\n"
+            "  Run:  qobuz login -u EMAIL -p PASSWORD\n",
             file=sys.stderr,
         )
         sys.exit(1)
-    except QobuzError as exc:
-        print(f"Session error: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"\n[tui] Session error: {exc}\n", file=sys.stderr)
+        traceback.print_exc()
         sys.exit(1)
 
-    app = QobuzTUI(session=sess)
-    app.run()
+    try:
+        QobuzTUI(session=sess).run()
+    except Exception as exc:
+        print(f"\n[tui] Crash: {exc}\n", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="Qobuz TUI player")
-    p.add_argument("--dev", action="store_true", help="Enable dev mode (cached responses)")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="Qobuz TUI player")
+    ap.add_argument("--dev", action="store_true")
+    args = ap.parse_args()
     main(dev=args.dev)

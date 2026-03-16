@@ -1,51 +1,27 @@
 # kabooz/session.py
 """
-QobuzSession — high-level facade over QobuzClient + LocalStore.
+QobuzSession — the ONLY place where business logic lives.
 
-This is the primary library entry point for programmatic use. All
-operations that the CLI exposes are available here as regular Python
-method calls, with no dependency on typer or any CLI framework.
+Architectural rule
+──────────────────
+cli.py  and  tui.py  are presentation layers.
+They call methods on QobuzSession and render the results.
+They NEVER:
+  · import from kabooz.client directly
+  · call sess.client.anything
+  · duplicate quality-parsing, URL-resolution, or reporting logic
 
-Usage:
-    from kabooz import QobuzSession, Quality
-
-    session = QobuzSession.from_config()
-    session.download_track("12345")
-    session.download_album("https://open.qobuz.com/album/abc123")
-    session.clone_playlist("8898080", name="My Copy")
-    session.add_favorite("12345", "track", remote=True)
-    session.backup()
-    session.restore("qobuz-backup-2026-03-15.tar.gz")
-    session.import_favorites("favorites-2026-03-15.toml")
-    session.import_playlist("evening-classical.toml")
-
-    # Account management:
-    profile = session.get_profile()
-    session.update_profile(firstname="Alice", newsletter=False)
-    session.change_password("old", "new")
-
-    # Remote playlist management:
-    pl = session.create_remote_playlist("My Playlist", is_public=True)
-    session.add_tracks_to_remote_playlist(pl.id, ["12345", "67890"])
-    session.follow_playlist("8898080")
-
-    # Discovery:
-    releases = session.get_new_releases(type="press-awards")
-    playlists = session.get_featured_playlists()
-
-    # Iterate without downloading:
-    for track in session.client.iter_playlist_track_summaries("8898080"):
-        print(track.title)
-
-All methods return typed objects or raise QobuzError subclasses —
-never sys.exit(), never print to stdout (use the callbacks for progress).
+Every operation a user can trigger from the CLI or TUI is a method here,
+so it is equally callable from a plain Python script.
 """
 from __future__ import annotations
 
 import dataclasses
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Generator, Optional
 
 from .client import QobuzClient
 from .config import QobuzConfig, _CONFIG_PATH, _SESSION_PATH, load_config
@@ -55,54 +31,106 @@ from .download.musicbrainz import lookup_isrc, apply_mb_tags
 from .download.naming import sanitize
 from .download.tagger import Tagger
 from .exceptions import (
-    APIError, NotStreamableError, PoolModeError,
-    TokenExpiredError, InvalidCredentialsError, NoAuthError,
+    APIError, ConfigError, NotFoundError, NotStreamableError,
+    PoolModeError, TokenExpiredError, InvalidCredentialsError, NoAuthError,
 )
-from .local.store import LocalStore
+from .local.export import (
+    ImportResult, backup_to_tar, export_favorites_toml,
+    import_favorites_toml, import_playlist_toml, restore_from_tar,
+)
 from .local.playlist import (
     LocalPlaylist, LocalPlaylistTrack,
     load_playlist, save_playlist, playlist_from_store_tracks,
 )
-from .local.export import (
-    backup_to_tar,
-    export_favorites_toml,
-    import_favorites_toml,
-    import_playlist_toml,
-    restore_from_tar,
-    ImportResult,
-)
+from .local.store import LocalStore
 from .models.album import Album
-from .models.track import Track
+from .models.artist import Artist
+from .models.favorites import UserFavorites, UserFavoriteIds, LabelDetail
 from .models.playlist import Playlist
-from .models.favorites import UserFavorites
+from .models.track import Track
 from .models.user import UserProfile
-from .quality import Quality
+from .quality import Quality, QUALITY_DESCENDING
 from .url import parse_url
 
 
-# ── Result types ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# Quality parsing helper
+# ══════════════════════════════════════════════════════════════════════════
+
+def _parse_quality(s: str) -> Quality:
+    """
+    Parse a quality string without requiring Quality.from_str().
+
+    Accepts enum names (case-insensitive), common aliases, and raw
+    format_id integers.  Raises ValueError on unknown input.
+    """
+    _ALIASES: dict[str, Quality] = {
+        "mp3":        Quality.MP3_320,
+        "320":        Quality.MP3_320,
+        "cd":         Quality.FLAC_16,
+        "lossless":   Quality.FLAC_16,
+        "flac":       Quality.FLAC_16,
+        "24bit":      Quality.FLAC_24_96,
+        "24_96":      Quality.FLAC_24_96,
+        "hires":      Quality.HI_RES,
+        "hi_res":     Quality.HI_RES,
+        "best":       Quality.HI_RES,
+        "max":        Quality.HI_RES,
+    }
+    n = s.strip().lower().replace("-", "_")
+    try:
+        return Quality[n.upper()]
+    except KeyError:
+        pass
+    if n in _ALIASES:
+        return _ALIASES[n]
+    try:
+        return Quality(int(s))
+    except (ValueError, KeyError):
+        pass
+    valid = ", ".join(m.name.lower() for m in Quality)
+    raise ValueError(
+        f"Unknown quality {s!r}. "
+        f"Valid: {valid}. "
+        f"Aliases: {', '.join(_ALIASES)}"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Public result types
+# ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class StreamInfo:
+    """
+    Returned by prepare_stream(). Contains everything the TUI or any
+    other player needs to start playback and report to Qobuz.
+    """
+    track_id:      str
+    url:           str
+    format_id:     int
+    bit_depth:     Optional[int]   = None
+    sampling_rate: Optional[float] = None
+    mime_type:     str             = "audio/flac"
+
 
 @dataclass
 class TrackDownloadResult:
-    """Result of a single track download + post-processing."""
-    download: DownloadResult
-    track: Track
-    album: Optional[Album] = None
-    tagged: bool = False
+    download:     DownloadResult
+    track:        Track
+    album:        Optional[Album] = None
+    tagged:       bool = False
     lyrics_found: bool = False
-    mb_enriched: bool = False
+    mb_enriched:  bool = False
 
 
 @dataclass
 class AlbumDownloadResult:
-    """Aggregate result of downloading a full album."""
-    album: Album
-    tracks: list[TrackDownloadResult] = field(default_factory=list)
-    goodies_ok: int = 0
+    album:          Album
+    tracks:         list[TrackDownloadResult] = field(default_factory=list)
+    failed:         int = 0
+    goodies_ok:     int = 0
     goodies_failed: int = 0
-    # FIX: was a hardcoded `return 0` property — now a real counter so callers
-    # can tell whether any tracks were silently skipped due to errors.
-    failed: int = 0
 
     @property
     def succeeded(self) -> int:
@@ -115,8 +143,7 @@ class AlbumDownloadResult:
 
 @dataclass
 class PlaylistDownloadResult:
-    """Aggregate result of downloading a playlist."""
-    name: str
+    name:   str
     tracks: list[TrackDownloadResult] = field(default_factory=list)
     failed: int = 0
 
@@ -129,63 +156,95 @@ class PlaylistDownloadResult:
         return sum(1 for r in self.tracks if r.download.skipped)
 
 
-# ── Progress callback types ────────────────────────────────────────────────
-
-# Signature: on_progress(done_bytes, total_bytes)
-ProgressCallback = Callable[[int, int], None]
-
-# Signature: on_track_start(track_title, index, total)
-TrackStartCallback = Callable[[str, int, int], None]
-
-# Signature: on_track_done(result)
-TrackDoneCallback = Callable[[TrackDownloadResult], None]
+# Callback signatures
+ProgressCallback   = Callable[[int, int], None]           # (bytes_done, total_bytes)
+TrackStartCallback = Callable[[str, int, int], None]       # (title, index, total)
+TrackDoneCallback  = Callable[[TrackDownloadResult], None]
+AlbumStartCallback = Callable[[str, int, int], None]       # (title, index, total)
 
 
-# ── Session ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════
+# Internal stream reporter
+# ══════════════════════════════════════════════════════════════════════════
+
+class _StreamReporter:
+    """
+    Sends stream start/end events to the Qobuz API.
+    Access only through QobuzSession.report_stream_* methods.
+    """
+
+    def __init__(self, client: QobuzClient, enabled: bool = True) -> None:
+        self._client  = client
+        self._enabled = enabled
+        self._lock    = threading.Lock()
+        self._active: dict[str, float] = {}   # track_id → wall-clock start
+
+    def start(self, track_id: str, format_id: int = 27) -> None:
+        if not self._enabled:
+            return
+        with self._lock:
+            self._active[track_id] = time.time()
+        try:
+            self._client._request(
+                "GET", "/track/reportStreamingStart",
+                params={"track_id": track_id, "format_id": format_id, "intent": "stream"},
+            )
+        except Exception:
+            pass   # reporting is best-effort; never crash playback
+
+    def end(self, track_id: str, duration_seconds: Optional[int] = None) -> None:
+        if not self._enabled:
+            return
+        with self._lock:
+            started = self._active.pop(track_id, None)
+        elapsed = duration_seconds
+        if elapsed is None and started is not None:
+            elapsed = int(time.time() - started)
+        try:
+            params: dict[str, Any] = {"track_id": track_id}
+            if elapsed is not None:
+                params["duration"] = elapsed
+            self._client._request("GET", "/track/reportStreamingEnd", params=params)
+        except Exception:
+            pass
+
+    def cancel(self, track_id: str) -> None:
+        """Cancel without reporting end (e.g. track skipped before 30 s)."""
+        with self._lock:
+            self._active.pop(track_id, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# QobuzSession
+# ══════════════════════════════════════════════════════════════════════════
 
 class QobuzSession:
-    """
-    High-level Qobuz session combining API access, local storage,
-    download, and tagging into a single programmable interface.
-
-    All CLI commands are thin wrappers around methods of this class.
-    Everything here is usable from library code with no CLI dependency.
-    """
 
     def __init__(
         self,
         client: QobuzClient,
         config: QobuzConfig,
-        store: Optional[LocalStore] = None,
-        dev: bool = False,
+        store:  Optional[LocalStore] = None,
+        dev:    bool = False,
     ) -> None:
-        self.client = client
-        self.config = config
-        self.store  = store or LocalStore(config.local_data.db_path)
-        self._dev   = dev
+        self.client  = client
+        self.config  = config
+        self.store   = store or LocalStore(config.local_data.db_path)
+        self._dev    = dev
+        self._reporter = _StreamReporter(client, enabled=True)
 
-    # ── Factory methods ────────────────────────────────────────────────────
+    # ── Construction ───────────────────────────────────────────────────────
 
     @classmethod
     def from_config(
         cls,
         config_path: Path = _CONFIG_PATH,
         dev: bool = False,
-    ) -> QobuzSession:
-        """
-        Create a session from the standard config file.
-        Loads credentials and session token automatically.
-
-        Raises:
-            ConfigError       — if the config file is invalid.
-            FileNotFoundError — if the session file is missing (not logged in).
-        """
+    ) -> "QobuzSession":
         cfg = load_config(config_path)
-
         if dev:
             from .dev import enable as _dev_enable
             _dev_enable()
-
         if cfg.credentials.pool:
             client = QobuzClient.from_token_pool(cfg.credentials.pool, dev=dev)
         else:
@@ -195,7 +254,6 @@ class QobuzSession:
                 dev=dev,
             )
             client.load_session(_SESSION_PATH)
-
         return cls(client=client, config=cfg, dev=dev)
 
     @classmethod
@@ -203,15 +261,13 @@ class QobuzSession:
         cls,
         client: QobuzClient,
         config: Optional[QobuzConfig] = None,
-    ) -> QobuzSession:
-        """
-        Wrap an existing QobuzClient. Useful when you've already
-        authenticated manually.
-        """
+    ) -> "QobuzSession":
         cfg = config or load_config()
         return cls(client=client, config=cfg)
 
-    # ── URL / ID resolution ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # Helpers — used by CLI, TUI, and scripts; never duplicated elsewhere
+    # ══════════════════════════════════════════════════════════════════════
 
     def resolve_id(
         self,
@@ -219,9 +275,12 @@ class QobuzSession:
         expected_type: Optional[str] = None,
     ) -> tuple[str, str]:
         """
-        Parse a Qobuz URL or bare ID.
+        Parse a Qobuz URL or bare numeric ID.
+
         Returns (entity_type, entity_id).
-        For bare IDs, entity_type is expected_type or 'unknown'.
+        For bare IDs entity_type is expected_type or 'unknown'.
+
+        Raises ValueError if URL parses to a different type than expected.
         """
         if url_or_id.startswith("http"):
             entity_type, entity_id = parse_url(url_or_id)
@@ -232,27 +291,387 @@ class QobuzSession:
             return entity_type, entity_id
         return expected_type or "unknown", url_or_id
 
-    # ── Post-download pipeline ─────────────────────────────────────────────
+    def resolve_quality(
+        self,
+        s: Optional[str],
+        default: Optional[Quality] = None,
+    ) -> Quality:
+        """
+        Parse a quality string, falling back to config then HI_RES.
 
-    def post_download(
+        Raises ConfigError (not ValueError) so callers get a consistent
+        exception type regardless of where the bad string came from.
+        """
+        if not s:
+            if default is not None:
+                return default
+            return _parse_quality(self.config.download.quality)
+        try:
+            return _parse_quality(s)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Stream reporting — public API for TUI/player
+    # ══════════════════════════════════════════════════════════════════════
+
+    def prepare_stream(
+        self,
+        track_id: str | int,
+        quality: Quality = Quality.HI_RES,
+    ) -> StreamInfo:
+        """
+        Resolve a CDN stream URL and report stream start to Qobuz.
+
+        This is the ONLY way the TUI (or any player) should get a stream
+        URL. It bundles URL resolution and stream reporting so reporting
+        can never be accidentally skipped.
+
+        Call report_stream_end() when playback stops normally.
+        Call report_stream_cancel() when the track is skipped.
+        """
+        url_info = self.client.get_track_url(str(track_id), quality=quality)
+        fmt_id   = url_info.get("format_id", int(quality))
+        self._reporter.start(str(track_id), format_id=int(fmt_id))
+        return StreamInfo(
+            track_id      = str(track_id),
+            url           = url_info["url"],
+            format_id     = int(fmt_id),
+            bit_depth     = url_info.get("bit_depth"),
+            sampling_rate = url_info.get("sampling_rate"),
+            mime_type     = url_info.get("mime_type", "audio/flac"),
+        )
+
+    def report_stream_end(
+        self,
+        track_id: str | int,
+        duration_seconds: Optional[int] = None,
+    ) -> None:
+        """Report that playback of track_id ended normally."""
+        self._reporter.end(str(track_id), duration_seconds)
+
+    def report_stream_cancel(self, track_id: str | int) -> None:
+        """Report that track_id was cancelled/skipped before finishing."""
+        self._reporter.cancel(str(track_id))
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Catalog reads — thin wrappers so CLI/TUI never import from .client
+    # ══════════════════════════════════════════════════════════════════════
+
+    def get_track(self, track_id: str | int) -> Track:
+        return self.client.get_track(str(track_id))
+
+    def get_album(
+        self,
+        album_id: str,
+        extra: Optional[str] = None,
+        limit: int = 1200,
+        offset: int = 0,
+    ) -> Album:
+        return self.client.get_album(album_id, extra=extra, limit=limit, offset=offset)
+
+    def get_artist(
+        self,
+        artist_id: str | int,
+        extras: str = "albums",
+        sort: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Artist:
+        return self.client.get_artist(
+            artist_id, extras=extras, sort=sort, limit=limit, offset=offset,
+        )
+
+    def get_playlist(
+        self,
+        playlist_id: str | int,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> Playlist:
+        return self.client.get_playlist(playlist_id, limit=limit, offset=offset)
+
+    def get_label(self, label_id: str | int, **kwargs) -> LabelDetail:
+        return self.client.get_label(label_id, **kwargs)
+
+    def search(
+        self,
+        query: str,
+        search_type: str = "tracks",
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        """
+        Search the Qobuz catalog.
+        search_type: 'tracks', 'albums', 'artists', 'playlists'
+        """
+        return self.client.search(
+            query=query, type=search_type, limit=limit, offset=offset,
+        )
+
+    def get_user_favorites(
+        self,
+        fav_type: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> UserFavorites:
+        return self.client.get_user_favorites(
+            type=fav_type, limit=limit, offset=offset,
+        )
+
+    def get_favorite_ids(self) -> UserFavoriteIds:
+        return self.client.get_favorite_ids()
+
+    def get_user_info(self) -> UserProfile:
+        return self.client.get_user_info()
+
+    def iter_user_playlists(self, page_size: int = 50) -> Generator[Playlist, None, None]:
+        return self.client.iter_user_playlists(page_size=page_size)
+
+    def iter_playlist_track_summaries(
+        self, playlist_id: str | int, page_size: int = 500,
+    ) -> Generator[Any, None, None]:
+        return self.client.iter_playlist_track_summaries(playlist_id, page_size)
+
+    def iter_releases(
+        self,
+        artist_id: str | int,
+        release_type: Optional[str] = None,
+        page_size: int = 50,
+    ) -> Generator[Any, None, None]:
+        return self.client.iter_releases(
+            artist_id, release_type=release_type, page_size=page_size,
+        )
+
+    def get_similar_artists(
+        self, artist_id: str | int, limit: int = 10,
+    ) -> list[Artist]:
+        return self.client.get_similar_artists(artist_id, limit=limit)
+
+    # ── Discovery ──────────────────────────────────────────────────────────
+
+    def get_new_releases(
+        self,
+        release_type: str = "new-releases",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        return self.client.get_new_releases(
+            type=release_type, genre_id=genre_id, limit=limit, offset=offset,
+        )
+
+    def get_featured_playlists(
+        self,
+        pl_type: str = "editor-picks",
+        genre_id: Optional[int] = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> dict:
+        return self.client.get_featured_playlists(
+            type=pl_type, genre_id=genre_id, limit=limit, offset=offset,
+        )
+
+    def get_genres(self, parent_id: Optional[int] = None) -> dict:
+        return self.client.get_genres(parent_id=parent_id)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Radio and recommendations
+    # ══════════════════════════════════════════════════════════════════════
+
+    def get_track_radio(
+        self,
+        track_id: str | int,
+        limit: int = 25,
+    ) -> list[Track]:
+        """
+        Build a radio queue seeded by a single track.
+
+        Tries the official /track/getSuggestions endpoint first;
+        falls back to similar-artist browsing if unavailable.
+        """
+        import random
+
+        # Attempt 1 — official suggestions
+        try:
+            data  = self.client._request(
+                "GET", "/track/getSuggestions",
+                params={"track_id": str(track_id), "limit": limit},
+            )
+            items = (
+                data.get("tracks", {}).get("items")
+                or data.get("items")
+                or []
+            )
+            if items:
+                tracks = []
+                for item in items[:limit]:
+                    try:
+                        tracks.append(Track.from_dict(item))
+                    except Exception:
+                        pass
+                if tracks:
+                    return tracks
+        except Exception:
+            pass
+
+        # Attempt 2 — similar-artist fallback
+        try:
+            seed = self.client.get_track(str(track_id))
+        except Exception:
+            return []
+
+        similar_ids: list[Any] = []
+        if seed.performer:
+            try:
+                a = self.client.get_artist(
+                    seed.performer.id, extras="", limit=1,
+                )
+                similar_ids = (a.similar_artist_ids or [])[:6]
+            except Exception:
+                pass
+
+        tracks: list[Track] = []
+        for sid in similar_ids:
+            if len(tracks) >= limit:
+                break
+            try:
+                artist = self.client.get_artist(sid, extras="albums", limit=5)
+                if not artist.albums or not artist.albums.items:
+                    continue
+                alb = random.choice(artist.albums.items)
+                full = self.client.get_album(alb.id, limit=20)
+                if full.tracks and full.tracks.items:
+                    for s in random.sample(
+                        full.tracks.items, min(4, len(full.tracks.items))
+                    ):
+                        try:
+                            tracks.append(self.client.get_track(str(s.id)))
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+
+        random.shuffle(tracks)
+        return tracks[:limit]
+
+    def get_artist_radio(
+        self,
+        artist_id: str | int,
+        limit: int = 25,
+    ) -> list[Track]:
+        """
+        Build a radio queue seeded by an artist.
+        Picks tracks from the artist + their similar artists.
+        """
+        import random
+        tracks: list[Track] = []
+
+        # Artist's own releases
+        try:
+            for release in self.client.iter_releases(artist_id, page_size=10):
+                if len(tracks) >= limit // 2 or not release.id:
+                    break
+                try:
+                    alb = self.client.get_album(release.id, limit=10)
+                    if alb.tracks and alb.tracks.items:
+                        for s in alb.tracks.items[:3]:
+                            tracks.append(self.client.get_track(str(s.id)))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # Fill from similar artists
+        try:
+            for sim in self.client.get_similar_artists(artist_id, limit=8):
+                if len(tracks) >= limit:
+                    break
+                try:
+                    for release in self.client.iter_releases(sim.id, page_size=3):
+                        if not release.id:
+                            continue
+                        alb = self.client.get_album(release.id, limit=5)
+                        if alb.tracks and alb.tracks.items:
+                            tracks.append(
+                                self.client.get_track(
+                                    str(random.choice(alb.tracks.items).id)
+                                )
+                            )
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        random.shuffle(tracks)
+        return tracks[:limit]
+
+    def get_recommendations(self, limit: int = 20) -> dict[str, list]:
+        """
+        Return editorial and personalised recommendation lists.
+
+        Keys:
+            "new_releases"    — raw album dicts from the new-releases feed
+            "press_awards"    — critic picks
+            "featured"        — editorial playlist dicts
+            "similar_artists" — Artist objects similar to your favourites
+        """
+        result: dict[str, list] = {
+            "new_releases":    [],
+            "press_awards":    [],
+            "featured":        [],
+            "similar_artists": [],
+        }
+        try:
+            result["new_releases"] = (
+                self.client.get_new_releases(type="new-releases", limit=limit)
+                .get("albums", {}).get("items", [])
+            )
+        except Exception:
+            pass
+        try:
+            result["press_awards"] = (
+                self.client.get_new_releases(type="press-awards", limit=limit)
+                .get("albums", {}).get("items", [])
+            )
+        except Exception:
+            pass
+        try:
+            result["featured"] = (
+                self.client.get_featured_playlists(type="editor-picks", limit=limit)
+                .get("playlists", {}).get("items", [])
+            )
+        except Exception:
+            pass
+        try:
+            fav_ids    = self.client.get_favorite_ids()
+            artist_ids = (fav_ids.artist_ids or [])[:5]
+            seen: set[str] = set()
+            for aid in artist_ids:
+                try:
+                    for a in self.client.get_similar_artists(aid, limit=4):
+                        if str(a.id) not in seen:
+                            seen.add(str(a.id))
+                            result["similar_artists"].append(a)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return result
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Post-download pipeline (tagging, lyrics, MusicBrainz, history)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _post_download(
         self,
         result: DownloadResult,
-        track: Track,
-        album: Optional[Album] = None,
-        embed_cover: Optional[bool] = None,
+        track:  Track,
+        album:  Optional[Album] = None,
+        embed_cover:       Optional[bool] = None,
         fetch_lyrics_flag: Optional[bool] = None,
-        save_cover_file: Optional[bool] = None,
+        save_cover_file:   Optional[bool] = None,
     ) -> TrackDownloadResult:
-        """
-        Run the full post-download pipeline on a downloaded file:
-        tagging, lyrics, MusicBrainz enrichment, cover art, history log.
-
-        All parameters default to config values when None.
-        Returns a TrackDownloadResult with flags indicating what ran.
-
-        This method is safe to call from library code — it never exits
-        or prints; use the return value to check what happened.
-        """
         cfg = self.config
         t   = cfg.tagging
         mb  = cfg.musicbrainz
@@ -264,25 +683,24 @@ class QobuzSession:
         tagged = lyrics_found = mb_enriched = False
 
         if not t.enabled:
-            return TrackDownloadResult(result, track, album, tagged, lyrics_found, mb_enriched)
+            return TrackDownloadResult(result, track, album)
 
         lyrics_result = None
         if _fetch_lyrics:
-            artist = (
+            artist_name = (
                 track.performer.name if track.performer
                 else (album.artist.name if album and album.artist else "")
             )
             lyrics_result = fetch_lyrics(
                 title=track.title,
-                artist=artist,
+                artist=artist_name,
                 album=album.title if album else None,
                 duration=track.duration,
             )
-            lyrics_found = lyrics_result.found if lyrics_result else False
+            lyrics_found = bool(lyrics_result and lyrics_result.found)
 
         if not result.dev_stub:
-            tagger = Tagger()
-            tagger.tag(
+            Tagger().tag(
                 path=result.path,
                 track=track,
                 album=album,
@@ -290,7 +708,6 @@ class QobuzSession:
                 embed_cover=_embed_cover,
             )
             tagged = True
-
             if _save_cover and album and album.image:
                 self._save_cover_file(result.path.parent, album)
 
@@ -306,50 +723,40 @@ class QobuzSession:
                     track_id=str(track.id),
                     title=track.display_title,
                     artist=track.performer.name if track.performer else "",
-                    album=album.title if album else (
-                        track.album.title if track.album else ""
-                    ),
+                    album=(album or track.album) and (
+                        album.title if album else track.album.title  # type: ignore
+                    ) or "",
                 )
             except Exception:
                 pass
 
-        return TrackDownloadResult(result, track, album, tagged, lyrics_found, mb_enriched)
+        return TrackDownloadResult(
+            result, track, album, tagged, lyrics_found, mb_enriched,
+        )
 
-    # ── Track download ─────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # Downloads
+    # ══════════════════════════════════════════════════════════════════════
 
     def download_track(
         self,
-        url_or_id: str,
-        quality: Optional[Quality] = None,
-        dest_dir: Optional[Path] = None,
-        template: Optional[str] = None,
-        embed_cover: Optional[bool] = None,
-        fetch_lyrics_flag: Optional[bool] = None,
-        save_cover_file: Optional[bool] = None,
-        on_progress: Optional[ProgressCallback] = None,
-        workers: Optional[int] = None,
-        external_downloader: Optional[str] = None,
+        url_or_id:         str,
+        quality:           Optional[Quality] = None,
+        dest_dir:          Optional[Path]    = None,
+        template:          Optional[str]     = None,
+        embed_cover:       Optional[bool]    = None,
+        fetch_lyrics_flag: Optional[bool]    = None,
+        save_cover_file:   Optional[bool]    = None,
+        on_progress:       Optional[ProgressCallback] = None,
+        workers:           Optional[int]     = None,
+        external_downloader: Optional[str]   = None,
     ) -> TrackDownloadResult:
-        """
-        Download a single track and run the full post-processing pipeline.
-
-        Parameters:
-            url_or_id:   Qobuz track ID or URL.
-            quality:     Quality tier. Defaults to config value.
-            dest_dir:    Output directory. Defaults to config value.
-            template:    Naming template override.
-            on_progress: Callback(bytes_done, total_bytes).
-
-        Returns TrackDownloadResult with the download outcome and flags
-        for what post-processing ran.
-        """
         cfg = self.config
         _, track_id = self.resolve_id(url_or_id, "track")
-
-        q      = quality or Quality[cfg.download.quality.upper()]
+        q      = quality or _parse_quality(cfg.download.quality)
         dest   = dest_dir or Path(cfg.download.output_dir)
         tmpl   = template or cfg.naming.single
-        n_work = workers or cfg.download.max_workers
+        n_work = workers  or cfg.download.max_workers
         ext_dl = external_downloader or cfg.download.external_downloader
 
         track_obj = self.client.get_track(track_id)
@@ -364,56 +771,40 @@ class QobuzSession:
             dev=self._dev,
         ) as dl:
             result = dl.download_track(
-                track=track_obj,
-                url_info=url_info,
-                dest_dir=dest,
-                album=None,
-                on_progress=on_progress,
+                track=track_obj, url_info=url_info,
+                dest_dir=dest, album=None, on_progress=on_progress,
             )
 
-        return self.post_download(
+        return self._post_download(
             result, track_obj, None,
             embed_cover=embed_cover,
             fetch_lyrics_flag=fetch_lyrics_flag,
             save_cover_file=save_cover_file,
         )
 
-    # ── Album download ─────────────────────────────────────────────────────
-
     def download_album(
         self,
-        url_or_id: str,
-        quality: Optional[Quality] = None,
-        dest_dir: Optional[Path] = None,
-        template: Optional[str] = None,
-        embed_cover: Optional[bool] = None,
-        fetch_lyrics_flag: Optional[bool] = None,
-        save_cover_file: Optional[bool] = None,
-        download_goodies: bool = True,
-        on_track_start: Optional[TrackStartCallback] = None,
-        on_track_done: Optional[TrackDoneCallback] = None,
-        on_progress: Optional[ProgressCallback] = None,
-        workers: Optional[int] = None,
-        external_downloader: Optional[str] = None,
+        url_or_id:         str,
+        quality:           Optional[Quality] = None,
+        dest_dir:          Optional[Path]    = None,
+        template:          Optional[str]     = None,
+        embed_cover:       Optional[bool]    = None,
+        fetch_lyrics_flag: Optional[bool]    = None,
+        save_cover_file:   Optional[bool]    = None,
+        download_goodies:  bool              = True,
+        on_track_start:    Optional[TrackStartCallback] = None,
+        on_track_done:     Optional[TrackDoneCallback]  = None,
+        on_progress:       Optional[ProgressCallback]   = None,
+        workers:           Optional[int]     = None,
+        external_downloader: Optional[str]   = None,
     ) -> AlbumDownloadResult:
-        """
-        Download a full album and run post-processing on each track.
-
-        Parameters:
-            url_or_id:        Qobuz album ID or URL.
-            on_track_start:   Callback(title, index, total) before each track.
-            on_track_done:    Callback(TrackDownloadResult) after each track.
-            on_progress:      Per-track progress callback(bytes_done, total).
-            download_goodies: Download booklet PDFs and bonus files.
-        """
         from .dev import dev_log
 
         cfg = self.config
         _, album_id = self.resolve_id(url_or_id, "album")
-
-        q      = quality or Quality[cfg.download.quality.upper()]
+        q      = quality or _parse_quality(cfg.download.quality)
         dest   = dest_dir or Path(cfg.download.output_dir)
-        n_work = workers or cfg.download.max_workers
+        n_work = workers  or cfg.download.max_workers
         ext_dl = external_downloader or cfg.download.external_downloader
 
         album_obj    = self.client.get_album(album_id)
@@ -433,19 +824,6 @@ class QobuzSession:
         agg           = AlbumDownloadResult(album=album_obj)
         track_results: list[DownloadResult] = []
 
-        # ── Build the track list ───────────────────────────────────────────
-        # get_album() is called above with limit=1200 (the default), so
-        # album_obj.tracks.items already contains every TrackSummary for
-        # almost every album ever released.  Only fall back to the paginated
-        # iter_album_tracks() when the album genuinely has more tracks than
-        # the initial fetch captured (> 1200 — essentially box-set outliers).
-        #
-        # The old code used iter_album_tracks() for any album with > 50
-        # tracks, which caused each track to call get_track() TWICE: once
-        # inside iter_album_tracks() and once again in this loop.  The inner
-        # iter_album_tracks() also has a silent `except Exception: pass` that
-        # could swallow individual track-fetch failures and quietly drop tracks
-        # from the yielded sequence — leading to the missing-tracks symptom.
         summaries = (
             album_obj.tracks.items
             if album_obj.tracks
@@ -468,48 +846,30 @@ class QobuzSession:
                                     getattr(summary, "title", ""))
                     on_track_start(title, i, total)
 
-                # ── Fetch full Track + signed URL ──────────────────────────
                 try:
                     track_obj = self.client.get_track(str(summary.id))
-                    url_info  = self.client.get_track_url(
-                        str(track_obj.id), quality=q
-                    )
+                    url_info  = self.client.get_track_url(str(track_obj.id), quality=q)
                 except NotStreamableError as exc:
-                    dev_log(
-                        f"[yellow]track {summary.id} not streamable "
-                        f"(skipping): {exc}[/yellow]"
-                    )
+                    dev_log(f"[yellow]track {summary.id} not streamable: {exc}[/yellow]")
                     agg.failed += 1
                     continue
                 except APIError as exc:
-                    dev_log(
-                        f"[red]track {summary.id} API error "
-                        f"(skipping): {exc}[/red]"
-                    )
+                    dev_log(f"[red]track {summary.id} API error: {exc}[/red]")
                     agg.failed += 1
                     continue
 
-                # ── Download ───────────────────────────────────────────────
                 try:
                     dl_result = dl.download_track(
-                        track=track_obj,
-                        url_info=url_info,
-                        dest_dir=dest,
-                        album=album_obj,
-                        on_progress=on_progress,
+                        track=track_obj, url_info=url_info,
+                        dest_dir=dest, album=album_obj, on_progress=on_progress,
                     )
                 except Exception as exc:
-                    # Log the real exception so it's visible in the terminal
-                    # instead of disappearing into a silent `continue`.
-                    dev_log(
-                        f"[red]track {track_obj.id} download error "
-                        f"(skipping): {type(exc).__name__}: {exc}[/red]"
-                    )
+                    dev_log(f"[red]track {track_obj.id} download error: {exc}[/red]")
                     agg.failed += 1
                     continue
 
                 track_results.append(dl_result)
-                tdr = self.post_download(
+                tdr = self._post_download(
                     dl_result, track_obj, album_obj,
                     embed_cover=embed_cover,
                     fetch_lyrics_flag=fetch_lyrics_flag,
@@ -537,44 +897,104 @@ class QobuzSession:
 
         return agg
 
-    # ── Playlist download ──────────────────────────────────────────────────
+    def download_artist_discography(
+        self,
+        url_or_id:      str,
+        release_type:   Optional[str]   = None,
+        quality:        Optional[Quality] = None,
+        dest_dir:       Optional[Path]   = None,
+        template:       Optional[str]    = None,
+        on_album_start: Optional[AlbumStartCallback] = None,
+        on_track_start: Optional[TrackStartCallback] = None,
+        on_track_done:  Optional[TrackDoneCallback]  = None,
+        workers:        Optional[int]    = None,
+    ) -> list[AlbumDownloadResult]:
+        """
+        Download every release in an artist's discography.
+
+        on_album_start(album_title, album_index, album_total) is fired
+        before each album so the CLI/TUI can print a clear header.
+        """
+        from .dev import dev_log
+
+        _, artist_id = self.resolve_id(url_or_id, "artist")
+
+        try:
+            releases = [
+                r for r in self.client.iter_releases(
+                    artist_id, release_type=release_type, page_size=100,
+                )
+                if r.id
+            ]
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to list releases for artist {artist_id}: {exc}"
+            ) from exc
+
+        total   = len(releases)
+        results = []
+
+        for i, release in enumerate(releases, 1):
+            try:
+                album_obj = self.client.get_album(release.id)
+            except APIError as exc:
+                dev_log(f"[yellow]album {release.id} fetch error (skipping): {exc}[/yellow]")
+                continue
+
+            if on_album_start:
+                on_album_start(album_obj.display_title, i, total)
+
+            try:
+                agg = self.download_album(
+                    release.id,
+                    quality=quality,
+                    dest_dir=dest_dir,
+                    template=template,
+                    on_track_start=on_track_start,
+                    on_track_done=on_track_done,
+                    workers=workers,
+                )
+                results.append(agg)
+            except NotStreamableError:
+                dev_log(f"[yellow]{album_obj.display_title!r} not streamable — skipped[/yellow]")
+            except APIError as exc:
+                dev_log(f"[red]{album_obj.display_title!r} API error: {exc}[/red]")
+            except Exception as exc:
+                dev_log(
+                    f"[red]{album_obj.display_title!r} unexpected error "
+                    f"({type(exc).__name__}): {exc}[/red]"
+                )
+
+        return results
 
     def download_playlist(
         self,
-        url_or_id: str,
-        quality: Optional[Quality] = None,
-        dest_dir: Optional[Path] = None,
-        template: Optional[str] = None,
-        embed_cover: Optional[bool] = None,
-        fetch_lyrics_flag: Optional[bool] = None,
-        save_cover_file: Optional[bool] = None,
-        on_track_start: Optional[TrackStartCallback] = None,
-        on_track_done: Optional[TrackDoneCallback] = None,
-        on_progress: Optional[ProgressCallback] = None,
-        workers: Optional[int] = None,
-        external_downloader: Optional[str] = None,
-        write_m3u: bool = False,
+        url_or_id:         str,
+        quality:           Optional[Quality] = None,
+        dest_dir:          Optional[Path]    = None,
+        template:          Optional[str]     = None,
+        embed_cover:       Optional[bool]    = None,
+        fetch_lyrics_flag: Optional[bool]    = None,
+        save_cover_file:   Optional[bool]    = None,
+        on_track_start:    Optional[TrackStartCallback] = None,
+        on_track_done:     Optional[TrackDoneCallback]  = None,
+        on_progress:       Optional[ProgressCallback]   = None,
+        workers:           Optional[int]     = None,
+        external_downloader: Optional[str]   = None,
+        write_m3u:         bool              = False,
     ) -> PlaylistDownloadResult:
-        """
-        Download a full Qobuz playlist (all pages, pagination-proof).
-
-        Parameters:
-            url_or_id:  Qobuz playlist ID or URL.
-            write_m3u:  Write an .m3u8 file alongside the downloaded tracks.
-        """
         cfg = self.config
         _, playlist_id = self.resolve_id(url_or_id, "playlist")
-
-        q      = quality or Quality[cfg.download.quality.upper()]
+        q      = quality or _parse_quality(cfg.download.quality)
         dest   = dest_dir or Path(cfg.download.output_dir)
         tmpl   = template or cfg.naming.playlist
-        n_work = workers or cfg.download.max_workers
+        n_work = workers  or cfg.download.max_workers
         ext_dl = external_downloader or cfg.download.external_downloader
 
         pl    = self.client.get_playlist(playlist_id, limit=1)
         total = pl.tracks_count
         agg   = PlaylistDownloadResult(name=pl.name)
-        m3u_lines: list[str] = ["#EXTM3U"]
+        m3u:  list[str] = ["#EXTM3U"]
 
         with Downloader(
             read_timeout=cfg.download.read_timeout,
@@ -605,70 +1025,57 @@ class QobuzSession:
 
                 try:
                     dl_result = dl.download_track(
-                        track=track_obj,
-                        url_info=url_info,
-                        dest_dir=dest,
-                        album=None,
-                        on_progress=on_progress,
-                        playlist_name=pl.name,
-                        playlist_index=i,
+                        track=track_obj, url_info=url_info,
+                        dest_dir=dest, album=None, on_progress=on_progress,
+                        playlist_name=pl.name, playlist_index=i,
                     )
                 except Exception:
                     agg.failed += 1
                     continue
 
-                tdr = self.post_download(
+                tdr = self._post_download(
                     dl_result, track_obj, album_obj,
                     embed_cover=embed_cover,
                     fetch_lyrics_flag=fetch_lyrics_flag,
                     save_cover_file=save_cover_file,
                 )
                 agg.tracks.append(tdr)
-                m3u_lines.append(str(dl_result.path))
+                m3u.append(str(dl_result.path))
                 if on_track_done:
                     on_track_done(tdr)
 
-        if write_m3u and len(m3u_lines) > 1:
+        if write_m3u and len(m3u) > 1:
             pl_dir = dest / sanitize(pl.name)
             pl_dir.mkdir(parents=True, exist_ok=True)
-            m3u_path = pl_dir / f"{sanitize(pl.name)}.m3u8"
-            m3u_path.write_text("\n".join(m3u_lines), encoding="utf-8")
-
+            (pl_dir / f"{sanitize(pl.name)}.m3u8").write_text(
+                "\n".join(m3u), encoding="utf-8"
+            )
         return agg
 
     def download_local_playlist(
         self,
         playlist_name_or_id: str,
-        quality: Optional[Quality] = None,
-        dest_dir: Optional[Path] = None,
-        template: Optional[str] = None,
+        quality:        Optional[Quality] = None,
+        dest_dir:       Optional[Path]    = None,
+        template:       Optional[str]     = None,
         on_track_start: Optional[TrackStartCallback] = None,
-        on_track_done: Optional[TrackDoneCallback] = None,
-        workers: Optional[int] = None,
+        on_track_done:  Optional[TrackDoneCallback]  = None,
+        workers:        Optional[int]     = None,
     ) -> PlaylistDownloadResult:
-        """
-        Download all tracks in a local (SQLite) playlist.
-
-        Parameters:
-            playlist_name_or_id: Playlist name or ID prefix.
-        """
         cfg = self.config
-
-        pl = self.store.get_playlist_by_name(playlist_name_or_id)
+        pl  = self.store.get_playlist_by_name(playlist_name_or_id)
         if not pl:
-            for candidate in self.store.list_playlists():
-                if candidate["id"].startswith(playlist_name_or_id):
-                    pl = candidate
-                    break
+            for c in self.store.list_playlists():
+                if c["id"].startswith(playlist_name_or_id):
+                    pl = c; break
         if not pl:
             raise ValueError(f"Local playlist not found: {playlist_name_or_id!r}")
 
         tracks = self.store.get_playlist_tracks(pl["id"])
-        q      = quality or Quality[cfg.download.quality.upper()]
+        q      = quality or _parse_quality(cfg.download.quality)
         dest   = dest_dir or Path(cfg.download.output_dir)
         tmpl   = template or cfg.naming.playlist
-        n_work = workers or cfg.download.max_workers
-        total  = len(tracks)
+        n_work = workers  or cfg.download.max_workers
         agg    = PlaylistDownloadResult(name=pl["name"])
 
         with Downloader(
@@ -680,13 +1087,12 @@ class QobuzSession:
         ) as dl:
             for i, t in enumerate(tracks, 1):
                 if on_track_start:
-                    on_track_start(t.get("title", t["track_id"]), i, total)
+                    on_track_start(t.get("title", t["track_id"]), i, len(tracks))
                 try:
                     track_obj = self.client.get_track(t["track_id"])
                     url_info  = self.client.get_track_url(t["track_id"], quality=q)
                 except Exception:
-                    agg.failed += 1
-                    continue
+                    agg.failed += 1; continue
                 try:
                     dl_result = dl.download_track(
                         track=track_obj, url_info=url_info,
@@ -694,656 +1100,45 @@ class QobuzSession:
                         playlist_name=pl["name"], playlist_index=i,
                     )
                 except Exception:
-                    agg.failed += 1
-                    continue
-
-                tdr = self.post_download(dl_result, track_obj)
+                    agg.failed += 1; continue
+                tdr = self._post_download(dl_result, track_obj)
                 agg.tracks.append(tdr)
                 if on_track_done:
                     on_track_done(tdr)
-
         return agg
-
-    # ── Playlist management ────────────────────────────────────────────────
-
-    def clone_playlist(
-        self,
-        url_or_id: str,
-        name: Optional[str] = None,
-    ) -> str:
-        """
-        Clone a Qobuz playlist into the local store.
-        Returns the new local playlist ID.
-        Pagination-proof: fetches all pages regardless of playlist size.
-        """
-        _, playlist_id = self.resolve_id(url_or_id, "playlist")
-
-        pl         = self.client.get_playlist(playlist_id, limit=1)
-        local_name = name or pl.name
-        if self.store.get_playlist_by_name(local_name):
-            local_name = f"{local_name} (cloned)"
-
-        local_id = self.store.create_playlist(local_name, pl.description or "")
-
-        for i, t in enumerate(
-            self.client.iter_playlist_track_summaries(playlist_id)
-        ):
-            self.store.add_track_to_playlist(
-                local_id,
-                str(t.id),
-                title=t.title,
-                artist=t.performer.name if t.performer else "",
-                album=t.album.title if t.album else "",
-                duration=t.duration or 0,
-                isrc=getattr(t, "isrc", "") or "",
-                position=i,
-            )
-
-        return local_id
-
-    def share_playlist(
-        self,
-        playlist_name_or_id: str,
-        output: Optional[Path] = None,
-        author: str = "",
-    ) -> Path:
-        """
-        Export a local playlist as a shareable TOML file.
-        Returns the path of the written file.
-        """
-        pl = self.store.get_playlist_by_name(playlist_name_or_id)
-        if not pl:
-            for candidate in self.store.list_playlists():
-                if candidate["id"].startswith(playlist_name_or_id):
-                    pl = candidate
-                    break
-        if not pl:
-            raise ValueError(f"Local playlist not found: {playlist_name_or_id!r}")
-
-        tracks = self.store.get_playlist_tracks(pl["id"])
-        lpl    = playlist_from_store_tracks(
-            name=pl["name"],
-            tracks=tracks,
-            description=pl.get("description", ""),
-            author=author,
-        )
-
-        if output is None:
-            self.config.local_data.playlists_dir.mkdir(parents=True, exist_ok=True)
-            output = (
-                self.config.local_data.playlists_dir
-                / f"{sanitize(pl['name'])}.toml"
-            )
-
-        save_playlist(lpl, output)
-        return output
-
-    def import_playlist(
-        self,
-        file: Path,
-        overwrite: bool = False,
-    ) -> str:
-        """
-        Import a shared TOML playlist file into the local store.
-
-        Parameters:
-            file:      Path to a qobuz-playlist TOML file.
-            overwrite: If True, replace any existing playlist with the same
-                       name. If False (default), append ' (imported)' to the
-                       name when a conflict exists, so the call always
-                       succeeds and always returns a usable ID.
-
-        Returns the new local playlist ID.
-        Raises ValueError if the file is not a valid qobuz-playlist.
-        """
-        pl_id = import_playlist_toml(self.store, file, overwrite=overwrite)
-        if pl_id is not None:
-            return pl_id
-
-        # Playlist already existed and overwrite=False — use the suffix strategy
-        # so this method always returns a valid ID.
-        lpl      = load_playlist(file)
-        new_name = f"{lpl.name} (imported)"
-        local_id = self.store.create_playlist(new_name, lpl.description)
-        for i, t in enumerate(lpl.tracks):
-            self.store.add_track_to_playlist(
-                local_id, t.id,
-                title=t.title, artist=t.artist, album=t.album,
-                duration=t.duration, isrc=t.isrc,
-                position=i,
-            )
-        return local_id
-
-    # ── Favourites ─────────────────────────────────────────────────────────
-
-    def add_favorite(
-        self,
-        id: str,
-        type: str,
-        remote: bool = False,
-    ) -> None:
-        """
-        Add a track, album, or artist to local favorites.
-
-        Parameters:
-            id:     Qobuz entity ID.
-            type:   'track', 'album', or 'artist'.
-            remote: Also add to the Qobuz account (personal session only).
-                    Raises PoolModeError if client is in pool mode.
-        """
-        title = artist = extra = ""
-        try:
-            if type == "track":
-                obj    = self.client.get_track(id)
-                title  = obj.display_title
-                artist = obj.performer.name if obj.performer else ""
-                extra  = obj.album.title if obj.album else ""
-            elif type == "album":
-                obj    = self.client.get_album(id)
-                title  = obj.display_title
-                artist = obj.artist.name if obj.artist else ""
-                extra  = obj.genre.name if obj.genre else ""
-            elif type == "artist":
-                obj    = self.client.get_artist(id, extras="")
-                title  = obj.name
-        except Exception:
-            pass
-
-        self.store.add_favorite(id, type, title=title, artist=artist, extra=extra)
-
-        if remote:
-            kwargs: dict[str, Any] = {}
-            if type == "track":
-                kwargs = {"track_ids": [id]}
-            elif type == "album":
-                kwargs = {"album_ids": [id]}
-            elif type == "artist":
-                kwargs = {"artist_ids": [id]}
-            self.client.add_favorite(**kwargs)
-
-    def remove_favorite(
-        self,
-        id: str,
-        type: str,
-        remote: bool = False,
-    ) -> bool:
-        """
-        Remove a track, album, or artist from local favorites.
-        Returns True if removed, False if it wasn't present.
-        Raises PoolModeError if remote=True in pool mode.
-        """
-        removed = self.store.remove_favorite(id, type)
-        if remote:
-            kwargs: dict[str, Any] = {}
-            if type == "track":
-                kwargs = {"track_ids": [id]}
-            elif type == "album":
-                kwargs = {"album_ids": [id]}
-            elif type == "artist":
-                kwargs = {"artist_ids": [id]}
-            self.client.remove_favorite(**kwargs)
-        return removed
-
-    def sync_favorites(
-        self,
-        type: Optional[str] = None,
-        clear: bool = False,
-    ) -> dict[str, int]:
-        """
-        Pull favorites from the Qobuz account into the local store.
-        Returns a dict of {type: count} for items synced.
-        Raises PoolModeError if client is in pool mode.
-        """
-        if self.client.is_pool_mode:
-            raise PoolModeError(
-                "sync_favorites() requires a personal session. "
-                "Pool mode clients don't have a personal account to sync from."
-            )
-
-        types    = [type] if type else ["track", "album", "artist"]
-        result   = {}
-        fav      = self.client.get_user_favorites()
-        type_map = {"track": fav.tracks, "album": fav.albums, "artist": fav.artists}
-
-        for t in types:
-            page = type_map.get(t)
-            if not page or not page.items:
-                result[t] = 0
-                continue
-            raw = [dataclasses.asdict(i) for i in page.items]
-            n   = self.store.sync_favorites_from_api(raw, t, clear_first=clear)
-            result[t] = n
-
-        return result
-
-    # ── Export / backup ────────────────────────────────────────────────────
-
-    def backup(self, output: Optional[Path] = None) -> Path:
-        """
-        Create a full .tar.gz backup of the local library.
-        Returns the path of the written archive.
-        """
-        if output is None:
-            from datetime import datetime, timezone
-            self.config.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
-            date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            output = (
-                self.config.local_data.exports_dir
-                / f"qobuz-backup-{date}.tar.gz"
-            )
-
-        return backup_to_tar(
-            store=self.store,
-            config_path=_CONFIG_PATH,
-            playlists_dir=self.config.local_data.playlists_dir,
-            output_path=output,
-        )
-
-    def export_favorites(
-        self,
-        output: Optional[Path] = None,
-        type: Optional[str] = None,
-    ) -> Path:
-        """
-        Export local favorites to a TOML file.
-        Returns the path of the written file.
-        """
-        if output is None:
-            from datetime import datetime, timezone
-            self.config.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
-            date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            output = (
-                self.config.local_data.exports_dir
-                / f"favorites-{date}.toml"
-            )
-
-        return export_favorites_toml(self.store, output, type=type)
-
-    # ── Import / restore ───────────────────────────────────────────────────
-
-    def import_favorites(
-        self,
-        file: Path,
-        merge: bool = True,
-    ) -> int:
-        """
-        Import favorites from a TOML file produced by export_favorites().
-
-        Parameters:
-            file:  Path to a favorites TOML export file.
-            merge: If True (default), upsert — existing favorites not in the
-                   file are preserved. If False, each type present in the
-                   file is cleared before inserting.
-
-        Returns the number of favorites imported.
-        Raises FileNotFoundError if the file does not exist.
-        Raises ValueError if the file is not a valid favorites export.
-        """
-        return import_favorites_toml(self.store, Path(file), merge=merge)
-
-    def restore(
-        self,
-        archive_path: Path,
-        *,
-        restore_favorites: bool = True,
-        restore_playlists: bool = True,
-        restore_db: bool = False,
-        merge: bool = True,
-    ) -> ImportResult:
-        """
-        Restore from a backup archive created by backup().
-
-        By default only favorites and playlists are restored (merged into
-        the live store), so existing data is not destroyed. Pass
-        restore_db=True for a full atomic database replacement — the store
-        should be re-opened after that call.
-
-        Parameters:
-            archive_path:      Path to the .tar.gz backup archive.
-            restore_favorites: Import favorites from the archive.
-            restore_playlists: Import playlists from the archive and also
-                               extract TOML files to the configured
-                               playlists directory.
-            restore_db:        Replace the entire library.db atomically.
-            merge:             Upsert behavior for favorites and playlists
-                               (True) vs. clear-then-insert (False).
-
-        Returns an ImportResult with counts and any non-fatal errors.
-        Raises FileNotFoundError if the archive does not exist.
-        Raises ValueError if the archive is not a valid qobuz backup.
-        """
-        playlists_dir = (
-            self.config.local_data.playlists_dir
-            if restore_playlists else None
-        )
-        return restore_from_tar(
-            self.store,
-            Path(archive_path),
-            restore_favorites=restore_favorites,
-            restore_playlists=restore_playlists,
-            restore_db=restore_db,
-            merge=merge,
-            playlists_dir=playlists_dir,
-        )
-
-    # ── User profile ───────────────────────────────────────────────────────
-
-    def get_profile(self) -> UserProfile:
-        """
-        Fetch the authenticated user's full profile.
-
-        Returns a typed UserProfile containing subscription tier,
-        credential parameters, display names, avatar URL, and so on.
-        """
-        return self.client.get_user_info()
-
-    def update_profile(
-        self,
-        email: Optional[str] = None,
-        firstname: Optional[str] = None,
-        lastname: Optional[str] = None,
-        display_name: Optional[str] = None,
-        country_code: Optional[str] = None,
-        language_code: Optional[str] = None,
-        newsletter: Optional[bool] = None,
-    ) -> UserProfile:
-        """
-        Update the authenticated user's profile fields.
-
-        Only the fields you pass are changed — omit a parameter to leave
-        the corresponding field unchanged on the Qobuz account.
-
-        Parameters:
-            email:         New email address.
-            firstname:     Given name.
-            lastname:      Family name.
-            display_name:  Public display name.
-            country_code:  ISO 3166-1 alpha-2 country code, e.g. 'US', 'GB'.
-            language_code: Preferred interface language, e.g. 'en', 'fr'.
-            newsletter:    Subscribe / unsubscribe from the Qobuz newsletter.
-
-        Returns the updated UserProfile.
-        Raises PoolModeError in pool mode.
-        Raises APIError if the server rejects the update (e.g. email taken).
-        """
-        return self.client.update_user(
-            email=email,
-            firstname=firstname,
-            lastname=lastname,
-            display_name=display_name,
-            country_code=country_code,
-            language_code=language_code,
-            newsletter=newsletter,
-        )
-
-    def change_password(
-        self,
-        current_password: str,
-        new_password: str,
-    ) -> None:
-        """
-        Change the password for the authenticated Qobuz account.
-
-        Parameters:
-            current_password: Existing password in plain text.
-            new_password:     Desired new password in plain text.
-
-        Raises PoolModeError in pool mode.
-        Raises InvalidCredentialsError if current_password is wrong.
-        Raises APIError for other server-side errors (e.g. password too weak).
-        """
-        self.client.update_password(current_password, new_password)
-
-    # ── Remote playlist management ─────────────────────────────────────────
-
-    def create_remote_playlist(
-        self,
-        name: str,
-        description: str = "",
-        is_public: bool = False,
-        is_collaborative: bool = False,
-        also_save_locally: bool = True,
-    ) -> Playlist:
-        """
-        Create a new playlist on the user's Qobuz account.
-
-        Parameters:
-            name:               Playlist title.
-            description:        Optional description.
-            is_public:          Make the playlist publicly visible.
-            is_collaborative:   Allow other users to add tracks.
-            also_save_locally:  If True (default), also create a matching
-                                entry in the local store so it shows up in
-                                local playlist commands.
-
-        Returns the newly created remote Playlist object.
-        Raises PoolModeError in pool mode.
-        """
-        pl = self.client.create_remote_playlist(
-            name=name,
-            description=description,
-            is_public=is_public,
-            is_collaborative=is_collaborative,
-        )
-        if also_save_locally:
-            self.store.create_playlist(name, description)
-        return pl
-
-    def update_remote_playlist(
-        self,
-        playlist_id: str | int,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        is_public: Optional[bool] = None,
-        is_collaborative: Optional[bool] = None,
-    ) -> Playlist:
-        """
-        Update the metadata of a Qobuz playlist owned by the user.
-
-        Only the fields you pass are changed.
-        Raises PoolModeError in pool mode.
-        """
-        return self.client.update_remote_playlist(
-            playlist_id=playlist_id,
-            name=name,
-            description=description,
-            is_public=is_public,
-            is_collaborative=is_collaborative,
-        )
-
-    def delete_remote_playlist(self, playlist_id: str | int) -> None:
-        """
-        Permanently delete a Qobuz playlist owned by the user.
-        Raises PoolModeError in pool mode.
-        """
-        self.client.delete_remote_playlist(playlist_id)
-
-    def add_tracks_to_remote_playlist(
-        self,
-        playlist_id: str | int,
-        track_ids: list[str | int],
-        no_duplicate: bool = True,
-    ) -> None:
-        """
-        Add tracks to a Qobuz playlist owned by the user.
-
-        Parameters:
-            playlist_id:  Target playlist ID.
-            track_ids:    Qobuz track IDs to add.
-            no_duplicate: Skip tracks already in the playlist (default True).
-
-        Raises PoolModeError in pool mode.
-        """
-        self.client.add_tracks_to_remote_playlist(
-            playlist_id=playlist_id,
-            track_ids=track_ids,
-            no_duplicate=no_duplicate,
-        )
-
-    def remove_tracks_from_remote_playlist(
-        self,
-        playlist_id: str | int,
-        playlist_track_ids: list[int],
-    ) -> None:
-        """
-        Remove tracks from a Qobuz playlist by playlist_track_id.
-
-        The playlist_track_id is the join-table ID on each PlaylistTrack
-        object — NOT the track ID. Collect these from
-        client.get_playlist() first.
-
-        Raises PoolModeError in pool mode.
-        """
-        self.client.remove_tracks_from_remote_playlist(
-            playlist_id=playlist_id,
-            playlist_track_ids=playlist_track_ids,
-        )
-
-    def follow_playlist(self, playlist_id: str | int) -> None:
-        """
-        Follow / subscribe to a public Qobuz playlist.
-        Raises PoolModeError in pool mode.
-        """
-        self.client.subscribe_to_playlist(playlist_id)
-
-    def unfollow_playlist(self, playlist_id: str | int) -> None:
-        """
-        Unfollow / unsubscribe from a Qobuz playlist.
-        Raises PoolModeError in pool mode.
-        """
-        self.client.unsubscribe_from_playlist(playlist_id)
-
-    # ── Artist discography ─────────────────────────────────────────────────
-
-    AlbumStartCallback = Callable[[str, int, int], None]  # (album_title, index, total)
-
-    def download_artist_discography_fixed(
-        self,
-        url_or_id: str,
-        release_type: Optional[str] = None,
-        quality=None,
-        dest_dir: Optional[Path] = None,
-        template: Optional[str] = None,
-        on_album_start: Optional[AlbumStartCallback] = None,
-        on_track_start=None,
-        on_track_done=None,
-        workers: Optional[int] = None,
-    ):
-        """
-        Download all albums in an artist's discography.
-    
-        Parameters
-        ──────────
-        url_or_id:    Artist ID or Qobuz URL.
-        release_type: Filter: 'album', 'live', 'compilation', 'epSingle',
-                    'other', 'download'.  None = all.
-        on_album_start: Callback(album_title, album_index, album_total)
-                        fired before each album starts downloading.
-        on_track_start: Callback(track_title, track_index, track_total).
-        on_track_done:  Callback(TrackDownloadResult).
-        """
-        from .exceptions import NotStreamableError, APIError
-    
-        _, artist_id = self.resolve_id(url_or_id, "artist")
-    
-        # ── 1. Collect releases upfront so we know the total ──────────────────
-        #    iter_releases is lazy, so we materialise it once.
-        try:
-            releases = [r for r in self.client.iter_releases(
-                artist_id, release_type=release_type, page_size=100
-            ) if r.id]
-        except Exception as exc:
-            raise type(exc)(f"Failed to list releases for artist {artist_id}: {exc}") from exc
-    
-        total   = len(releases)
-        results = []
-
-        for i, release in enumerate(releases, 1):
-            # ── 2. Fetch album metadata separately for a proper title ──────────
-            try:
-                album_obj = self.client.get_album(release.id)
-            except APIError as exc:
-                # Log and skip — don't crash the whole discography
-                from .dev import dev_log
-                dev_log(f"[yellow]album {release.id} fetch error (skipping): {exc}[/yellow]")
-                continue
-
-            if on_album_start:
-                on_album_start(album_obj.display_title, i, total)
-    
-            # ── 3. Download with specific error messages ───────────────────────
-            try:
-                agg = self.download_album(
-                    release.id,
-                    quality=quality,
-                    dest_dir=dest_dir,
-                    template=template,
-                    on_track_start=on_track_start,
-                    on_track_done=on_track_done,
-                    workers=workers,
-                )
-                results.append(agg)
-            except NotStreamableError:
-                from .dev import dev_log
-                dev_log(f"[yellow]album {album_obj.display_title!r} not streamable — skipped[/yellow]")
-            except APIError as exc:
-                from .dev import dev_log
-                dev_log(f"[red]album {album_obj.display_title!r} API error: {exc}[/red]")
-            except Exception as exc:
-                from .dev import dev_log
-                dev_log(
-                    f"[red]album {album_obj.display_title!r} unexpected error "
-                    f"({type(exc).__name__}): {exc}[/red]"
-                )
-
-        return results
-
-    # ── Favorites download ─────────────────────────────────────────────────
 
     def download_favorites(
         self,
-        type: str = "tracks",
-        quality: Optional[Quality] = None,
-        dest_dir: Optional[Path] = None,
+        fav_type:       str              = "tracks",
+        quality:        Optional[Quality] = None,
+        dest_dir:       Optional[Path]   = None,
         on_track_start: Optional[TrackStartCallback] = None,
-        on_track_done: Optional[TrackDoneCallback] = None,
-        workers: Optional[int] = None,
+        on_track_done:  Optional[TrackDoneCallback]  = None,
+        workers:        Optional[int]    = None,
     ) -> PlaylistDownloadResult:
-        """
-        Download all favorited tracks or albums.
-
-        Parameters:
-            type:     'tracks' — download each favorited track as a single.
-                      'albums' — download each favorited album in full.
-            quality:  Quality tier. Defaults to config value.
-            dest_dir: Output directory. Defaults to config value.
-        """
         cfg  = self.config
-        q    = quality or Quality[cfg.download.quality.upper()]
+        q    = quality or _parse_quality(cfg.download.quality)
         dest = dest_dir or Path(cfg.download.output_dir)
-        agg  = PlaylistDownloadResult(name=f"Favorites ({type})")
+        agg  = PlaylistDownloadResult(name=f"Favorites ({fav_type})")
 
-        if type == "albums":
+        if fav_type == "albums":
             for album_obj in self.client.iter_favorites(type="albums"):
                 try:
-                    result = self.download_album(
-                        str(album_obj.id),
-                        quality=quality,
-                        dest_dir=dest_dir,
-                        on_track_start=on_track_start,
-                        on_track_done=on_track_done,
+                    r = self.download_album(
+                        str(album_obj.id), quality=q, dest_dir=dest,
+                        on_track_start=on_track_start, on_track_done=on_track_done,
                         workers=workers,
                     )
-                    agg.tracks.extend(result.tracks)
+                    agg.tracks.extend(r.tracks)
+                    agg.failed += r.failed
                 except Exception:
                     agg.failed += 1
             return agg
 
-        n_work = workers or cfg.download.max_workers
         with Downloader(
             read_timeout=cfg.download.read_timeout,
             connect_timeout=cfg.download.connect_timeout,
-            max_workers=n_work,
+            max_workers=workers or cfg.download.max_workers,
             naming_template=cfg.naming.single,
             dev=self._dev,
         ) as dl:
@@ -1353,69 +1148,50 @@ class QobuzSession:
                 if on_track_start:
                     on_track_start(track_obj.display_title, i, 0)
                 try:
-                    url_info = self.client.get_track_url(
-                        str(track_obj.id), quality=q
-                    )
+                    url_info  = self.client.get_track_url(str(track_obj.id), quality=q)
                     dl_result = dl.download_track(
-                        track=track_obj, url_info=url_info,
-                        dest_dir=dest, album=None,
+                        track=track_obj, url_info=url_info, dest_dir=dest, album=None,
                     )
                 except Exception:
-                    agg.failed += 1
-                    continue
-
-                tdr = self.post_download(dl_result, track_obj)
+                    agg.failed += 1; continue
+                tdr = self._post_download(dl_result, track_obj)
                 agg.tracks.append(tdr)
                 if on_track_done:
                     on_track_done(tdr)
-
         return agg
-
-    # ── Purchases download ─────────────────────────────────────────────────
 
     def download_purchases(
         self,
-        type: str = "albums",
-        quality: Optional[Quality] = None,
-        dest_dir: Optional[Path] = None,
+        purchase_type:  str              = "albums",
+        quality:        Optional[Quality] = None,
+        dest_dir:       Optional[Path]   = None,
         on_track_start: Optional[TrackStartCallback] = None,
-        on_track_done: Optional[TrackDoneCallback] = None,
-        workers: Optional[int] = None,
+        on_track_done:  Optional[TrackDoneCallback]  = None,
+        workers:        Optional[int]    = None,
     ) -> PlaylistDownloadResult:
-        """
-        Download all purchased albums or tracks.
-
-        Parameters:
-            type:     'albums' (default) or 'tracks'.
-            quality:  Quality tier. Defaults to config value.
-            dest_dir: Output directory. Defaults to config value.
-        """
         cfg  = self.config
-        q    = quality or Quality[cfg.download.quality.upper()]
+        q    = quality or _parse_quality(cfg.download.quality)
         dest = dest_dir or Path(cfg.download.output_dir)
-        agg  = PlaylistDownloadResult(name=f"Purchases ({type})")
+        agg  = PlaylistDownloadResult(name=f"Purchases ({purchase_type})")
 
-        if type == "albums":
+        if purchase_type == "albums":
             for album_obj in self.client.iter_purchases(type="albums"):
                 try:
-                    result = self.download_album(
-                        str(album_obj.id),
-                        quality=quality,
-                        dest_dir=dest_dir,
-                        on_track_start=on_track_start,
-                        on_track_done=on_track_done,
+                    r = self.download_album(
+                        str(album_obj.id), quality=q, dest_dir=dest,
+                        on_track_start=on_track_start, on_track_done=on_track_done,
                         workers=workers,
                     )
-                    agg.tracks.extend(result.tracks)
+                    agg.tracks.extend(r.tracks)
+                    agg.failed += r.failed
                 except Exception:
                     agg.failed += 1
             return agg
 
-        n_work = workers or cfg.download.max_workers
         with Downloader(
             read_timeout=cfg.download.read_timeout,
             connect_timeout=cfg.download.connect_timeout,
-            max_workers=n_work,
+            max_workers=workers or cfg.download.max_workers,
             naming_template=cfg.naming.single,
             dev=self._dev,
         ) as dl:
@@ -1427,80 +1203,273 @@ class QobuzSession:
                         getattr(track_obj, "display_title", str(track_obj)), i, 0
                     )
                 try:
-                    url_info = self.client.get_track_url(
-                        str(track_obj.id), quality=q
-                    )
+                    url_info  = self.client.get_track_url(str(track_obj.id), quality=q)
                     dl_result = dl.download_track(
-                        track=track_obj, url_info=url_info,
-                        dest_dir=dest, album=None,
+                        track=track_obj, url_info=url_info, dest_dir=dest, album=None,
                     )
                 except Exception:
-                    agg.failed += 1
-                    continue
-
-                tdr = self.post_download(dl_result, track_obj)
+                    agg.failed += 1; continue
+                tdr = self._post_download(dl_result, track_obj)
                 agg.tracks.append(tdr)
                 if on_track_done:
                     on_track_done(tdr)
-
         return agg
 
-    # ── Discovery ──────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # Favourites
+    # ══════════════════════════════════════════════════════════════════════
 
-    def get_featured_playlists(
+    def add_favorite(
+        self, entity_id: str, entity_type: str, remote: bool = False,
+    ) -> None:
+        title = artist = extra = ""
+        try:
+            if entity_type == "track":
+                obj    = self.client.get_track(entity_id)
+                title  = obj.display_title
+                artist = obj.performer.name if obj.performer else ""
+                extra  = obj.album.title if obj.album else ""
+            elif entity_type == "album":
+                obj    = self.client.get_album(entity_id)
+                title  = obj.display_title
+                artist = obj.artist.name if obj.artist else ""
+                extra  = obj.genre.name if obj.genre else ""
+            elif entity_type == "artist":
+                obj   = self.client.get_artist(entity_id, extras="")
+                title = obj.name
+        except Exception:
+            pass
+        self.store.add_favorite(
+            entity_id, entity_type, title=title, artist=artist, extra=extra,
+        )
+        if remote:
+            kwargs: dict[str, Any] = {}
+            if entity_type == "track":
+                kwargs = {"track_ids":  [entity_id]}
+            elif entity_type == "album":
+                kwargs = {"album_ids":  [entity_id]}
+            elif entity_type == "artist":
+                kwargs = {"artist_ids": [entity_id]}
+            self.client.add_favorite(**kwargs)
+
+    def remove_favorite(
+        self, entity_id: str, entity_type: str, remote: bool = False,
+    ) -> bool:
+        removed = self.store.remove_favorite(entity_id, entity_type)
+        if remote:
+            kwargs: dict[str, Any] = {}
+            if entity_type == "track":
+                kwargs = {"track_ids":  [entity_id]}
+            elif entity_type == "album":
+                kwargs = {"album_ids":  [entity_id]}
+            elif entity_type == "artist":
+                kwargs = {"artist_ids": [entity_id]}
+            self.client.remove_favorite(**kwargs)
+        return removed
+
+    def sync_favorites(
+        self, fav_type: Optional[str] = None, clear: bool = False,
+    ) -> dict[str, int]:
+        if self.client.is_pool_mode:
+            raise PoolModeError("sync_favorites() requires a personal session.")
+        types    = [fav_type] if fav_type else ["track", "album", "artist"]
+        result   = {}
+        fav      = self.client.get_user_favorites()
+        type_map = {"track": fav.tracks, "album": fav.albums, "artist": fav.artists}
+        for t in types:
+            page = type_map.get(t)
+            if not page or not page.items:
+                result[t] = 0; continue
+            raw = [dataclasses.asdict(i) for i in page.items]
+            result[t] = self.store.sync_favorites_from_api(raw, t, clear_first=clear)
+        return result
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Remote playlist management
+    # ══════════════════════════════════════════════════════════════════════
+
+    def clone_playlist(self, url_or_id: str, name: Optional[str] = None) -> str:
+        _, playlist_id = self.resolve_id(url_or_id, "playlist")
+        pl         = self.client.get_playlist(playlist_id, limit=1)
+        local_name = name or pl.name
+        if self.store.get_playlist_by_name(local_name):
+            local_name = f"{local_name} (cloned)"
+        local_id = self.store.create_playlist(local_name, pl.description or "")
+        for i, t in enumerate(
+            self.client.iter_playlist_track_summaries(playlist_id)
+        ):
+            self.store.add_track_to_playlist(
+                local_id, str(t.id),
+                title=t.title,
+                artist=t.performer.name if t.performer else "",
+                album=t.album.title if t.album else "",
+                duration=t.duration or 0,
+                isrc=getattr(t, "isrc", "") or "",
+                position=i,
+            )
+        return local_id
+
+    def share_playlist(
         self,
-        type: str = "editor-picks",
-        genre_id: Optional[int] = None,
-        limit: int = 25,
-        offset: int = 0,
-    ) -> dict:
-        """
-        Fetch editorially curated playlists.
+        playlist_name_or_id: str,
+        output: Optional[Path] = None,
+        author: str = "",
+    ) -> Path:
+        pl = self._find_local_playlist(playlist_name_or_id)
+        if not pl:
+            raise ValueError(f"Local playlist not found: {playlist_name_or_id!r}")
+        tracks = self.store.get_playlist_tracks(pl["id"])
+        lpl    = playlist_from_store_tracks(
+            name=pl["name"], tracks=tracks,
+            description=pl.get("description", ""), author=author,
+        )
+        if output is None:
+            self.config.local_data.playlists_dir.mkdir(parents=True, exist_ok=True)
+            output = (
+                self.config.local_data.playlists_dir
+                / f"{sanitize(pl['name'])}.toml"
+            )
+        save_playlist(lpl, output)
+        return output
 
-        Parameters:
-            type:     Curation type: 'editor-picks', 'last-created',
-                      'best-of'. See client.get_featured_playlists() for
-                      the full list of accepted values.
-            genre_id: Filter by genre ID.
-            limit:    Max results (default 25, max 100).
-            offset:   Pagination offset.
-        """
-        return self.client.get_featured_playlists(
-            type=type, genre_id=genre_id, limit=limit, offset=offset,
+    def import_playlist(self, file: Path, overwrite: bool = False) -> str:
+        pl_id = import_playlist_toml(self.store, file, overwrite=overwrite)
+        if pl_id is not None:
+            return pl_id
+        lpl      = load_playlist(file)
+        new_name = f"{lpl.name} (imported)"
+        local_id = self.store.create_playlist(new_name, lpl.description)
+        for i, t in enumerate(lpl.tracks):
+            self.store.add_track_to_playlist(
+                local_id, t.id,
+                title=t.title, artist=t.artist, album=t.album,
+                duration=t.duration, isrc=t.isrc, position=i,
+            )
+        return local_id
+
+    def create_remote_playlist(
+        self,
+        name:               str,
+        description:        str  = "",
+        is_public:          bool = False,
+        is_collaborative:   bool = False,
+        also_save_locally:  bool = True,
+    ) -> Playlist:
+        pl = self.client.create_remote_playlist(
+            name=name, description=description,
+            is_public=is_public, is_collaborative=is_collaborative,
+        )
+        if also_save_locally:
+            self.store.create_playlist(name, description)
+        return pl
+
+    def update_remote_playlist(
+        self, playlist_id: str | int, **kwargs: Any,
+    ) -> Playlist:
+        return self.client.update_remote_playlist(
+            playlist_id=playlist_id, **kwargs,
         )
 
-    def get_new_releases(
-        self,
-        type: str = "new-releases",
-        genre_id: Optional[int] = None,
-        limit: int = 25,
-        offset: int = 0,
-    ) -> dict:
-        """
-        Fetch new or featured album releases.
+    def delete_remote_playlist(self, playlist_id: str | int) -> None:
+        self.client.delete_remote_playlist(playlist_id)
 
-        Parameters:
-            type:     Feed type: 'new-releases', 'press-awards',
-                      'editor-picks', 'most-streamed', 'best-sellers', etc.
-            genre_id: Filter by genre ID.
-            limit:    Max results (default 25, max 100).
-            offset:   Pagination offset.
-        """
-        return self.client.get_new_releases(
-            type=type, genre_id=genre_id, limit=limit, offset=offset,
+    def add_tracks_to_remote_playlist(
+        self, playlist_id: str | int, track_ids: list[str | int],
+        no_duplicate: bool = True,
+    ) -> None:
+        self.client.add_tracks_to_remote_playlist(
+            playlist_id=playlist_id, track_ids=track_ids, no_duplicate=no_duplicate,
         )
 
-    def get_genres(self, parent_id: Optional[int] = None) -> dict:
-        """
-        Fetch the Qobuz genre tree.
+    def remove_tracks_from_remote_playlist(
+        self, playlist_id: str | int, playlist_track_ids: list[int],
+    ) -> None:
+        self.client.remove_tracks_from_remote_playlist(
+            playlist_id=playlist_id, playlist_track_ids=playlist_track_ids,
+        )
 
-        Parameters:
-            parent_id: Fetch sub-genres of this ID.
-                       Omit to fetch top-level genres.
-        """
-        return self.client.get_genres(parent_id=parent_id)
+    def follow_playlist(self, playlist_id: str | int) -> None:
+        self.client.subscribe_to_playlist(playlist_id)
 
-    # ── Internals ──────────────────────────────────────────────────────────
+    def unfollow_playlist(self, playlist_id: str | int) -> None:
+        self.client.unsubscribe_from_playlist(playlist_id)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Account
+    # ══════════════════════════════════════════════════════════════════════
+
+    def get_profile(self) -> UserProfile:
+        return self.client.get_user_info()
+
+    def update_profile(self, **kwargs: Any) -> UserProfile:
+        return self.client.update_user(**kwargs)
+
+    def change_password(
+        self, current_password: str, new_password: str,
+    ) -> None:
+        self.client.update_password(current_password, new_password)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Export / backup
+    # ══════════════════════════════════════════════════════════════════════
+
+    def backup(self, output: Optional[Path] = None) -> Path:
+        if output is None:
+            from datetime import datetime, timezone
+            self.config.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
+            date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            output = self.config.local_data.exports_dir / f"qobuz-backup-{date}.tar.gz"
+        return backup_to_tar(
+            store=self.store,
+            config_path=_CONFIG_PATH,
+            playlists_dir=self.config.local_data.playlists_dir,
+            output_path=output,
+        )
+
+    def export_favorites(
+        self, output: Optional[Path] = None, fav_type: Optional[str] = None,
+    ) -> Path:
+        if output is None:
+            from datetime import datetime, timezone
+            self.config.local_data.exports_dir.mkdir(parents=True, exist_ok=True)
+            date   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            output = self.config.local_data.exports_dir / f"favorites-{date}.toml"
+        return export_favorites_toml(self.store, output, type=fav_type)
+
+    def import_favorites(self, file: Path, merge: bool = True) -> int:
+        return import_favorites_toml(self.store, Path(file), merge=merge)
+
+    def restore(
+        self,
+        archive_path:      Path,
+        restore_favorites: bool = True,
+        restore_playlists: bool = True,
+        restore_db:        bool = False,
+        merge:             bool = True,
+    ) -> ImportResult:
+        return restore_from_tar(
+            self.store, Path(archive_path),
+            restore_favorites=restore_favorites,
+            restore_playlists=restore_playlists,
+            restore_db=restore_db,
+            merge=merge,
+            playlists_dir=(
+                self.config.local_data.playlists_dir if restore_playlists else None
+            ),
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Private helpers
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _find_local_playlist(self, name_or_id: str) -> Optional[dict]:
+        pl = self.store.get_playlist_by_name(name_or_id)
+        if pl:
+            return pl
+        for c in self.store.list_playlists():
+            if c["id"].startswith(name_or_id):
+                return c
+        return None
 
     def _save_cover_file(self, folder: Path, album: Album) -> None:
         url = None

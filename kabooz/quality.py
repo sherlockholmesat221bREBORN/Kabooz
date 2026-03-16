@@ -1,4 +1,4 @@
-# quality.py
+# kabooz/quality.py
 from enum import IntEnum
 
 
