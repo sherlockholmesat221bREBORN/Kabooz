@@ -1215,33 +1215,63 @@ class QobuzSession:
 
     # ── Artist discography ─────────────────────────────────────────────────
 
-    def download_artist_discography(
+    AlbumStartCallback = Callable[[str, int, int], None]  # (album_title, index, total)
+
+    def download_artist_discography_fixed(
         self,
         url_or_id: str,
         release_type: Optional[str] = None,
-        quality: Optional[Quality] = None,
+        quality=None,
         dest_dir: Optional[Path] = None,
         template: Optional[str] = None,
-        on_track_start: Optional[TrackStartCallback] = None,
-        on_track_done: Optional[TrackDoneCallback] = None,
+        on_album_start: Optional[AlbumStartCallback] = None,
+        on_track_start=None,
+        on_track_done=None,
         workers: Optional[int] = None,
-    ) -> list[AlbumDownloadResult]:
+    ):
         """
         Download all albums in an artist's discography.
-
-        Parameters:
-            url_or_id:    Artist ID or Qobuz URL.
-            release_type: Filter releases: 'album', 'live', 'compilation',
-                          'epSingle', 'other', 'download', or None for all.
+    
+        Parameters
+        ──────────
+        url_or_id:    Artist ID or Qobuz URL.
+        release_type: Filter: 'album', 'live', 'compilation', 'epSingle',
+                    'other', 'download'.  None = all.
+        on_album_start: Callback(album_title, album_index, album_total)
+                        fired before each album starts downloading.
+        on_track_start: Callback(track_title, track_index, track_total).
+        on_track_done:  Callback(TrackDownloadResult).
         """
+        from .exceptions import NotStreamableError, APIError
+    
         _, artist_id = self.resolve_id(url_or_id, "artist")
-        results: list[AlbumDownloadResult] = []
+    
+        # ── 1. Collect releases upfront so we know the total ──────────────────
+        #    iter_releases is lazy, so we materialise it once.
+        try:
+            releases = [r for r in self.client.iter_releases(
+                artist_id, release_type=release_type, page_size=100
+            ) if r.id]
+        except Exception as exc:
+            raise type(exc)(f"Failed to list releases for artist {artist_id}: {exc}") from exc
+    
+        total   = len(releases)
+        results = []
 
-        for release in self.client.iter_releases(
-            artist_id, release_type=release_type
-        ):
-            if not release.id:
+        for i, release in enumerate(releases, 1):
+            # ── 2. Fetch album metadata separately for a proper title ──────────
+            try:
+                album_obj = self.client.get_album(release.id)
+            except APIError as exc:
+                # Log and skip — don't crash the whole discography
+                from .dev import dev_log
+                dev_log(f"[yellow]album {release.id} fetch error (skipping): {exc}[/yellow]")
                 continue
+
+            if on_album_start:
+                on_album_start(album_obj.display_title, i, total)
+    
+            # ── 3. Download with specific error messages ───────────────────────
             try:
                 agg = self.download_album(
                     release.id,
@@ -1253,8 +1283,18 @@ class QobuzSession:
                     workers=workers,
                 )
                 results.append(agg)
-            except Exception:
-                continue
+            except NotStreamableError:
+                from .dev import dev_log
+                dev_log(f"[yellow]album {album_obj.display_title!r} not streamable — skipped[/yellow]")
+            except APIError as exc:
+                from .dev import dev_log
+                dev_log(f"[red]album {album_obj.display_title!r} API error: {exc}[/red]")
+            except Exception as exc:
+                from .dev import dev_log
+                dev_log(
+                    f"[red]album {album_obj.display_title!r} unexpected error "
+                    f"({type(exc).__name__}): {exc}[/red]"
+                )
 
         return results
 

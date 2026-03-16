@@ -240,7 +240,7 @@ class QobuzClient:
             "/user/login",
             params={
                 "username": username,
-                "password": hashlib.md5(password.encode("utf-8")).hexdigest(),
+                "password": hashlib.md5(password.encode("utf-8"), usedforsecurity=False).hexdigest(),
             },
             require_auth=False,
         )
@@ -330,6 +330,51 @@ class QobuzClient:
 
         return body
 
+    def _handle_response_fixed(self, response):
+        """
+        Parse the HTTP response, raising typed exceptions for error statuses.
+        
+        FIX: On a 2xx response with invalid JSON (e.g. HTML maintenance page),
+        we now raise APIError immediately instead of returning {} and letting
+        callers crash with a confusing KeyError later.
+        """
+        status = response.status_code
+
+        # Always try to parse JSON.  For error responses, the body carries
+        # a 'message' field we want to include in the exception.
+        body: dict = {}
+        if response.content:
+            try:
+                body = response.json()
+            except Exception:
+                if response.is_success:
+                    # A success status with non-JSON body is unexpected —
+                    # raise immediately so the caller sees a clear error.
+                    raise APIError(
+                        f"Expected JSON response but got: "
+                        f"{response.text[:200]!r}",
+                        status_code=status,
+                    )
+
+        if status == 401:
+            message = body.get("message", "Unauthorized")
+            if "token" in message.lower():
+                raise TokenExpiredError(message)
+            raise InvalidCredentialsError(message)
+    
+        if status == 404:
+            raise NotFoundError(body.get("message", "Not found."), status_code=status)
+
+        if status == 429:
+            raise RateLimitError("Rate limit hit. Back off and retry.", status_code=status)
+    
+        if not response.is_success:
+            raise APIError(
+                body.get("message", f"API error: HTTP {status}"),
+                status_code=status,
+            )
+        return body
+        
     def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
         try:
             body = response.json()
@@ -355,7 +400,8 @@ class QobuzClient:
                 body.get("message", f"API error: HTTP {status}"),
                 status_code=status,
             )
-        return body
+        return body    
+
 
     # ── Request signing ────────────────────────────────────────────────────
 
@@ -374,7 +420,7 @@ class QobuzClient:
             f"{ts}"
             f"{self._credentials.app_secret}"
         )
-        sig = hashlib.md5(canonical.encode("utf-8")).hexdigest()
+        sig = hashlib.md5(canonical.encode("utf-8"), usedforsecurity=False).hexdigest()
         return ts, sig
 
     # ── Catalog — single-item fetches ──────────────────────────────────────
@@ -581,6 +627,17 @@ class QobuzClient:
 
     # ── User library — reads ───────────────────────────────────────────────
 
+    def _build_favorite_params_fixed(track_ids, album_ids, artist_ids):
+        """Build params dict omitting keys with empty values."""
+        params = {}
+        if track_ids:
+            params["track_ids"]  = ",".join(str(i) for i in track_ids)
+            if album_ids:
+                params["album_ids"]  = ",".join(str(i) for i in album_ids)
+            if artist_ids:
+                params["artist_ids"] = ",".join(str(i) for i in artist_ids)
+            return params
+    
     def get_user_favorites(
         self,
         type: Optional[str] = None,
@@ -657,11 +714,7 @@ class QobuzClient:
         self._guard_write("add_favorite")
         if not any([track_ids, album_ids, artist_ids]):
             raise ValueError("At least one of track_ids, album_ids, or artist_ids must be provided.")
-        params: dict[str, Any] = {
-            "track_ids":  ",".join(str(i) for i in (track_ids  or [])),
-            "album_ids":  ",".join(str(i) for i in (album_ids  or [])),
-            "artist_ids": ",".join(str(i) for i in (artist_ids or [])),
-        }
+        a_params_fixed(track_ids, album_ids, artist_ids)
         return self._request("GET", "/favorite/create", params=params)
 
     def remove_favorite(
@@ -678,11 +731,7 @@ class QobuzClient:
         self._guard_write("remove_favorite")
         if not any([track_ids, album_ids, artist_ids]):
             raise ValueError("At least one of track_ids, album_ids, or artist_ids must be provided.")
-        params: dict[str, Any] = {
-            "track_ids":  ",".join(str(i) for i in (track_ids  or [])),
-            "album_ids":  ",".join(str(i) for i in (album_ids  or [])),
-            "artist_ids": ",".join(str(i) for i in (artist_ids or [])),
-        }
+        a_params_fixed(track_ids, album_ids, artist_ids)
         return self._request("GET", "/favorite/delete", params=params)
 
     # ── Stream endpoint ────────────────────────────────────────────────────
@@ -1019,8 +1068,8 @@ class QobuzClient:
         return self._request(
             "POST", "/user/update",
             params={
-                "old_password": hashlib.md5(current_password.encode("utf-8")).hexdigest(),
-                "new_password": hashlib.md5(new_password.encode("utf-8")).hexdigest(),
+                "old_password": hashlib.md5(current_password.encode("utf-8"), usedforsecurity=False).hexdigest(),
+                "new_password": hashlib.md5(new_password.encode("utf-8"), usedforsecurity=False).hexdigest(),
             },
         )
 
@@ -1273,247 +1322,3 @@ class QobuzClient:
             params["parent_id"] = parent_id
         return self._request("GET", "/genre/list", params=params)
         
-    # ── User profile ───────────────────────────────────────────────────────────
-
-    def get_profile(self) -> "UserProfile":
-        """
-        Fetch the authenticated user's full profile.
-
-        Returns a typed UserProfile containing subscription tier,
-        credential parameters, display names, avatar URL, etc.
-        """
-        from .models.user import UserProfile
-        return self.client.get_user_info()
-
-    def update_profile(
-        self,
-        email: Optional[str] = None,
-        firstname: Optional[str] = None,
-        lastname: Optional[str] = None,
-        display_name: Optional[str] = None,
-        country_code: Optional[str] = None,
-        language_code: Optional[str] = None,
-        newsletter: Optional[bool] = None,
-    ) -> "UserProfile":
-        """
-        Update the authenticated user's profile fields.
-
-        Only the fields you pass are changed — omit a parameter to leave
-        the corresponding field unchanged on the Qobuz account.
-
-        Parameters:
-            email:         New email address.
-            firstname:     Given name.
-            lastname:      Family name.
-            display_name:  Public display name.
-            country_code:  ISO 3166-1 alpha-2 country code, e.g. 'US', 'GB'.
-            language_code: Preferred interface language, e.g. 'en', 'fr'.
-            newsletter:    Subscribe / unsubscribe from the Qobuz newsletter.
-
-        Returns the updated UserProfile.
-        Raises PoolModeError in pool mode.
-        Raises APIError if the server rejects the update (e.g. email taken).
-        """
-        return self.client.update_user(
-            email=email,
-            firstname=firstname,
-            lastname=lastname,
-            display_name=display_name,
-            country_code=country_code,
-            language_code=language_code,
-            newsletter=newsletter,
-        )
-
-    def change_password(
-        self,
-        current_password: str,
-        new_password: str,
-    ) -> None:
-        """
-        Change the password for the authenticated Qobuz account.
-
-        Parameters:
-            current_password: Existing password in plain text.
-            new_password:     Desired new password in plain text.
-
-        Raises PoolModeError in pool mode.
-        Raises InvalidCredentialsError if current_password is wrong.
-        Raises APIError for other server-side errors (e.g. password too weak).
-        """
-        self.client.update_password(current_password, new_password)
-
-    # ── Remote playlist management ─────────────────────────────────────────
-
-    def create_remote_playlist(
-        self,
-        name: str,
-        description: str = "",
-        is_public: bool = False,
-        is_collaborative: bool = False,
-        also_save_locally: bool = True,
-    ) -> "Playlist":
-        """
-        Create a new playlist on the user's Qobuz account.
-
-        Parameters:
-            name:               Playlist title.
-            description:        Optional description.
-            is_public:          Make the playlist publicly visible.
-            is_collaborative:   Allow other users to add tracks.
-            also_save_locally:  If True (default), also create a matching
-                                entry in the local store so it shows up in
-                                local playlist commands.
-
-        Returns the newly created remote Playlist object.
-        Raises PoolModeError in pool mode.
-        """
-        pl = self.client.create_remote_playlist(
-            name=name,
-            description=description,
-            is_public=is_public,
-            is_collaborative=is_collaborative,
-        )
-        if also_save_locally:
-            self.store.create_playlist(name, description)
-        return pl
-
-    def update_remote_playlist(
-        self,
-        playlist_id: str | int,
-        name: Optional[str] = None,
-        description: Optional[str] = None,
-        is_public: Optional[bool] = None,
-        is_collaborative: Optional[bool] = None,
-    ) -> "Playlist":
-        """
-        Update the metadata of a Qobuz playlist owned by the user.
-
-        Only the fields you pass are changed.
-        Raises PoolModeError in pool mode.
-        """
-        return self.client.update_remote_playlist(
-            playlist_id=playlist_id,
-            name=name,
-            description=description,
-            is_public=is_public,
-            is_collaborative=is_collaborative,
-        )
-
-    def delete_remote_playlist(
-        self,
-        playlist_id: str | int,
-    ) -> None:
-        """
-        Permanently delete a Qobuz playlist owned by the user.
-        Raises PoolModeError in pool mode.
-        """
-        self.client.delete_remote_playlist(playlist_id)
-
-    def add_tracks_to_remote_playlist(
-        self,
-        playlist_id: str | int,
-        track_ids: list[str | int],
-        no_duplicate: bool = True,
-    ) -> None:
-        """
-        Add tracks to a Qobuz playlist owned by the user.
-
-        Parameters:
-            playlist_id:  Target playlist ID.
-            track_ids:    Qobuz track IDs to add.
-            no_duplicate: Skip tracks already in the playlist (default True).
-
-        Raises PoolModeError in pool mode.
-        """
-        self.client.add_tracks_to_remote_playlist(
-            playlist_id=playlist_id,
-            track_ids=track_ids,
-            no_duplicate=no_duplicate,
-        )
-
-    def remove_tracks_from_remote_playlist(
-        self,
-        playlist_id: str | int,
-        playlist_track_ids: list[int],
-    ) -> None:
-        """
-        Remove tracks from a Qobuz playlist by playlist_track_id.
-
-        The playlist_track_id is the join-table ID on each PlaylistTrack
-        object — NOT the track ID. Collect these from get_playlist() first.
-
-        Raises PoolModeError in pool mode.
-        """
-        self.client.remove_tracks_from_remote_playlist(
-            playlist_id=playlist_id,
-            playlist_track_ids=playlist_track_ids,
-        )
-
-    def follow_playlist(self, playlist_id: str | int) -> None:
-        """
-        Follow / subscribe to a public Qobuz playlist.
-        Raises PoolModeError in pool mode.
-        """
-        self.client.subscribe_to_playlist(playlist_id)
-
-    def unfollow_playlist(self, playlist_id: str | int) -> None:
-        """
-        Unfollow / unsubscribe from a Qobuz playlist.
-        Raises PoolModeError in pool mode.
-        """
-        self.client.unsubscribe_from_playlist(playlist_id)
-
-    # ── Discovery ──────────────────────────────────────────────────────────
-
-    def get_featured_playlists(
-        self,
-        type: str = "editor-picks",
-        genre_id: Optional[int] = None,
-        limit: int = 25,
-        offset: int = 0,
-    ) -> dict:
-        """
-        Fetch editorially curated playlists.
-
-        Parameters:
-            type:     Curation type: 'editor-picks', 'last-created',
-                      'best-of'. See client.get_featured_playlists() for
-                      full list.
-            genre_id: Filter by genre ID.
-            limit:    Max results (default 25, max 100).
-            offset:   Pagination offset.
-        """
-        return self.client.get_featured_playlists(
-            type=type, genre_id=genre_id, limit=limit, offset=offset,
-        )
-
-    def get_new_releases(
-        self,
-        type: str = "new-releases",
-        genre_id: Optional[int] = None,
-        limit: int = 25,
-        offset: int = 0,
-    ) -> dict:
-        """
-        Fetch new or featured album releases.
-
-        Parameters:
-            type:     Feed type: 'new-releases', 'press-awards',
-                      'editor-picks', 'most-streamed', 'best-sellers', etc.
-            genre_id: Filter by genre ID.
-            limit:    Max results (default 25, max 100).
-            offset:   Pagination offset.
-        """
-        return self.client.get_new_releases(
-            type=type, genre_id=genre_id, limit=limit, offset=offset,
-        )
-
-    def get_genres(self, parent_id: Optional[int] = None) -> dict:
-        """
-        Fetch the Qobuz genre tree.
-
-        Parameters:
-            parent_id: Fetch sub-genres of this ID.
-                       Omit to fetch top-level genres.
-        """
-        return self.client.get_genres(parent_id=parent_id)    
