@@ -156,9 +156,15 @@ class Downloader:
             playlist_index: Passed to naming template as {index}.
         """
         dest_dir = Path(dest_dir)
-        url      = url_info["url"]
-        mime     = url_info.get("mime_type", "audio/flac")
-        extension     = ".mp3" if "mpeg" in mime else ".flac"
+        url  = url_info["url"]
+        mime = url_info.get("mime_type", "").lower()
+        
+        # If the URL contains 'mp3' or MIME is mpeg, it's an MP3. Period.
+        if "mpeg" in mime or "mp3" in mime or ".mp3" in url.lower():
+            extension = ".mp3"
+        else:
+            extension = ".flac"
+
         bit_depth     = url_info.get("bit_depth")
         sampling_rate = url_info.get("sampling_rate")
 
