@@ -680,9 +680,18 @@ class QobuzSession:
         _fetch_lyrics = fetch_lyrics_flag if fetch_lyrics_flag is not None else t.fetch_lyrics
         _save_cover   = save_cover_file   if save_cover_file   is not None else t.save_cover_file
 
+        # ── Skip guard ────────────────────────────────────────────────────
+        # The final file already existed before this run — the .part
+        # convention guarantees both download and tagging completed on a
+        # prior run, so there is nothing to do here.
+        if result.skipped:
+            return TrackDownloadResult(result, track, album)
+
         tagged = lyrics_found = mb_enriched = False
 
         if not t.enabled:
+            # Tagging disabled — just rename .part → final and return.
+            self._finalise(result)
             return TrackDownloadResult(result, track, album)
 
         lyrics_result = None
@@ -708,31 +717,35 @@ class QobuzSession:
                 embed_cover=_embed_cover,
             )
             tagged = True
-            if _save_cover:
-                # For album downloads, album is a full Album object and we
-                # use the canonical "cover.jpg" name — all tracks in that
-                # folder belong to the same release, so one file is correct.
-                #
-                # For single-track downloads, album is None (the caller
-                # passes None explicitly — see download_track). Multiple
-                # singles can land in the same dest_dir, so we name the
-                # cover after the audio file itself: e.g. "01. Track.jpg".
-                # The image URL falls back to track.album in that case.
-                if album:
-                    self._save_cover_file(result.path.parent, album)
-                else:
-                    self._save_cover_file(
-                        result.path.parent,
-                        album=None,
-                        track=track,
-                        track_stem=result.path.stem,
-                    )
 
         if mb.enabled and track.isrc and not result.dev_stub:
             mb_result = lookup_isrc(track.isrc)
             if mb_result.found:
                 apply_mb_tags(result.path, mb_result)
                 mb_enriched = True
+
+        # ── Rename .part → final ──────────────────────────────────────────
+        # Every pipeline step that writes to the file is done. Only now do
+        # we rename to the final path — making "file exists" an unambiguous
+        # "fully complete" signal, exactly like yt-dlp's convention.
+        # If anything above raised an exception, the .part file stays on
+        # disk. The next run will detect the complete .part, skip the
+        # download, and retry the tagging pipeline automatically.
+        if not result.dev_stub:
+            self._finalise(result)
+
+        # ── Save standalone cover file ────────────────────────────────────
+        # Must happen after _finalise so result.path is the final path.
+        if _save_cover and not result.dev_stub:
+            if album:
+                self._save_cover_file(result.path.parent, album)
+            else:
+                self._save_cover_file(
+                    result.path.parent,
+                    album=None,
+                    track=track,
+                    track_stem=result.path.stem,
+                )
 
         if cfg.local_data.track_history and not result.dev_stub:
             try:
@@ -750,6 +763,19 @@ class QobuzSession:
         return TrackDownloadResult(
             result, track, album, tagged, lyrics_found, mb_enriched,
         )
+
+    @staticmethod
+    def _finalise(result: DownloadResult) -> None:
+        """
+        Rename result.path from <name>.part to <name> (mutates result.path).
+
+        If the path doesn't end with '.part' (dev mode writes directly to
+        the final path) this is a no-op, so it is always safe to call.
+        """
+        if result.path.name.endswith(".part"):
+            final = result.path.with_name(result.path.name[:-5])
+            result.path.rename(final)
+            result.path = final
 
     # ══════════════════════════════════════════════════════════════════════
     # Downloads
@@ -986,28 +1012,17 @@ class QobuzSession:
             if on_album_start:
                 on_album_start(album_obj.display_title, i, total)
 
-            # ── Per-release template selection ─────────────────────────────
-            # If the caller passed an explicit --template, always honour it.
-            # Otherwise choose based on release type:
-            #   · full album / unknown → naming.artist
-            #       (must NOT contain {albumartist}; the artist folder is
-            #        already provided by artist_dir above)
-            #   · single / ep / compilation → their own templates
-            #       (these don't start with {albumartist} by default, so
-            #        passing None lets download_album pick them normally)
             if template:
                 effective_template: Optional[str] = template
             else:
                 rtype = (album_obj.release_type or "album").lower()
                 if rtype == "single":
-                    effective_template = None   # → download_album uses naming.single
+                    effective_template = None
                 elif rtype == "ep":
-                    effective_template = None   # → download_album uses naming.ep
+                    effective_template = None
                 elif rtype == "compilation":
-                    effective_template = None   # → download_album uses naming.compilation
+                    effective_template = None
                 else:
-                    # Full album: suppress {albumartist} prefix since the
-                    # artist folder is already provided by artist_dir.
                     effective_template = cfg.naming.artist
 
             try:
@@ -1032,7 +1047,6 @@ class QobuzSession:
                 )
 
         return results
-
 
     def download_playlist(
         self,
@@ -1569,8 +1583,6 @@ class QobuzSession:
             url = album.image.large or album.image.small
         elif track and track.album and track.album.image:
             img = track.album.image
-            # TrackAlbum.image may be a dict or an object depending on
-            # how far the model was hydrated — handle both gracefully.
             if hasattr(img, "large"):
                 url = img.large or img.small
             elif isinstance(img, dict):

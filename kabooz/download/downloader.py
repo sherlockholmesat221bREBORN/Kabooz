@@ -25,10 +25,13 @@ class DownloadResult:
 
     Attributes:
         path:          Absolute path where the file was written.
+                       For a fresh/resumed download this is the .part path
+                       until session._post_download renames it to the final
+                       path after tagging completes.
         bytes_written: Bytes written this session (partial for resumes).
         total_bytes:   Total file size in bytes.
-        skipped:       File was already complete — not re-downloaded.
-        resumed:       Download was resumed from a partial file.
+        skipped:       Final file already exists — nothing to do.
+        resumed:       Download was resumed from a partial .part file.
         dev_stub:      True when the file is a stub (not real audio).
                        When True, the full tagging pipeline is skipped.
     """
@@ -77,7 +80,16 @@ class Downloader:
 
     Features
     ────────
-    - Skip / resume logic based on Content-Length matching.
+    - .part file convention: bytes are written to <dest>.part and only
+      renamed to the final path after the full post-download pipeline
+      (tagging, MusicBrainz, etc.) completes successfully in session.py.
+      This means final_path.exists() is an unambiguous "fully done" signal,
+      identical to how yt-dlp works.
+    - Skip / resume logic:
+        · final_path.exists()             → skip everything (skipped=True)
+        · part_path size >= Content-Length → bytes complete, re-tag only
+        · part_path size < Content-Length  → resume from offset
+        · no part_path                    → fresh download
     - Optional multithreaded album/playlist downloads via max_workers.
     - Optional external downloader (e.g. aria2c) via a shell template.
     - Naming template support (passed through to resolve_track_path).
@@ -85,17 +97,20 @@ class Downloader:
     - Dev mode: writes real audio (transcoded from the embedded Opus clip)
       instead of streaming from Qobuz. Falls back to a sine wave if the
       clip isn't baked yet, then to stub bytes as a last resort.
+      Dev mode writes directly to the final path (no .part) since it
+      never does real network I/O.
 
     External downloader template
     ────────────────────────────
     Set external_downloader to a shell command with {url} and {output}
-    placeholders. Examples:
+    placeholders. {output} will be the .part path; session renames it
+    after tagging. Examples:
 
         "aria2c -x 16 -s 16 -d {dir} -o {filename} {url}"
         "wget -O {output} {url}"
 
     When set, the built-in httpx streaming is bypassed entirely for file
-    downloads. Skip/resume logic still runs via a HEAD request first.
+    downloads. Skip/resume logic still runs first.
 
     Threading
     ─────────
@@ -145,6 +160,13 @@ class Downloader:
         """
         Download a single track.
 
+        Returns a DownloadResult whose .path is:
+          · the final path                  when skipped=True or dev_stub=True
+          · the .part path (needs rename)   for all other cases
+
+        session._post_download() is responsible for tagging the .part file
+        and renaming it to the final path on success.
+
         Parameters:
             track:          Full Track object (not TrackSummary).
             url_info:       Dict from client.get_track_url(). Must have "url";
@@ -158,7 +180,7 @@ class Downloader:
         dest_dir = Path(dest_dir)
         url  = url_info["url"]
         mime = url_info.get("mime_type", "").lower()
-        
+
         # If the URL contains 'mp3' or MIME is mpeg, it's an MP3. Period.
         if "mpeg" in mime or "mp3" in mime or ".mp3" in url.lower():
             extension = ".mp3"
@@ -217,6 +239,10 @@ class Downloader:
 
         When download_goodies is True and album has goodies, they are
         downloaded sequentially after all tracks finish.
+
+        Note: this method is not currently called by session.py, which
+        manages its own loop to interleave tagging per-track. It is
+        provided for callers that only need raw bytes (no tagging).
         """
         dest_dir = Path(dest_dir)
         result   = AlbumDownloadResult()
@@ -226,20 +252,12 @@ class Downloader:
             track, url_info = item
             if on_track_start:
                 on_track_start(track, index, total)
-            
-            # FIX: Create a local callback that identifies which track is updating
-            local_progress = None
-            if on_progress:
-                local_progress = lambda written, total: on_progress(written, total, track.id)
-
             return self.download_track(
                 track=track,
                 url_info=url_info,
                 dest_dir=dest_dir,
                 album=album,
-                on_progress=local_progress, # Pass the callback here
             )
-
 
         if self._max_workers == 1:
             for i, item in enumerate(tracks, 1):
@@ -296,9 +314,9 @@ class Downloader:
         """
         Download a single bonus file (booklet PDF, video, etc.).
 
-        The filename is derived from the goodie's URL — typically
-        something like "booklet.pdf". If that's unavailable the goodie
-        name is sanitized and used instead.
+        Goodies are non-audio files (PDFs, videos) — they don't go through
+        the tagging pipeline, so we write directly to the final path using
+        the same size-based skip/resume logic as before.
         """
         url = goodie.original_url or goodie.url
         if not url:
@@ -319,7 +337,7 @@ class Downloader:
         dev_log(f"goodie '{goodie.name}' → {dest_path}")
 
         try:
-            result = self._download_to_path(url, dest_path, on_progress)
+            result = self._download_goodie_to_path(url, dest_path, on_progress)
             return GoodieResult(path=result.path, goodie=goodie, skipped=result.skipped)
         except Exception as exc:
             return GoodieResult(path=dest_path, goodie=goodie, error=str(exc))
@@ -366,16 +384,21 @@ class Downloader:
         path: Path,
         on_progress: Optional[Callable[[int, int], None]],
     ) -> DownloadResult:
-        # ── Dev mode: write dev audio instead of streaming real audio ─────
+        """
+        Download url to path using the .part convention.
+
+        State machine:
+            path.exists()              → already fully done (skip)
+            part_path size >= CDN len  → bytes done, tagging failed last run
+                                         (return part_path for re-tagging)
+            part_path size < CDN len   → partial, resume from offset
+            no part_path               → fresh download
+        """
+        # ── Dev mode: write directly to final path, skip by existence ─────
         if self._dev:
             from ..dev import prepare_dev_audio, is_stub, DEV_STUB_BYTES, dev_log
 
-            # Already exists — check whether it's a stub or real audio.
             if path.exists():
-                if is_stub(path):
-                    dev_log(f"stub already exists, skipping → {path.name}")
-                else:
-                    dev_log(f"dev audio already exists, skipping → {path.name}")
                 size = path.stat().st_size
                 if on_progress:
                     on_progress(size, size)
@@ -387,7 +410,6 @@ class Downloader:
                     dev_stub=is_stub(path),
                 )
 
-            # Write the dev audio file. Returns True = real audio, False = stub.
             is_real_audio = prepare_dev_audio(path)
             size = path.stat().st_size if path.exists() else len(DEV_STUB_BYTES)
             if on_progress:
@@ -400,36 +422,53 @@ class Downloader:
             )
 
         # ── Normal path ────────────────────────────────────────────────────
-        total         = self._head(url)
-        existing_size = path.stat().st_size if path.exists() else 0
+        from ..dev import dev_log
 
-        # Skip if the file is at least as large as the CDN reports.
-        # Tagging adds cover art and metadata so the on-disk file will
-        # exceed the raw Content-Length — that is expected, not corruption.
-        if total > 0 and existing_size >= total:
+        # Final file exists → download + tagging both completed previously.
+        if path.exists():
+            size = path.stat().st_size
+            if on_progress:
+                on_progress(size, size)
+            return DownloadResult(
+                path=path, bytes_written=0, total_bytes=size, skipped=True,
+            )
+
+        part_path  = Path(str(path) + ".part")
+        total      = self._head(url)
+        part_size  = part_path.stat().st_size if part_path.exists() else 0
+
+        # .part is complete — bytes done but tagging must have failed last run.
+        # Return it so session can re-run the tagging pipeline without
+        # re-downloading anything.
+        if total > 0 and part_size >= total:
+            dev_log(f"part complete, re-tagging → {part_path.name}")
             if on_progress:
                 on_progress(total, total)
             return DownloadResult(
-                path=path, bytes_written=0, total_bytes=total, skipped=True,
+                path=part_path,
+                bytes_written=0,
+                total_bytes=total,
+                resumed=False,
             )
 
-        # Resume only when HEAD gave a real total and file is partial.
-        resumed = total > 0 and existing_size > 0 and existing_size < total
-        headers = {"Range": f"bytes={existing_size}-"} if resumed else {}
+        # Resume from existing partial bytes.
+        resumed = total > 0 and part_size > 0 and part_size < total
+        headers = {"Range": f"bytes={part_size}-"} if resumed else {}
         written = 0
         mode    = "ab" if resumed else "wb"
 
-        with open(path, mode) as f:
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(part_path, mode) as f:
             with self._http.stream("GET", url, headers=headers) as response:
                 response.raise_for_status()
                 for chunk in response.iter_bytes(chunk_size=self._chunk_size):
                     f.write(chunk)
                     written += len(chunk)
                     if on_progress:
-                        on_progress(existing_size + written, total or written)
+                        on_progress(part_size + written, total or written)
 
         return DownloadResult(
-            path=path,
+            path=part_path,
             bytes_written=written,
             total_bytes=total or written,
             resumed=resumed,
@@ -444,31 +483,46 @@ class Downloader:
         """
         Invoke an external downloader instead of the built-in one.
 
+        The {output} and {filename} placeholders resolve to the .part path.
+        session._post_download() renames it to the final path after tagging.
+
         Placeholders in the template:
             {url}      — the CDN URL
-            {output}   — full destination path (str)
+            {output}   — .part destination path (str)
             {dir}      — parent directory of {output}
-            {filename} — basename of {output}
+            {filename} — basename of the .part path
         """
-        total         = self._head(url)
-        existing_size = path.stat().st_size if path.exists() else 0
+        from ..dev import dev_log
 
-        # FIX: use >= (not ==) so that tagged files (which grow slightly beyond
-        # the raw CDN Content-Length after cover art + metadata are embedded)
-        # are still correctly skipped on subsequent runs.  Consistent with the
-        # skip logic in _download_to_path.
-        if total > 0 and existing_size >= total:
+        # Final file exists → fully done.
+        if path.exists():
+            size = path.stat().st_size
+            if on_progress:
+                on_progress(size, size)
+            return DownloadResult(
+                path=path, bytes_written=0, total_bytes=size, skipped=True,
+            )
+
+        part_path = Path(str(path) + ".part")
+        total     = self._head(url)
+        part_size = part_path.stat().st_size if part_path.exists() else 0
+
+        # .part complete — re-tag only.
+        if total > 0 and part_size >= total:
+            dev_log(f"part complete (external), re-tagging → {part_path.name}")
             if on_progress:
                 on_progress(total, total)
             return DownloadResult(
-                path=path, bytes_written=0, total_bytes=total, skipped=True,
+                path=part_path, bytes_written=0, total_bytes=total,
             )
+
+        part_path.parent.mkdir(parents=True, exist_ok=True)
 
         cmd_str = self._external_downloader.format(
             url      = url,
-            output   = str(path),
-            dir      = str(path.parent),
-            filename = path.name,
+            output   = str(part_path),
+            dir      = str(part_path.parent),
+            filename = part_path.name,
         )
 
         try:
@@ -484,14 +538,58 @@ class Downloader:
                 f"External downloader failed (exit {exc.returncode}): {stderr}"
             ) from exc
 
-        written = path.stat().st_size if path.exists() else 0
+        written = part_path.stat().st_size if part_path.exists() else 0
         if on_progress:
             on_progress(written, written)
 
         return DownloadResult(
-            path=path,
+            path=part_path,
             bytes_written=written,
             total_bytes=written,
+        )
+
+    def _download_goodie_to_path(
+        self,
+        url: str,
+        path: Path,
+        on_progress: Optional[Callable[[int, int], None]],
+    ) -> DownloadResult:
+        """
+        Download a goodie directly to its final path (no .part convention).
+
+        Goodies are not tagged, so there is no ambiguity: if the file
+        exists and is at least as large as Content-Length, it's complete.
+        """
+        total         = self._head(url)
+        existing_size = path.stat().st_size if path.exists() else 0
+
+        if total > 0 and existing_size >= total:
+            if on_progress:
+                on_progress(total, total)
+            return DownloadResult(
+                path=path, bytes_written=0, total_bytes=total, skipped=True,
+            )
+
+        resumed = total > 0 and existing_size > 0 and existing_size < total
+        headers = {"Range": f"bytes={existing_size}-"} if resumed else {}
+        written = 0
+        mode    = "ab" if resumed else "wb"
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, mode) as f:
+            with self._http.stream("GET", url, headers=headers) as response:
+                response.raise_for_status()
+                for chunk in response.iter_bytes(chunk_size=self._chunk_size):
+                    f.write(chunk)
+                    written += len(chunk)
+                    if on_progress:
+                        on_progress(existing_size + written, total or written)
+
+        return DownloadResult(
+            path=path,
+            bytes_written=written,
+            total_bytes=total or written,
+            resumed=resumed,
         )
 
     # ── Resource management ────────────────────────────────────────────────
