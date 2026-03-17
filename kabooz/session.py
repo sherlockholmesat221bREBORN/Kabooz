@@ -708,8 +708,25 @@ class QobuzSession:
                 embed_cover=_embed_cover,
             )
             tagged = True
-            if _save_cover and album and album.image:
-                self._save_cover_file(result.path.parent, album)
+            if _save_cover:
+                # For album downloads, album is a full Album object and we
+                # use the canonical "cover.jpg" name — all tracks in that
+                # folder belong to the same release, so one file is correct.
+                #
+                # For single-track downloads, album is None (the caller
+                # passes None explicitly — see download_track). Multiple
+                # singles can land in the same dest_dir, so we name the
+                # cover after the audio file itself: e.g. "01. Track.jpg".
+                # The image URL falls back to track.album in that case.
+                if album:
+                    self._save_cover_file(result.path.parent, album)
+                else:
+                    self._save_cover_file(
+                        result.path.parent,
+                        album=None,
+                        track=track,
+                        track_stem=result.path.stem,
+                    )
 
         if mb.enabled and track.isrc and not result.dev_stub:
             mb_result = lookup_isrc(track.isrc)
@@ -1521,15 +1538,53 @@ class QobuzSession:
                 return c
         return None
 
-    def _save_cover_file(self, folder: Path, album: Album) -> None:
-        url = None
-        if album.image:
+    def _save_cover_file(
+        self,
+        folder: Path,
+        album: Optional[Album] = None,
+        track: Optional[Track] = None,
+        track_stem: Optional[str] = None,
+    ) -> None:
+        """
+        Save cover art as a JPEG file alongside the audio.
+
+        For album downloads (album is not None):
+            Writes  <folder>/cover.jpg
+            All tracks in the folder share the same release, so one
+            canonical cover file is the right behaviour.
+
+        For single-track downloads (album is None, track_stem provided):
+            Writes  <folder>/<track_stem>.jpg
+            Multiple singles may land in the same dest_dir, so we name
+            the cover after the audio file to avoid collisions:
+                "01. One More Time.flac"  →  "01. One More Time.jpg"
+
+        Image URL resolution order:
+            1. album.image (full Album object, highest quality)
+            2. track.album.image (TrackAlbum embedded in the Track)
+        """
+        url: Optional[str] = None
+
+        if album and album.image:
             url = album.image.large or album.image.small
+        elif track and track.album and track.album.image:
+            img = track.album.image
+            # TrackAlbum.image may be a dict or an object depending on
+            # how far the model was hydrated — handle both gracefully.
+            if hasattr(img, "large"):
+                url = img.large or img.small
+            elif isinstance(img, dict):
+                url = img.get("large") or img.get("small")
+
         if not url:
             return
-        cover_path = folder / "cover.jpg"
+
+        filename = "cover.jpg" if track_stem is None else f"{track_stem}.jpg"
+        cover_path = folder / filename
+
         if cover_path.exists():
             return
+
         try:
             import httpx
             with httpx.Client(follow_redirects=True, timeout=30) as c:
