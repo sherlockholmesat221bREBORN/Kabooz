@@ -244,10 +244,15 @@ class Tagger:
 
         # ── Lyrics ────────────────────────────────────────────────────────
         if lyrics and lyrics.found:
+            # Prioritize synced for the main LYRICS tag to ensure visibility
+            text_to_write = lyrics.synced or lyrics.plain
+            if text_to_write:
+                audio["LYRICS"] = text_to_write
+            
+            # Also write the specific synced tag if available
             if lyrics.synced:
                 audio["SYNCEDLYRICS"] = lyrics.synced
-            if lyrics.plain:
-                audio["LYRICS"] = lyrics.plain
+
 
         # ── Cover art ─────────────────────────────────────────────────────
         if cover_data:
@@ -386,23 +391,20 @@ class Tagger:
 
         # ── Lyrics ────────────────────────────────────────────────────────
         if lyrics and lyrics.found:
+            # Most players read USLT first. Use synced text if available.
+            text_to_write = lyrics.synced or lyrics.plain
+            if text_to_write:
+                audio["USLT"] = USLT(
+                    encoding=3, lang="eng", desc="", text=text_to_write
+                )
+
             if lyrics.synced:
                 sylt_data = _parse_lrc_to_sylt(lyrics.synced)
                 if sylt_data:
                     audio["SYLT"] = SYLT(
-                        encoding=3,
-                        lang="eng",
-                        format=2,
-                        type=1,
-                        text=sylt_data,
+                        encoding=3, lang="eng", format=2, type=1, text=sylt_data
                     )
-            if lyrics.plain:
-                audio["USLT"] = USLT(
-                    encoding=3,
-                    lang="eng",
-                    desc="",
-                    text=lyrics.plain,
-                )
+
 
         # ── Cover art ─────────────────────────────────────────────────────
         if cover_data:

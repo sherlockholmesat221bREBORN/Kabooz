@@ -353,11 +353,19 @@ def track(
             task_ref[0][0].update(task_ref[0][1], completed=done, total=total or None)
 
     with _make_progress() as prog:
+        tasks = {}
+
+        def on_track_start_local(track, index, total):
+            _on_track_start(track.title, index, total)
+            # Add a sub-bar for the specific track
+            tasks[track.id] = prog.add_task(f"  [dim]Downloading...[/dim]", total=None)
+
+        def on_progress_local(written, total, track_id=None):
+            if track_id in tasks:
+                prog.update(tasks[track_id], completed=written, total=total)
+
         try:
-            track_obj = sess.get_track(_resolve_id(url_or_id, "track"))
-            task = prog.add_task(track_obj.title, total=None)
-            task_ref.append((prog, task))
-            result = sess.download_track(
+            result = sess.download_album(
                 url_or_id,
                 quality=q,
                 dest_dir=output or Path(cfg.download.output_dir),
@@ -365,7 +373,10 @@ def track(
                 embed_cover=cover,
                 fetch_lyrics_flag=lyrics,
                 save_cover_file=save_cover,
-                on_progress=on_progress,
+                download_goodies=goodies if goodies is not None else True,
+                on_track_start=on_track_start_local,
+                on_track_done=_on_track_done,
+                on_progress=on_progress_local, # Wire up the progress logic
                 workers=workers,
             )
         except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:

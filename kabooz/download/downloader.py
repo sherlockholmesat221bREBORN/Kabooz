@@ -226,12 +226,20 @@ class Downloader:
             track, url_info = item
             if on_track_start:
                 on_track_start(track, index, total)
+            
+            # FIX: Create a local callback that identifies which track is updating
+            local_progress = None
+            if on_progress:
+                local_progress = lambda written, total: on_progress(written, total, track.id)
+
             return self.download_track(
                 track=track,
                 url_info=url_info,
                 dest_dir=dest_dir,
                 album=album,
+                on_progress=local_progress, # Pass the callback here
             )
+
 
         if self._max_workers == 1:
             for i, item in enumerate(tracks, 1):
