@@ -8,28 +8,18 @@ from typing import Optional
 import httpx
 
 
-# ── Result type ────────────────────────────────────────────────────────────
-
 @dataclass
 class MBResult:
-    """
-    MusicBrainz metadata for a single track.
-    All fields are None if the lookup failed or found no match.
-    """
-    recording_mbid:  Optional[str] = None   # MusicBrainz recording ID
-    artist_mbid:     Optional[str] = None   # MusicBrainz artist ID (first credited)
-    release_mbid:    Optional[str] = None   # MusicBrainz release (album) ID
-    found:           bool = False
+    recording_mbid:     Optional[str] = None
+    artist_mbid:        Optional[str] = None
+    release_mbid:       Optional[str] = None
+    release_group_mbid: Optional[str] = None
+    work_mbid:          Optional[str] = None
+    found:              bool = False
 
-
-# ── Rate limiter ───────────────────────────────────────────────────────────
 
 class _RateLimiter:
-    """
-    Simple token-bucket rate limiter for the MusicBrainz 1 req/sec rule.
-    Thread-safe enough for our use case (GIL protects the float update).
-    """
-    def __init__(self, min_interval: float = 1.05) -> None:
+    def __init__(self, min_interval: float = 1.1) -> None:
         self._min_interval = min_interval
         self._last: float = 0.0
 
@@ -42,105 +32,83 @@ class _RateLimiter:
 
 
 _limiter = _RateLimiter()
-
 _MB_BASE    = "https://musicbrainz.org/ws/2"
-_USER_AGENT = "kabooz/0.1 ( https://gitlab.com//kabooz )"
+_USER_AGENT = "kabooz/0.1 ( https://gitlab.com/kabooz )"
 
 
-# ── Public interface ───────────────────────────────────────────────────────
-
-def lookup_isrc(
-    isrc: str,
-    http_client: Optional[httpx.Client] = None,
-) -> MBResult:
-    """
-    Look up a track by ISRC on MusicBrainz.
-
-    Returns a MBResult with recording_mbid, artist_mbid, and release_mbid
-    populated on success. Returns an empty MBResult on any error so the
-    caller never has to handle exceptions from this function.
-
-    Rate-limited to 1 request per second per the MusicBrainz API terms.
-    Always set a descriptive User-Agent — MB will throttle anonymous bots.
-
-    Parameters:
-        isrc:        The ISRC code from the Qobuz track metadata.
-        http_client: Optional injected httpx.Client for testing.
-    """
+def lookup_isrc(isrc: str, http_client: Optional[httpx.Client] = None) -> MBResult:
     from ..dev import dev_log
-
     if not isrc:
         return MBResult()
 
-    dev_log(f"MusicBrainz lookup — ISRC={isrc}")
-    _limiter.wait()
-
     own_client = http_client is None
-    client = http_client or httpx.Client(
-        headers={"User-Agent": _USER_AGENT},
-        timeout=10.0,
-    )
+    client = http_client or httpx.Client(headers={"User-Agent": _USER_AGENT}, timeout=10.0)
 
     try:
-        resp = client.get(
-            f"{_MB_BASE}/isrc/{isrc}?inc=artists+releases&fmt=json",
-        )
+        # STEP 1: Basic lookup to get Recording ID (ISRC endpoint is restricted)
+        dev_log(f"MusicBrainz ISRC lookup — {isrc}")
+        _limiter.wait()
+        resp = client.get(f"{_MB_BASE}/isrc/{isrc}?fmt=json")
         resp.raise_for_status()
         data = resp.json()
+        
+        recordings = data.get("recordings", [])
+        if not recordings:
+            return MBResult()
+        
+        recording_mbid = recordings[0].get("id")
+        
+        # STEP 2: Use Recording ID to get rich metadata (This allows inc=release-groups)
+        dev_log(f"MusicBrainz fetching rich metadata for RecID: {recording_mbid[:8]}")
+        _limiter.wait()
+        full_resp = client.get(
+            f"{_MB_BASE}/recording/{recording_mbid}?inc=artists+releases+release-groups+work-rels&fmt=json"
+        )
+        full_resp.raise_for_status()
+        rec = full_resp.json()
+
+        # Extract IDs
+        artist_mbid = None
+        for credit in rec.get("artist-credit", []):
+            if isinstance(credit, dict) and "artist" in credit:
+                artist_mbid = credit["artist"].get("id")
+                break
+
+        release_mbid = None
+        release_group_mbid = None
+        releases = rec.get("releases", [])
+        if releases:
+            rel = releases[0]
+            release_mbid = rel.get("id")
+            rg = rel.get("release-group")
+            if rg:
+                release_group_mbid = rg.get("id")
+
+        work_mbid = None
+        for rel_item in rec.get("relations", []):
+            if rel_item.get("target-type") == "work":
+                work_mbid = rel_item.get("work", {}).get("id")
+                break
+
+        return MBResult(
+            recording_mbid=recording_mbid,
+            artist_mbid=artist_mbid,
+            release_mbid=release_mbid,
+            release_group_mbid=release_group_mbid,
+            work_mbid=work_mbid,
+            found=True
+        )
+
     except Exception as exc:
-        dev_log(f"MusicBrainz: lookup failed — {exc}")
+        dev_log(f"MusicBrainz error: {exc}")
         return MBResult()
     finally:
         if own_client:
             client.close()
 
-    recordings = data.get("recordings", [])
-    if not recordings:
-        dev_log(f"MusicBrainz: no recordings found for ISRC={isrc}")
-        return MBResult()
-
-    rec = recordings[0]
-    recording_mbid = rec.get("id")
-
-    artist_mbid: Optional[str] = None
-    artist_credits = rec.get("artist-credit", [])
-    for credit in artist_credits:
-        if isinstance(credit, dict) and "artist" in credit:
-            artist_mbid = credit["artist"].get("id")
-            break
-
-    release_mbid: Optional[str] = None
-    releases = rec.get("releases", [])
-    if releases:
-        release_mbid = releases[0].get("id")
-
-    dev_log(
-        f"MusicBrainz: found — "
-        f"recording={recording_mbid} "
-        f"artist={artist_mbid} "
-        f"release={release_mbid}"
-    )
-
-    return MBResult(
-        recording_mbid = recording_mbid,
-        artist_mbid    = artist_mbid,
-        release_mbid   = release_mbid,
-        found          = bool(recording_mbid),
-    )
-
 
 def apply_mb_tags(path, mb: MBResult) -> None:
-    """
-    Write MusicBrainz IDs into an already-tagged audio file.
-
-    FLAC: uses standard Vorbis comment fields (MUSICBRAINZ_TRACKID etc.)
-    MP3:  uses TXXX ID3 frames with the conventional description strings.
-
-    Called after the main tagger has already written all other tags, so
-    we open, update, and save rather than replacing everything.
-    """
     from ..dev import dev_log
-
     if not mb.found:
         return
 
@@ -148,18 +116,15 @@ def apply_mb_tags(path, mb: MBResult) -> None:
     path = _Path(path)
     suffix = path.suffix.lower()
 
-    dev_log(f"applying MusicBrainz tags to {path.name}")
-
     try:
         if suffix == ".flac":
             from mutagen.flac import FLAC
             audio = FLAC(path)
-            if mb.recording_mbid:
-                audio["MUSICBRAINZ_TRACKID"]  = [mb.recording_mbid]
-            if mb.artist_mbid:
-                audio["MUSICBRAINZ_ARTISTID"] = [mb.artist_mbid]
-            if mb.release_mbid:
-                audio["MUSICBRAINZ_ALBUMID"]  = [mb.release_mbid]
+            if mb.recording_mbid: audio["MUSICBRAINZ_TRACKID"] = [mb.recording_mbid]
+            if mb.artist_mbid:    audio["MUSICBRAINZ_ARTISTID"] = [mb.artist_mbid]
+            if mb.release_mbid:   audio["MUSICBRAINZ_ALBUMID"] = [mb.release_mbid]
+            if mb.release_group_mbid: audio["MUSICBRAINZ_RELEASEGROUPID"] = [mb.release_group_mbid]
+            if mb.work_mbid:      audio["MUSICBRAINZ_WORKID"] = [mb.work_mbid]
             audio.save()
 
         elif suffix == ".mp3":
@@ -168,12 +133,20 @@ def apply_mb_tags(path, mb: MBResult) -> None:
                 tags = ID3(path)
             except ID3NoHeaderError:
                 return
-            if mb.recording_mbid:
-                tags.add(TXXX(encoding=3, desc="MusicBrainz Track Id",  text=mb.recording_mbid))
-            if mb.artist_mbid:
-                tags.add(TXXX(encoding=3, desc="MusicBrainz Artist Id", text=mb.artist_mbid))
-            if mb.release_mbid:
-                tags.add(TXXX(encoding=3, desc="MusicBrainz Album Id",  text=mb.release_mbid))
+
+            mb_map = {
+                "MusicBrainz Track Id": mb.recording_mbid,
+                "MusicBrainz Artist Id": mb.artist_mbid,
+                "MusicBrainz Album Id": mb.release_mbid,
+                "MusicBrainz Release Group Id": mb.release_group_mbid,
+                "MusicBrainz Work Id": mb.work_mbid,
+            }
+
+            for desc, val in mb_map.items():
+                if val:
+                    tags.add(TXXX(encoding=3, desc=desc, text=val))
             tags.save()
+            
+        dev_log(f"MB tags written → {path.name}")
     except Exception as exc:
-        dev_log(f"MusicBrainz: tag write failed — {exc}")
+        dev_log(f"MB tag write failed: {exc}")
