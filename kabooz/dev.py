@@ -78,47 +78,39 @@ DEV_STUB_MARKER = b"QOBUZ_DEV_STUB"
 # ── Embedded audio ─────────────────────────────────────────────────────────
 
 def _embedded_opus() -> Optional[Path]:
-    """
-    Return a Path to the embedded dev_audio.opus inside the package.
-    Returns None if the asset hasn't been baked in yet.
-
-    importlib.resources.files() works whether the package is installed
-    as a directory or a zip (wheel/egg). In the zip case the file is
-    extracted to the audio cache dir once and reused.
-    """
     try:
         import importlib.resources
+
         ref = importlib.resources.files("kabooz.data").joinpath("dev_audio.opus")
         if not ref.is_file():
             return None
-        # If it's a real path on disk (editable / directory install), use it directly.
-        candidate = Path(str(ref))
-        if candidate.exists():
-            return candidate
-        # Zip install — extract once to the cache dir.
-        extracted = _AUDIO_CACHE_DIR / "dev_audio_extracted.opus"
-        extracted.parent.mkdir(parents=True, exist_ok=True)
-        extracted.write_bytes(ref.read_bytes())
-        return extracted
+
+        from importlib.resources import as_file
+        with as_file(ref) as p:
+            return Path(p)
+
     except Exception:
         return None
 
+    except Exception:
+        return None
 
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def _transcode(source: Path, dest: Path, codec: str, extra_args: list[str] | None = None) -> bool:
-    """Run ffmpeg to transcode source → dest with the given codec."""
+def _transcode(source: Path, dest: Path, codec: str, extra_args=None) -> bool:
     cmd = [
         "ffmpeg", "-y",
         "-i", str(source),
+        "-vn",
+        "-map", "a:0",
         "-c:a", codec,
         *(extra_args or []),
         str(dest),
     ]
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(cmd, check=True)
         return True
     except subprocess.CalledProcessError:
         return False
@@ -150,62 +142,68 @@ def prepare_dev_audio(dest_path: Path) -> bool:
     extension = dest_path.suffix.lower()
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Transcoded output is cached so ffmpeg only runs once per format.
-    key = _audio_cache_key(opus_source, extension, codec, extra_args)
-    cached_transcode = _AUDIO_CACHE_DIR / f"dev_audio_{key}{extension}"
-    
-    
+    opus_source = _embedded_opus()  # ALWAYS define first
 
-    # ── Serve from transcode cache if available ────────────────────────────
-    if dest_path.exists() and dest_path.stat().st_size == cached_transcode.stat().st_size:
-        dev_log(f"dev audio already up-to-date → {dest_path.name}")
-        return True
-
-    opus_source = _embedded_opus()
-
-    # ── Transcode from embedded Opus clip ─────────────────────────────────
+    # ── Embedded Opus → Transcode ────────────────────────────────────────
     if opus_source is not None and _ffmpeg_available():
         if extension == ".flac":
-            codec      = "flac"
-            extra_args = None
+            codec, extra_args = "flac", None
         else:
-            # MP3 — use a reasonable quality for a dev file
-            codec      = "libmp3lame"
-            extra_args = ["-q:a", "5"]
+            codec, extra_args = "libmp3lame", ["-q:a", "5"]
 
-        _AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = cached_transcode.with_suffix(cached_transcode.suffix + ".tmp")
+        key = _audio_cache_key(opus_source, extension, codec, extra_args)
+        cached_transcode = _AUDIO_CACHE_DIR / f"dev_audio_opus_{key}{extension}"
+
+        # Cache hit
+        if cached_transcode.exists() and cached_transcode.stat().st_size > 1024:
+            shutil.copy2(cached_transcode, dest_path)
+            dev_log(f"dev audio (cached transcode) → {dest_path.name}")
+            return True
+
+        # Transcode once → cache
+        tmp = cached_transcode.with_suffix(".tmp" + cached_transcode.suffix)
 
         if _transcode(opus_source, tmp, codec, extra_args):
-            tmp.replace(cached_transcode)  # atomic rename
-            dev_log(
-                f"dev audio (embedded opus → {extension[1:].upper()}) "
-                f"→ {dest_path.name}"
-            )
+            tmp.replace(cached_transcode)
+            shutil.copy2(cached_transcode, dest_path)
+            dev_log(f"dev audio (transcoded once → cached) → {dest_path.name}")
             return True
+
+        # Only runs if transcode failed
         dev_log("[yellow]transcode from embedded clip failed — trying sine wave[/yellow]")
 
     elif opus_source is None:
         dev_log("[yellow]dev_audio.opus not baked yet — run scripts/make_dev_audio.py[/yellow]")
 
-    # ── Sine wave fallback (no embedded clip or transcode failed) ─────────
+    # ── Sine wave fallback ───────────────────────────────────────────────
     if _ffmpeg_available():
         codec = "flac" if extension == ".flac" else "libmp3lame"
+
+        # IMPORTANT: define cache path here too
+        fallback_cache = _AUDIO_CACHE_DIR / f"dev_audio_sine{extension}"
+
         cmd = [
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", str(source),
+            "-vn",
+            "-map", "a:0",
             "-c:a", codec,
-            str(cached_transcode),
+            *(extra_args or []),
+            str(dest),
         ]
+
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            shutil.copy2(cached_transcode, dest_path)
+            shutil.copy2(fallback_cache, dest_path)
             dev_log(f"dev audio (sine wave fallback) → {dest_path.name}")
             return True
         except subprocess.CalledProcessError:
             pass
 
-    # ── Last resort: stub bytes — tagging will be skipped ─────────────────
+    # ── Last resort: stub bytes ──────────────────────────────────────────
     dev_log("[red]all audio generation failed — writing stub bytes, tagging skipped[/red]")
     dest_path.write_bytes(DEV_STUB_BYTES)
     return False
