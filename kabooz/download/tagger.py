@@ -1,6 +1,7 @@
 # kabooz/download/tagger.py
 from __future__ import annotations
 
+import re
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -18,6 +19,27 @@ from ..models.track import Track
 from ..models.album import Album
 from .credits import parse_performers, format_credits_for_vorbis, format_credits_for_id3
 from .lyrics import LyricsResult
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+_LRC_TIMESTAMP = re.compile(r"^\[\d{2}:\d{2}\.\d{2,3}\]\s*")
+
+
+def _lrc_to_plain(lrc: str) -> str:
+    """
+    Strip [mm:ss.xx] timestamp prefixes from an LRC string.
+
+    Used when writing to plain-text frames (LYRICS / USLT) so that
+    players don't display raw timestamp markers.  Empty lines after
+    stripping are dropped.
+    """
+    lines = []
+    for line in lrc.splitlines():
+        cleaned = _LRC_TIMESTAMP.sub("", line.strip())
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
 
 
 # ── Tagger ─────────────────────────────────────────────────────────────────
@@ -244,15 +266,18 @@ class Tagger:
 
         # ── Lyrics ────────────────────────────────────────────────────────
         if lyrics and lyrics.found:
-            # Prioritize synced for the main LYRICS tag to ensure visibility
-            text_to_write = lyrics.synced or lyrics.plain
-            if text_to_write:
-                audio["LYRICS"] = text_to_write
-            
-            # Also write the specific synced tag if available
+            # LYRICS is a plain-text tag. If we only have synced LRC, strip
+            # the [mm:ss.xx] timestamp prefixes before writing — players that
+            # display LYRICS are not LRC-aware and would show raw markers.
+            plain_text = lyrics.plain or (
+                _lrc_to_plain(lyrics.synced) if lyrics.synced else None
+            )
+            if plain_text:
+                audio["LYRICS"] = plain_text
+
+            # SYNCEDLYRICS carries the full LRC string verbatim.
             if lyrics.synced:
                 audio["SYNCEDLYRICS"] = lyrics.synced
-
 
         # ── Cover art ─────────────────────────────────────────────────────
         if cover_data:
@@ -391,20 +416,25 @@ class Tagger:
 
         # ── Lyrics ────────────────────────────────────────────────────────
         if lyrics and lyrics.found:
-            # Most players read USLT first. Use synced text if available.
-            text_to_write = lyrics.synced or lyrics.plain
-            if text_to_write:
+            # USLT is Unsynchronised Lyrics — plain text only. Never write
+            # raw LRC (which contains [mm:ss.xx] markers) into this frame;
+            # players that read USLT are not LRC-aware and will display the
+            # markers literally. Strip timestamps if we only have synced.
+            plain_text = lyrics.plain or (
+                _lrc_to_plain(lyrics.synced) if lyrics.synced else None
+            )
+            if plain_text:
                 audio["USLT"] = USLT(
-                    encoding=3, lang="eng", desc="", text=text_to_write
+                    encoding=3, lang="eng", desc="", text=plain_text
                 )
 
+            # SYLT carries the properly parsed (text, ms) pairs from the LRC.
             if lyrics.synced:
                 sylt_data = _parse_lrc_to_sylt(lyrics.synced)
                 if sylt_data:
                     audio["SYLT"] = SYLT(
                         encoding=3, lang="eng", format=2, type=1, text=sylt_data
                     )
-
 
         # ── Cover art ─────────────────────────────────────────────────────
         if cover_data:
@@ -441,7 +471,6 @@ def _parse_lrc_to_sylt(lrc: str) -> list[tuple[str, int]]:
     Parse an LRC-format string into a list of (text, timestamp_ms) tuples
     suitable for an ID3 SYLT frame.
     """
-    import re
     result = []
     pattern = re.compile(r"\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)")
     for line in lrc.splitlines():

@@ -346,26 +346,15 @@ def track(
     cfg  = _cfg()
     q    = _quality(quality)
     sess = _session(cfg)
-    task_ref: list = []
-
-    def on_progress(done: int, total: int) -> None:
-        if task_ref:
-            task_ref[0][0].update(task_ref[0][1], completed=done, total=total or None)
 
     with _make_progress() as prog:
-        tasks = {}
+        task = prog.add_task("[dim]Downloading…[/dim]", total=None)
 
-        def on_track_start_local(track, index, total):
-            _on_track_start(track.title, index, total)
-            # Add a sub-bar for the specific track
-            tasks[track.id] = prog.add_task(f"  [dim]Downloading...[/dim]", total=None)
-
-        def on_progress_local(written, total, track_id=None):
-            if track_id in tasks:
-                prog.update(tasks[track_id], completed=written, total=total)
+        def on_progress(written: int, total: int) -> None:
+            prog.update(task, completed=written, total=total or None)
 
         try:
-            result = sess.download_album(
+            result = sess.download_track(
                 url_or_id,
                 quality=q,
                 dest_dir=output or Path(cfg.download.output_dir),
@@ -373,10 +362,7 @@ def track(
                 embed_cover=cover,
                 fetch_lyrics_flag=lyrics,
                 save_cover_file=save_cover,
-                download_goodies=goodies if goodies is not None else True,
-                on_track_start=on_track_start_local,
-                on_track_done=_on_track_done,
-                on_progress=on_progress_local, # Wire up the progress logic
+                on_progress=on_progress,
                 workers=workers,
             )
         except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
@@ -392,7 +378,10 @@ def track(
     if dl.skipped and not dl.dev_stub:
         console.print(f"[yellow]Skipped[/yellow] (already complete): {dl.path}")
     else:
-        console.print(f"[green]Done:[/green] {dl.path}")
+        suffix = ""
+        if result.lyrics_found:
+            suffix += "  [dim]lyrics embedded[/dim]"
+        console.print(f"[green]Done:[/green] {dl.path}{suffix}")
 
 
 @app.command()
@@ -411,25 +400,47 @@ def album(
     cfg  = _cfg()
     q    = _quality(quality)
     sess = _session(cfg)
-    try:
-        result = sess.download_album(
-            url_or_id,
-            quality=q,
-            dest_dir=output or Path(cfg.download.output_dir),
-            template=template,
-            embed_cover=cover,
-            fetch_lyrics_flag=lyrics,
-            save_cover_file=save_cover,
-            download_goodies=goodies if goodies is not None else True,
-            on_track_start=_on_track_start,
-            on_track_done=_on_track_done,
-            workers=workers,
-        )
-    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
-        _handle_auth_error(exc)
-    except APIError as exc:
-        err_console.print(f"[red]API error:[/red] {exc}")
-        raise typer.Exit(code=1)
+
+    # current_task holds the Rich task ID for the active track's progress bar.
+    # We use a list as a mutable container so the closures below can mutate it.
+    current_task: list = []
+
+    with _make_progress() as prog:
+
+        def on_progress(written: int, total: int) -> None:
+            if current_task:
+                prog.update(current_task[0], completed=written, total=total or None)
+
+        def on_track_start(title: str, index: int, total_tracks: int) -> None:
+            _on_track_start(title, index, total_tracks)
+            # Replace the progress bar for each new track.
+            if current_task:
+                prog.remove_task(current_task[0])
+                current_task.clear()
+            current_task.append(
+                prog.add_task(f"  [dim]{title[:60]}[/dim]", total=None)
+            )
+
+        try:
+            result = sess.download_album(
+                url_or_id,
+                quality=q,
+                dest_dir=output or Path(cfg.download.output_dir),
+                template=template,
+                embed_cover=cover,
+                fetch_lyrics_flag=lyrics,
+                save_cover_file=save_cover,
+                download_goodies=goodies if goodies is not None else True,
+                on_track_start=on_track_start,
+                on_track_done=_on_track_done,
+                on_progress=on_progress,
+                workers=workers,
+            )
+        except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+            _handle_auth_error(exc)
+        except APIError as exc:
+            err_console.print(f"[red]API error:[/red] {exc}")
+            raise typer.Exit(code=1)
 
     console.print(
         f"\n[green]Done.[/green] "
