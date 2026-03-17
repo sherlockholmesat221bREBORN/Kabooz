@@ -123,6 +123,15 @@ def _transcode(source: Path, dest: Path, codec: str, extra_args: list[str] | Non
     except subprocess.CalledProcessError:
         return False
 
+def _audio_cache_key(source: Path, extension: str, codec: str, extra_args: list[str] | None) -> str:
+    h = hashlib.md5()
+    h.update(source.read_bytes())  # small file → safe
+    h.update(extension.encode())
+    h.update(codec.encode())
+    if extra_args:
+        h.update(" ".join(extra_args).encode())
+    return h.hexdigest()
+
 
 def prepare_dev_audio(dest_path: Path) -> bool:
     """
@@ -142,12 +151,14 @@ def prepare_dev_audio(dest_path: Path) -> bool:
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Transcoded output is cached so ffmpeg only runs once per format.
-    cached_transcode = _AUDIO_CACHE_DIR / f"dev_audio{extension}"
+    key = _audio_cache_key(opus_source, extension, codec, extra_args)
+    cached_transcode = _AUDIO_CACHE_DIR / f"dev_audio_{key}{extension}"
+    
+    
 
     # ── Serve from transcode cache if available ────────────────────────────
-    if cached_transcode.exists():
-        shutil.copy2(cached_transcode, dest_path)
-        dev_log(f"dev audio (cached transcode) → {dest_path.name}")
+    if dest_path.exists() and dest_path.stat().st_size == cached_transcode.stat().st_size:
+        dev_log(f"dev audio already up-to-date → {dest_path.name}")
         return True
 
     opus_source = _embedded_opus()
@@ -163,8 +174,10 @@ def prepare_dev_audio(dest_path: Path) -> bool:
             extra_args = ["-q:a", "5"]
 
         _AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        if _transcode(opus_source, cached_transcode, codec, extra_args):
-            shutil.copy2(cached_transcode, dest_path)
+        tmp = cached_transcode.with_suffix(cached_transcode.suffix + ".tmp")
+
+        if _transcode(opus_source, tmp, codec, extra_args):
+            tmp.replace(cached_transcode)  # atomic rename
             dev_log(
                 f"dev audio (embedded opus → {extension[1:].upper()}) "
                 f"→ {dest_path.name}"

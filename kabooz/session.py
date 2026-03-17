@@ -912,13 +912,38 @@ class QobuzSession:
         """
         Download every release in an artist's discography.
 
+        All albums are rooted under <dest_dir>/<ArtistName>/ so that a
+        bare `qobuz artist 123` produces a clean, self-contained folder
+        rather than mixing albums from different artists in the same
+        directory.  The artist name used for the folder is the canonical
+        name returned by the API for the queried artist ID — not the
+        per-album albumartist field, which can vary across releases.
+
+        Template selection (when no explicit --template is passed):
+          · album / other  → naming.artist   (no {albumartist} prefix;
+                                              the artist folder is injected here)
+          · single         → naming.single   (flat, e.g. "Artist - Title")
+          · ep             → naming.ep
+          · compilation    → naming.compilation
+
         on_album_start(album_title, album_index, album_total) is fired
         before each album so the CLI/TUI can print a clear header.
         """
         from .dev import dev_log
 
+        cfg = self.config
         _, artist_id = self.resolve_id(url_or_id, "artist")
 
+        # ── Resolve artist name for the top-level folder ───────────────────
+        base_dest = dest_dir or Path(cfg.download.output_dir)
+        try:
+            artist_obj = self.client.get_artist(artist_id, extras="")
+            artist_dir = base_dest / sanitize(artist_obj.name)
+        except Exception as exc:
+            dev_log(f"[yellow]Could not fetch artist name ({exc}), using base dest[/yellow]")
+            artist_dir = base_dest
+
+        # ── Enumerate releases ─────────────────────────────────────────────
         try:
             releases = [
                 r for r in self.client.iter_releases(
@@ -944,12 +969,36 @@ class QobuzSession:
             if on_album_start:
                 on_album_start(album_obj.display_title, i, total)
 
+            # ── Per-release template selection ─────────────────────────────
+            # If the caller passed an explicit --template, always honour it.
+            # Otherwise choose based on release type:
+            #   · full album / unknown → naming.artist
+            #       (must NOT contain {albumartist}; the artist folder is
+            #        already provided by artist_dir above)
+            #   · single / ep / compilation → their own templates
+            #       (these don't start with {albumartist} by default, so
+            #        passing None lets download_album pick them normally)
+            if template:
+                effective_template: Optional[str] = template
+            else:
+                rtype = (album_obj.release_type or "album").lower()
+                if rtype == "single":
+                    effective_template = None   # → download_album uses naming.single
+                elif rtype == "ep":
+                    effective_template = None   # → download_album uses naming.ep
+                elif rtype == "compilation":
+                    effective_template = None   # → download_album uses naming.compilation
+                else:
+                    # Full album: suppress {albumartist} prefix since the
+                    # artist folder is already provided by artist_dir.
+                    effective_template = cfg.naming.artist
+
             try:
                 agg = self.download_album(
                     release.id,
                     quality=quality,
-                    dest_dir=dest_dir,
-                    template=template,
+                    dest_dir=artist_dir,
+                    template=effective_template,
                     on_track_start=on_track_start,
                     on_track_done=on_track_done,
                     workers=workers,
@@ -966,6 +1015,7 @@ class QobuzSession:
                 )
 
         return results
+
 
     def download_playlist(
         self,

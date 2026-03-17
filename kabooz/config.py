@@ -49,6 +49,9 @@ class NamingConfig:
     ep:          str = "{albumartist}/{album} [{quality}] [{year}]/{track:02d}. {title}"
     compilation: str = "{album} [{quality}] [{year}]/{track:02d}. {title}"
     playlist:    str = "{playlist} [{quality}]/{index:02d}. {title}"
+    # Used by `qobuz artist` — the artist folder itself is injected by the
+    # session layer, so this template must NOT start with {albumartist}.
+    artist:      str = "{album} [{quality}] [{year}]/{track:02d}. {title}"
 
 
 @dataclass
@@ -154,6 +157,7 @@ def validate_config(cfg: QobuzConfig) -> None:
         "naming.ep":          n.ep,
         "naming.compilation": n.compilation,
         "naming.playlist":    n.playlist,
+        "naming.artist":      n.artist,
     }.items():
         import string
         used = {
@@ -215,6 +219,7 @@ def load_config(path: Path = _CONFIG_PATH) -> QobuzConfig:
             ep          = n.get("ep",          cfg.naming.ep),
             compilation = n.get("compilation", cfg.naming.compilation),
             playlist    = n.get("playlist",    cfg.naming.playlist),
+            artist      = n.get("artist",      cfg.naming.artist),
         )
 
         m = raw.get("musicbrainz", {})
