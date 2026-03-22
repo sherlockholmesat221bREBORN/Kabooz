@@ -22,7 +22,6 @@ except ImportError:
     )
     sys.exit(1)
 
-from .client import QobuzClient
 from .config import (
     QobuzConfig, _CONFIG_PATH, _SESSION_PATH,
     load_config, save_config, update_config,
@@ -183,6 +182,7 @@ def login(
     2. Direct token:         qobuz login --token TOKEN --user-id 12345
     3. Token pool:           qobuz login --pool ~/.config/qobuz/pool.txt
     """
+    from .client import QobuzClient
     cfg = _cfg()
 
     if pool:
@@ -449,6 +449,324 @@ def album(
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Metadata and goodies
+# ══════════════════════════════════════════════════════════════════════════
+
+def _fmt_dur(seconds: int) -> str:
+    """Format an integer number of seconds as m:ss or h:mm:ss."""
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+@app.command()
+def info(
+    url_or_id:   str           = typer.Argument(..., help="Qobuz URL or bare ID"),
+    info_type:   Optional[str] = typer.Option(
+        None, "--type", "-t",
+        help="Entity type when passing a bare ID: album | track | artist",
+    ),
+    json_output: bool          = typer.Option(False, "--json", help="Output raw JSON"),
+) -> None:
+    """
+    Display metadata for an album, track, or artist — no download.
+
+    Entity type is auto-detected from Qobuz URLs. When passing a bare
+    numeric ID, use --type to specify album, track, or artist.
+
+    Examples
+    ────────
+      qobuz info https://open.qobuz.com/album/0093046758769
+      qobuz info 0093046758769 --type album
+      qobuz info https://open.qobuz.com/track/12345
+    """
+    from rich.panel import Panel
+
+    # ── Resolve entity type and ID ─────────────────────────────────────────
+    if url_or_id.startswith("http"):
+        try:
+            entity_type, entity_id = parse_url(url_or_id)
+        except ValueError as exc:
+            err_console.print(f"[red]Invalid URL:[/red] {exc}")
+            raise typer.Exit(code=1)
+    else:
+        if not info_type:
+            err_console.print(
+                "[red]Bare IDs require --type.[/red]  "
+                "Use: --type album | track | artist"
+            )
+            raise typer.Exit(code=1)
+        entity_type = info_type.lower()
+        entity_id   = url_or_id
+
+    sess = _session()
+
+    # ── Fetch ──────────────────────────────────────────────────────────────
+    try:
+        if entity_type == "album":
+            obj = sess.get_album(entity_id, limit=500)
+        elif entity_type == "track":
+            obj = sess.get_track(entity_id)
+        elif entity_type == "artist":
+            obj = sess.get_artist(entity_id, extras="albums", limit=50)
+        else:
+            err_console.print(
+                f"[red]Unknown type:[/red] {entity_type!r}. "
+                "Use album, track, or artist."
+            )
+            raise typer.Exit(code=1)
+    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+        _handle_auth_error(exc)
+    except NotFoundError:
+        err_console.print(f"[red]Not found:[/red] {entity_id}")
+        raise typer.Exit(code=1)
+    except APIError as exc:
+        err_console.print(f"[red]API error:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if json_output:
+        import json, dataclasses
+        console.print_json(json.dumps(dataclasses.asdict(obj), indent=2, default=str))
+        return
+
+    # ── Display ────────────────────────────────────────────────────────────
+    if entity_type == "album":
+        _display_album_info(obj)
+    elif entity_type == "track":
+        _display_track_info(obj)
+    elif entity_type == "artist":
+        _display_artist_info(obj)
+
+
+def _display_album_info(album) -> None:
+    from rich.panel import Panel
+    from rich.text  import Text
+
+    # ── Header panel ───────────────────────────────────────────────────────
+    artist = album.artist.name if album.artist else ""
+    label  = album.label.name  if album.label  else ""
+    genre  = album.genre.name  if album.genre  else (
+        album.genres_list[0] if album.genres_list else ""
+    )
+    year   = album.release_date_original[:4] if album.release_date_original else ""
+
+    from .download.naming import quality_tag
+    fmt = quality_tag(album.maximum_bit_depth, album.maximum_sampling_rate)
+
+    # Build subtitle line: artist · genre · year · label
+    meta_parts = [p for p in [artist, genre, year, label] if p]
+    meta_line  = "  ·  ".join(meta_parts)
+
+    flags = []
+    if album.hires:            flags.append("Hi-Res")
+    if album.hires_streamable: flags.append("Hi-Res Stream")
+    if album.downloadable:     flags.append("DL")
+    if album.parental_warning: flags.append("Explicit")
+    flag_line = "  ".join(f"[dim]{f}[/dim]" for f in flags)
+
+    goodies_line = ""
+    if album.goodies:
+        names = ", ".join(g.name or "file" for g in album.goodies)
+        goodies_line = f"\n  [bold]Goodies:[/bold] {len(album.goodies)} — {names}"
+
+    upc_line = f"  UPC [dim]{album.upc}[/dim]" if album.upc else ""
+
+    header = (
+        f"[bold]{album.display_title}[/bold]\n"
+        f"  {meta_line}\n"
+        f"  [cyan]{fmt}[/cyan]  ·  "
+        f"{album.tracks_count} track{'s' if album.tracks_count != 1 else ''}  ·  "
+        f"{_fmt_dur(album.duration)}"
+        + (f"\n  {flag_line}" if flag_line else "")
+        + (f"\n{upc_line}" if upc_line else "")
+        + goodies_line
+    )
+    console.print(Panel(header, expand=False, border_style="cyan"))
+
+    # ── Track listing ──────────────────────────────────────────────────────
+    if not album.tracks or not album.tracks.items:
+        console.print("[dim]No track data available.[/dim]")
+        return
+
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+    table.add_column("#",      style="dim",  no_wrap=True, width=4)
+    table.add_column("Title",  style="bold", ratio=4)
+    table.add_column("Dur",    style="dim",  no_wrap=True, width=6)
+    table.add_column("ISRC",   style="dim",  no_wrap=True, width=14)
+
+    for t in album.tracks.items:
+        num  = f"{t.track_number:02d}"
+        if album.media_count and album.media_count > 1:
+            num = f"{t.media_number}-{t.track_number:02d}"
+        table.add_row(
+            num,
+            t.display_title,
+            _fmt_dur(t.duration),
+            t.isrc or "",
+        )
+
+    console.print(table)
+    console.print(
+        f"\n[dim]ID: {album.id}"
+        + (f"  ·  Released: {album.release_date_original}" if album.release_date_original else "")
+        + "[/dim]"
+    )
+
+
+def _display_track_info(track) -> None:
+    from rich.panel import Panel
+    from .download.naming import quality_tag
+
+    artist  = track.performer.name if track.performer else ""
+    composer = track.composer.name if track.composer  else ""
+    album_t = ""
+    fmt     = ""
+    if track.album:
+        album_t = track.album.display_title
+        fmt = quality_tag(track.album.maximum_bit_depth, track.album.maximum_sampling_rate)
+
+    lines = [f"[bold]{track.display_title}[/bold]"]
+    if artist:
+        lines.append(f"  {artist}")
+    if composer and composer != artist:
+        lines.append(f"  [dim]Composer:[/dim] {composer}")
+    if track.work:
+        lines.append(f"  [dim]Work:[/dim] {track.work}")
+    if album_t:
+        lines.append(f"  [dim]Album:[/dim] {album_t}")
+
+    detail_parts = []
+    if track.track_number:
+        disc = f"Disc {track.media_number}  " if track.media_number and track.media_number > 1 else ""
+        detail_parts.append(f"{disc}Track {track.track_number}")
+    detail_parts.append(_fmt_dur(track.duration or 0))
+    if fmt:
+        detail_parts.append(f"[cyan]{fmt}[/cyan]")
+    if track.isrc:
+        detail_parts.append(f"ISRC [dim]{track.isrc}[/dim]")
+    lines.append("  " + "  ·  ".join(detail_parts))
+
+    flags = []
+    if track.hires:        flags.append("Hi-Res")
+    if track.downloadable: flags.append("DL")
+    if track.streamable:   flags.append("Stream")
+    if track.parental_warning: flags.append("Explicit")
+    if flags:
+        lines.append("  " + "  ".join(f"[dim]{f}[/dim]" for f in flags))
+
+    console.print(Panel("\n".join(lines), expand=False, border_style="cyan"))
+    console.print(f"[dim]ID: {track.id}[/dim]")
+
+
+def _display_artist_info(artist) -> None:
+    from rich.panel import Panel
+
+    header = f"[bold]{artist.name}[/bold]"
+    if artist.albums_count:
+        header += f"\n  {artist.albums_count} albums"
+
+    console.print(Panel(header, expand=False, border_style="cyan"))
+
+    if not artist.albums or not artist.albums.items:
+        console.print("[dim]No album data.[/dim]")
+        return
+
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1))
+    table.add_column("ID",    style="dim",  no_wrap=True, width=14)
+    table.add_column("Title", style="bold", ratio=4)
+    table.add_column("Year",  style="dim",  no_wrap=True, width=6)
+    table.add_column("Type",  style="dim",  no_wrap=True, width=12)
+
+    for a in artist.albums.items:
+        year = (a.release_date_original or "")[:4] if hasattr(a, "release_date_original") else ""
+        rtype = (getattr(a, "release_type", None) or "").capitalize()
+        table.add_row(str(a.id), a.display_title, year, rtype)
+
+    console.print(table)
+    console.print(f"[dim]ID: {artist.id}[/dim]")
+
+
+@app.command()
+def goodies(
+    url_or_id: str            = typer.Argument(..., help="Album URL or bare album ID"),
+    output:    Optional[Path] = typer.Option(None, "-o", "--output",
+                                             help="Destination directory"),
+) -> None:
+    """
+    Download only the bonus files (goodies) for an album.
+
+    Goodies are non-audio extras bundled with an album purchase —
+    typically a booklet PDF, but may also include hi-res videos or
+    other digital files. Audio tracks are not downloaded.
+
+    Files are placed in  <output>/<Album [Format] [Year]>/
+
+    Examples
+    ────────
+      qobuz goodies https://open.qobuz.com/album/0093046758769
+      qobuz goodies 0093046758769 -o ~/Downloads
+    """
+    cfg  = _cfg()
+    sess = _session(cfg)
+
+    try:
+        with _make_progress() as prog:
+            current: list = []
+
+            def on_progress(filename: str, done: int, total: int) -> None:
+                if not current:
+                    current.append(
+                        prog.add_task(f"  [dim]{filename[:60]}[/dim]", total=None)
+                    )
+                prog.update(current[0], completed=done, total=total or None)
+
+            def on_next(filename: str, done: int, total: int) -> None:
+                # Reset task for each new file
+                if current:
+                    prog.remove_task(current[0])
+                    current.clear()
+                on_progress(filename, done, total)
+
+            results = sess.download_album_goodies(
+                url_or_id,
+                dest_dir=output or Path(cfg.download.output_dir),
+                on_progress_each=on_next,
+            )
+    except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
+        _handle_auth_error(exc)
+    except NotFoundError:
+        err_console.print(f"[red]Album not found:[/red] {url_or_id}")
+        raise typer.Exit(code=1)
+    except APIError as exc:
+        err_console.print(f"[red]API error:[/red] {exc}")
+        raise typer.Exit(code=1)
+
+    if not results:
+        console.print("[yellow]This album has no goodies.[/yellow]")
+        return
+
+    ok      = [r for r in results if r.ok and not r.skipped]
+    skipped = [r for r in results if r.ok and r.skipped]
+    failed  = [r for r in results if not r.ok]
+
+    for r in ok:
+        console.print(f"[green]Downloaded:[/green] {r.path.name}")
+    for r in skipped:
+        console.print(f"[yellow]Skipped[/yellow] (already complete): {r.path.name}")
+    for r in failed:
+        console.print(f"[red]Failed:[/red] {r.goodie.name} — {r.error}")
+
+    console.print(
+        f"\n[green]Done.[/green] "
+        f"{len(ok)} downloaded, {len(skipped)} skipped"
+        + (f", [red]{len(failed)} failed[/red]" if failed else "")
+        + "."
+    )
+
+
 @app.command()
 def playlist(
     url_or_id:  str            = typer.Argument(...),
@@ -681,11 +999,21 @@ def search(
         raise typer.Exit(code=1)
 
     if json_output:
-        import json
-        console.print(json.dumps(results, indent=2, ensure_ascii=False))
+        import json, dataclasses
+        console.print_json(json.dumps(dataclasses.asdict(results), indent=2, default=str))
         return
 
-    items = results.get(search_type, {}).get("items", [])
+    # Pull items from the typed result object based on what was requested.
+    if search_type == "tracks":
+        page = results.tracks
+    elif search_type == "albums":
+        page = results.albums
+    elif search_type == "artists":
+        page = results.artists
+    else:
+        page = results.playlists
+
+    items = page.items if page else []
     if not items:
         console.print(f"No results for [bold]{query!r}[/bold].")
         return
@@ -696,35 +1024,43 @@ def search(
         table.add_column("Title", style="bold")
         table.add_column("Artist")
         table.add_column("Album", style="dim")
-        for i in items:
-            table.add_row(str(i.get("id", "")), i.get("title", ""),
-                          (i.get("performer") or {}).get("name", ""),
-                          (i.get("album") or {}).get("title", ""))
+        for t in items:
+            table.add_row(
+                str(t.id),
+                t.display_title,
+                t.performer.name if t.performer else "",
+                t.album.display_title if t.album else "",
+            )
     elif search_type == "albums":
         table.add_column("ID", style="dim", no_wrap=True)
         table.add_column("Title", style="bold")
         table.add_column("Artist")
         table.add_column("Year", style="dim")
-        for i in items:
-            table.add_row(str(i.get("id", "")), i.get("title", ""),
-                          (i.get("artist") or {}).get("name", ""),
-                          (i.get("release_date_original") or "")[:4])
+        for a in items:
+            table.add_row(
+                str(a.id),
+                a.display_title,
+                a.artist.name if a.artist else "",
+                (a.release_date_original or "")[:4],
+            )
     elif search_type == "artists":
         table.add_column("ID", style="dim", no_wrap=True)
         table.add_column("Name", style="bold")
         table.add_column("Albums", style="dim")
-        for i in items:
-            table.add_row(str(i.get("id", "")), i.get("name", ""),
-                          str(i.get("albums_count", "")))
+        for a in items:
+            table.add_row(str(a.id), a.name, str(a.albums_count or ""))
     elif search_type == "playlists":
         table.add_column("ID", style="dim", no_wrap=True)
         table.add_column("Name", style="bold")
         table.add_column("Tracks", style="dim")
         table.add_column("Owner")
-        for i in items:
-            table.add_row(str(i.get("id", "")), i.get("name", ""),
-                          str(i.get("tracks_count", "")),
-                          (i.get("owner") or {}).get("name", ""))
+        for p in items:
+            table.add_row(
+                str(p.id),
+                p.name,
+                str(p.tracks_count or ""),
+                p.owner.get("name", "") if isinstance(p.owner, dict) else "",
+            )
     console.print(table)
 
 
