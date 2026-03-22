@@ -43,10 +43,10 @@ def quality_tag(
     if not format_name:
         if bitrate_kbps:
             format_name = "MP3"
-        elif bit_depth or sampling_rate:
-            format_name = "FLAC"
         else:
-            format_name = "Unknown"
+            # Default to FLAC — even with no depth/rate info, bare FLAC is
+            # the correct label for a lossless file of unknown spec.
+            format_name = "FLAC"
 
     parts = [format_name.upper()]
 

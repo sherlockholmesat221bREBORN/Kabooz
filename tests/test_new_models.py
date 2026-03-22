@@ -275,7 +275,8 @@ def test_search_tracks_endpoint():
     )
     client = authed()
     result = client.search_tracks("beethoven")
-    assert "tracks" in result
+    assert result.total == 0
+    assert result.items == []
 
 
 @respx.mock
@@ -285,7 +286,8 @@ def test_search_albums_endpoint():
     )
     client = authed()
     result = client.search_albums("discovery")
-    assert "albums" in result
+    assert result.total == 0
+    assert result.items == []
 
 
 @respx.mock
@@ -299,7 +301,7 @@ def test_get_user_info_endpoint():
     )
     client = authed()
     info = client.get_user_info()
-    assert info["email"] == "test@example.com"
+    assert info.email == "test@example.com"
 
 
 @respx.mock

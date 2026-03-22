@@ -116,13 +116,6 @@ class LRCLibProvider:
             dev_log("lyrics: no synced lyrics and fallback disabled")
             return LyricsResult(found=False)
 
-        # ── Priority Logic ─────────────────────────────────────────────────
-        # If we have synced lyrics, we ditch the plain text to avoid redundancy.
-        if synced and plain:
-            dev_log("lyrics: both synced and plain found; discarding plain")
-            plain = None
-        # ───────────────────────────────────────────────────────────────────
-
         dev_log(
             f"lyrics: found via lrclib — "
             f"synced={'yes' if synced else 'no'} "

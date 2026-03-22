@@ -101,6 +101,12 @@ class Tagger:
         path = Path(path)
         suffix = path.suffix.lower()
 
+        # When called by session._post_download(), the file still has the
+        # .part extension (rename to final path happens after tagging).
+        # Strip .part to get the real audio format suffix.
+        if suffix == ".part":
+            suffix = Path(path.stem).suffix.lower()
+
         # ── Cover art ─────────────────────────────────────────────────────
         # FIX: Always call _fetch_cover() when embed_cover=True so the method
         # is interceptable by tests (and other callers) regardless of whether

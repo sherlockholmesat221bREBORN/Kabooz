@@ -31,6 +31,13 @@ from .models.playlist import Playlist
 from .models.release import Release, ReleasesList
 from .models.favorites import UserFavorites, UserFavoriteIds, LabelDetail
 from .models.user import UserProfile
+from .models.search import (
+    SearchResults,
+    TrackSearchResults,
+    AlbumSearchResults,
+    ArtistSearchResults,
+    PlaylistSearchResults,
+)
 
 _BASE_URL = "https://www.qobuz.com/api.json/0.2"
 
@@ -330,29 +337,24 @@ class QobuzClient:
 
         return body
 
-    def _handle_response_fixed(self, response):
+    def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
         """
-        Parse the HTTP response, raising typed exceptions for error statuses.
-        
-        FIX: On a 2xx response with invalid JSON (e.g. HTML maintenance page),
-        we now raise APIError immediately instead of returning {} and letting
-        callers crash with a confusing KeyError later.
+        Parse the HTTP response, raising typed exceptions for all error statuses.
+
+        On a 2xx response with non-JSON body (e.g. an HTML maintenance page),
+        APIError is raised immediately — callers must never receive an empty
+        dict that would cause a confusing KeyError later.
         """
         status = response.status_code
 
-        # Always try to parse JSON.  For error responses, the body carries
-        # a 'message' field we want to include in the exception.
         body: dict = {}
         if response.content:
             try:
                 body = response.json()
             except Exception:
                 if response.is_success:
-                    # A success status with non-JSON body is unexpected —
-                    # raise immediately so the caller sees a clear error.
                     raise APIError(
-                        f"Expected JSON response but got: "
-                        f"{response.text[:200]!r}",
+                        f"Expected JSON response but got: {response.text[:200]!r}",
                         status_code=status,
                     )
 
@@ -361,46 +363,19 @@ class QobuzClient:
             if "token" in message.lower():
                 raise TokenExpiredError(message)
             raise InvalidCredentialsError(message)
-    
+
         if status == 404:
             raise NotFoundError(body.get("message", "Not found."), status_code=status)
 
         if status == 429:
             raise RateLimitError("Rate limit hit. Back off and retry.", status_code=status)
-    
+
         if not response.is_success:
             raise APIError(
                 body.get("message", f"API error: HTTP {status}"),
                 status_code=status,
             )
         return body
-        
-    def _handle_response(self, response: httpx.Response) -> dict[str, Any]:
-        try:
-            body = response.json()
-        except Exception:
-            body = {}
-
-        status = response.status_code
-
-        if status == 401:
-            message = body.get("message", "Unauthorized")
-            if "token" in message.lower():
-                raise TokenExpiredError(message)
-            raise InvalidCredentialsError(message)
-
-        if status == 404:
-            raise NotFoundError(body.get("message", "Not found."), status_code=status)
-
-        if status == 429:
-            raise RateLimitError("Rate limit hit. Back off and retry.", status_code=status)
-
-        if not response.is_success:
-            raise APIError(
-                body.get("message", f"API error: HTTP {status}"),
-                status_code=status,
-            )
-        return body    
 
 
     # ── Request signing ────────────────────────────────────────────────────
@@ -586,57 +561,96 @@ class QobuzClient:
         type: str = "tracks",
         limit: int = 25,
         offset: int = 0,
-    ) -> dict:
+    ) -> SearchResults:
         """
         Search the Qobuz catalog.
-        type: 'tracks', 'albums', 'artists', 'playlists', 'articles',
-              'focus', 'stories'.
+
+        Parameters:
+            query:  Search string.
+            type:   Result types to include. One of: 'tracks', 'albums',
+                    'artists', 'playlists', 'articles', 'focus', 'stories'.
+                    Pass a comma-separated list to request multiple types.
+            limit:  Max results per type (default 25).
+            offset: Offset into results (for pagination).
+
+        Returns a :class:`SearchResults` object with typed ``tracks``,
+        ``albums``, ``artists``, and ``playlists`` pages.
         """
-        return self._request(
+        data = self._request(
             "GET", "/catalog/search",
             params={"query": query, "type": type, "limit": limit, "offset": offset},
         )
+        return SearchResults.from_dict(data)
 
-    def search_tracks(self, query: str, limit: int = 50, offset: int = 0) -> dict:
-        """Search tracks via the dedicated /track/search endpoint."""
-        return self._request(
+    def search_tracks(self, query: str, limit: int = 50, offset: int = 0) -> TrackSearchResults:
+        """
+        Search tracks via the dedicated ``/track/search`` endpoint.
+
+        Returns a :class:`TrackSearchResults` with a typed ``.items`` list
+        of :class:`~kabooz.models.track.Track` objects.
+        """
+        data = self._request(
             "GET", "/track/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
+        return TrackSearchResults.from_dict(data)
 
-    def search_albums(self, query: str, limit: int = 50, offset: int = 0) -> dict:
-        """Search albums via the dedicated /album/search endpoint."""
-        return self._request(
+    def search_albums(self, query: str, limit: int = 50, offset: int = 0) -> AlbumSearchResults:
+        """
+        Search albums via the dedicated ``/album/search`` endpoint.
+
+        Returns a :class:`AlbumSearchResults` with a typed ``.items`` list
+        of :class:`~kabooz.models.album.Album` objects.
+        """
+        data = self._request(
             "GET", "/album/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
+        return AlbumSearchResults.from_dict(data)
 
-    def search_artists(self, query: str, limit: int = 50, offset: int = 0) -> dict:
-        """Search artists via the dedicated /artist/search endpoint."""
-        return self._request(
+    def search_artists(self, query: str, limit: int = 50, offset: int = 0) -> ArtistSearchResults:
+        """
+        Search artists via the dedicated ``/artist/search`` endpoint.
+
+        Returns a :class:`ArtistSearchResults` with a typed ``.items`` list
+        of :class:`~kabooz.models.artist.Artist` objects.
+        """
+        data = self._request(
             "GET", "/artist/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
+        return ArtistSearchResults.from_dict(data)
 
-    def search_playlists(self, query: str, limit: int = 50, offset: int = 0) -> dict:
-        """Search playlists via the dedicated /playlist/search endpoint."""
-        return self._request(
+    def search_playlists(self, query: str, limit: int = 50, offset: int = 0) -> PlaylistSearchResults:
+        """
+        Search playlists via the dedicated ``/playlist/search`` endpoint.
+
+        Returns a :class:`PlaylistSearchResults` with a typed ``.items`` list
+        of :class:`~kabooz.models.playlist.Playlist` objects.
+        """
+        data = self._request(
             "GET", "/playlist/search",
             params={"query": query, "limit": limit, "offset": offset},
         )
+        return PlaylistSearchResults.from_dict(data)
 
     # ── User library — reads ───────────────────────────────────────────────
 
-    def _build_favorite_params_fixed(track_ids, album_ids, artist_ids):
-        """Build params dict omitting keys with empty values."""
+    @staticmethod
+    def _build_favorite_params(
+        track_ids: Optional[list] = None,
+        album_ids: Optional[list] = None,
+        artist_ids: Optional[list] = None,
+    ) -> dict:
+        """Build params dict for favorite create/delete endpoints."""
         params = {}
         if track_ids:
             params["track_ids"]  = ",".join(str(i) for i in track_ids)
-            if album_ids:
-                params["album_ids"]  = ",".join(str(i) for i in album_ids)
-            if artist_ids:
-                params["artist_ids"] = ",".join(str(i) for i in artist_ids)
-            return params
+        if album_ids:
+            params["album_ids"]  = ",".join(str(i) for i in album_ids)
+        if artist_ids:
+            params["artist_ids"] = ",".join(str(i) for i in artist_ids)
+        return params
     
     def get_user_favorites(
         self,
@@ -714,7 +728,7 @@ class QobuzClient:
         self._guard_write("add_favorite")
         if not any([track_ids, album_ids, artist_ids]):
             raise ValueError("At least one of track_ids, album_ids, or artist_ids must be provided.")
-        a_params_fixed(track_ids, album_ids, artist_ids)
+        params = self._build_favorite_params(track_ids, album_ids, artist_ids)
         return self._request("GET", "/favorite/create", params=params)
 
     def remove_favorite(
@@ -731,7 +745,7 @@ class QobuzClient:
         self._guard_write("remove_favorite")
         if not any([track_ids, album_ids, artist_ids]):
             raise ValueError("At least one of track_ids, album_ids, or artist_ids must be provided.")
-        a_params_fixed(track_ids, album_ids, artist_ids)
+        params = self._build_favorite_params(track_ids, album_ids, artist_ids)
         return self._request("GET", "/favorite/delete", params=params)
 
     # ── Stream endpoint ────────────────────────────────────────────────────

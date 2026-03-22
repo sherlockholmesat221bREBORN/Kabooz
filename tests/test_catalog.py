@@ -109,7 +109,7 @@ def test_search_returns_results():
     )
     client = authenticated_client()
     results = client.search("daft punk", type="tracks")
-    assert results["query"] == "daft punk"
+    assert results.query == "daft punk"
 
 
 # ── get_track_url ──────────────────────────────────────────────────────────

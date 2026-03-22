@@ -150,9 +150,12 @@ class Track:
         return cls(
             id=data["id"],
             title=data["title"],
-            duration=data["duration"],
-            track_number=data["track_number"],
-            media_number=data["media_number"],
+            # Search results return partial track objects that omit these fields.
+            # Use .get() with sensible defaults so Track.from_dict works for both
+            # full /track/get responses and lightweight /catalog/search items.
+            duration=data.get("duration", 0),
+            track_number=data.get("track_number", 0),
+            media_number=data.get("media_number", 1),
             version=data.get("version"),
             isrc=data.get("isrc"),
             copyright=data.get("copyright"),

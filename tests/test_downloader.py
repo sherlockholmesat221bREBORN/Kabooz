@@ -201,7 +201,10 @@ def test_download_fresh(tmp_path):
     )
     downloader = Downloader()
     result = downloader._download_to_path(FAKE_URL, dest, None)
-    assert dest.read_bytes() == FAKE_CONTENT
+    # _download_to_path writes to <dest>.part — session._finalise() does the rename.
+    assert result.path == Path(str(dest) + ".part")
+    assert result.path.read_bytes() == FAKE_CONTENT
+    assert not dest.exists()          # final path not yet created
     assert result.skipped is False
     assert result.resumed is False
     assert result.bytes_written == len(FAKE_CONTENT)
@@ -228,7 +231,9 @@ def test_download_resumes_partial_file(tmp_path):
     partial = FAKE_CONTENT[:50]
     remaining = FAKE_CONTENT[50:]
     dest = tmp_path / "track.flac"
-    dest.write_bytes(partial)
+    # Write partial bytes to the .part file — that is what the downloader resumes from.
+    part = Path(str(dest) + ".part")
+    part.write_bytes(partial)
 
     respx.head(FAKE_URL).mock(
         return_value=httpx.Response(
@@ -247,7 +252,7 @@ def test_download_resumes_partial_file(tmp_path):
     result = downloader._download_to_path(FAKE_URL, dest, None)
     assert result.resumed is True
     assert result.bytes_written == len(remaining)
-    assert dest.read_bytes() == FAKE_CONTENT
+    assert result.path.read_bytes() == FAKE_CONTENT
 
 
 @respx.mock
