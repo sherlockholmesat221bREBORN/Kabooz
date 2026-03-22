@@ -17,7 +17,7 @@ try:
 except ImportError:
     print(
         "CLI dependencies are not installed.\n"
-        "Run: pip install 'qobuz-py[cli]'",
+        "Run: pip install 'kabooz[cli]'",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -37,7 +37,7 @@ from .url import parse_url
 
 # ── Sub-apps ───────────────────────────────────────────────────────────────
 
-app         = typer.Typer(name="qobuz", add_completion=False,
+app         = typer.Typer(name="kabooz", add_completion=False,
                           help="Unofficial Qobuz CLI.")
 library_app = typer.Typer(help="Manage local and remote favourites.")
 lpl_app     = typer.Typer(help="Create, manage, and share local playlists.")
@@ -122,11 +122,70 @@ def _on_album_start(title: str, index: int, total: int) -> None:
 
 # ── Global callback ────────────────────────────────────────────────────────
 
+
+def _version_callback(value: bool) -> None:
+    if value:
+        try:
+            from importlib.metadata import version
+            v = version("kabooz")
+        except Exception:
+            v = "0.1.0"
+        console.print(f"[bold]Kabooz[/bold] v{v}")
+        raise typer.Exit()
+
+
+def _credits_callback(value: bool) -> None:
+    if not value:
+        return
+    from rich.panel import Panel
+    lines = [
+        "[bold]Kabooz[/bold] — unofficial Qobuz client\n",
+        "[bold cyan]A word on Qobuz[/bold cyan]",
+        "  This tool exists because Qobuz is genuinely one of the best",
+        "  things to happen to music. Hi-res lossless, a serious catalog,",
+        "  no ads, fair artist payouts — it deserves your subscription.",
+        "  [dim]https://www.qobuz.com[/dim]\n",
+        "[bold cyan]Technical thanks[/bold cyan]",
+        "  [bold]tmxkwpn[/bold]  (@tmxkwpn on Telegram) — technical help and guidance\n",
+        "[bold cyan]Services used[/bold cyan]",
+        "  [bold]MusicBrainz[/bold]   musicbrainz.org — open music encyclopedia,",
+        "                    used for ISRC lookup and tag enrichment",
+        "  [bold]LRCLIB[/bold]        lrclib.net — free, open synced lyrics database\n",
+        "[bold cyan]Built with[/bold cyan]",
+        "  [bold]httpx[/bold]         HTTP client            github.com/encode/httpx",
+        "  [bold]mutagen[/bold]       audio metadata         github.com/quodlibet/mutagen",
+        "  [bold]Typer[/bold]         CLI framework          github.com/tiangolo/typer",
+        "  [bold]Rich[/bold]          terminal formatting    github.com/Textualize/rich",
+        "  [bold]tomli-w[/bold]       TOML writer            github.com/hukkin/tomli-w\n",
+        "[bold cyan]Tinker, extend, improve[/bold cyan]",
+        "  Kabooz is intentionally designed to be hackable. The business",
+        "  logic lives entirely in session.py, models are plain dataclasses,",
+        "  and the CLI is a thin presentation layer over the library.",
+        "  If something is missing, slow, or broken — please add it.",
+        "  PRs, forks, and feature branches are all welcome.\n",
+        "[bold cyan]License[/bold cyan]",
+        "  AGPL-3.0-or-later\n",
+        "[dim]Kabooz is not affiliated with, endorsed by, or connected",
+        "to Qobuz or any of the services listed above.[/dim]",
+    ]
+    console.print(Panel("\n".join(lines), expand=False, border_style="cyan"))
+    raise typer.Exit()
+
 @app.callback()
 def main(
     dev: bool = typer.Option(
-        False, "--dev", envvar="QOBUZ_DEV", is_eager=True,
+        False, "--dev", envvar="KABOOZ_DEV", is_eager=True,
         help="Developer mode: cache API responses, write dev audio.",
+    ),
+    version: bool = typer.Option(
+        False, "--version", "-V", is_eager=True,
+        callback=_version_callback, expose_value=False,
+        help="Show version and exit.",
+    ),
+    credits: bool = typer.Option(
+        False, "--credits", is_eager=True,
+        callback=_credits_callback, expose_value=False,
+        help="Show credits and exit.",
     ),
 ) -> None:
     """Unofficial Qobuz CLI."""
@@ -265,10 +324,10 @@ def config(
 
     \b
     Examples:
-        qobuz config --show
-        qobuz config --set download.max_workers=4
-        qobuz config --set streaming.report_streams=false
-        qobuz config --set download.quality=flac_16
+        kabooz config --show
+        kabooz config --set download.max_workers=4
+        kabooz config --set streaming.report_streams=false
+        kabooz config --set download.quality=flac_16
     """
     if show:
         import dataclasses, json
@@ -479,9 +538,9 @@ def info(
 
     Examples
     ────────
-      qobuz info https://open.qobuz.com/album/0093046758769
-      qobuz info 0093046758769 --type album
-      qobuz info https://open.qobuz.com/track/12345
+      kabooz info https://open.qobuz.com/album/0093046758769
+      kabooz info 0093046758769 --type album
+      kabooz info https://open.qobuz.com/track/12345
     """
     from rich.panel import Panel
 
@@ -706,8 +765,8 @@ def goodies(
 
     Examples
     ────────
-      qobuz goodies https://open.qobuz.com/album/0093046758769
-      qobuz goodies 0093046758769 -o ~/Downloads
+      kabooz goodies https://open.qobuz.com/album/0093046758769
+      kabooz goodies 0093046758769 -o ~/Downloads
     """
     cfg  = _cfg()
     sess = _session(cfg)
@@ -828,9 +887,9 @@ def artist(
 
     \b
     Examples:
-        qobuz artist 298
-        qobuz artist https://open.qobuz.com/artist/298 --type album
-        qobuz artist 298 --type album,live -q flac_16
+        kabooz artist 298
+        kabooz artist https://open.qobuz.com/artist/298 --type album
+        kabooz artist 298 --type album,live -q flac_16
     """
     cfg  = _cfg()
     q    = _quality(quality)
@@ -899,8 +958,8 @@ def favorites(
 
     \b
     Examples:
-        qobuz favorites
-        qobuz favorites --type albums -q flac_16
+        kabooz favorites
+        kabooz favorites --type albums -q flac_16
     """
     if fav_type not in ("tracks", "albums"):
         err_console.print("[red]--type must be 'tracks' or 'albums'[/red]")

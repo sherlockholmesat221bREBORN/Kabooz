@@ -31,7 +31,7 @@ all = [
 ]
 
 [project.scripts]
-qobuz = "kabooz.cli:app"
+kabooz = "kabooz.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["kabooz"]
