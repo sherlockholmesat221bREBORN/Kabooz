@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "qobuz-py"
+name = "kabooz"
 version = "0.1.0"
 description = "Unofficial Qobuz API client with CLI, local library, and download pipeline"
 readme = "README.md"
