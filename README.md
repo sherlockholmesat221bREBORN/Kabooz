@@ -39,12 +39,6 @@ that every operation available in the CLI is equally callable from Python.
 pip install 'kabooz[cli]'
 ```
 
-Requires Python 3.11+. On Termux:
-
-```bash
-pip install 'kabooz[cli]' --break-system-packages
-```
-
 See [docs/installation.md](docs/installation.md) for more, including editable
 development installs.
 

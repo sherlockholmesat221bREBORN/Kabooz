@@ -41,16 +41,3 @@ kabooz --version
 | Synced lyrics | Set `tagging.fetch_lyrics = true` in config — no extra packages needed |
 | External downloader (aria2c, wget) | Install the tool separately; set `download.external_downloader` in config |
 
-## Termux (Android)
-
-```bash
-pip install 'kabooz[cli]' --break-system-packages
-```
-
-Ensure `$PREFIX/bin` is in your `PATH`:
-
-```bash
-echo 'export PATH="$PREFIX/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
-
