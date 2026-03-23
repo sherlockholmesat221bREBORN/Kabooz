@@ -1,6 +1,6 @@
 # kabooz/local/playlist.py
 """
-Shareable TOML playlist format for qobuz-py.
+Shareable TOML playlist format for kabooz.
 
 A playlist file is a self-contained, human-readable TOML document that
 can be shared between users. Importing it creates a local playlist in
@@ -8,7 +8,7 @@ the user's store without needing a Qobuz account.
 
 File format (version 1):
 ────────────────────────
-    # qobuz-playlist v1
+    # kabooz-playlist v1
     [playlist]
     name        = "Evening Classical"
     description = "Quiet pieces for the evening"
@@ -46,7 +46,7 @@ from typing import Optional
 import tomli_w
 
 PLAYLIST_VERSION = "1"
-_MAGIC_COMMENT   = "# qobuz-playlist v1\n"
+_MAGIC_COMMENT   = "# kabooz-playlist v1\n"
 
 
 @dataclass
@@ -164,7 +164,7 @@ def load_playlist(path: str | Path) -> LocalPlaylist:
     Strips the magic comment before parsing, so files saved by
     save_playlist() are loaded correctly.
 
-    Raises ValueError if the file is not a valid qobuz-playlist.
+    Raises ValueError if the file is not a valid kabooz-playlist.
     Raises FileNotFoundError if the path doesn't exist.
     """
     path = Path(path)
@@ -177,11 +177,11 @@ def load_playlist(path: str | Path) -> LocalPlaylist:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        raise ValueError(f"Not a valid qobuz-playlist file: {exc}") from exc
+        raise ValueError(f"Not a valid kabooz-playlist file: {exc}") from exc
 
     if "playlist" not in data:
         raise ValueError(
-            "Not a valid qobuz-playlist file: missing [playlist] section."
+            "Not a valid kabooz-playlist file: missing [playlist] section."
         )
 
     return LocalPlaylist.from_dict(data)

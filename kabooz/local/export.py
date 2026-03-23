@@ -7,7 +7,7 @@ tomllib, pathlib). No external compression tools required.
 
 Backup archive layout
 ─────────────────────
-qobuz-backup-{date}/
+kabooz-backup-{date}/
 ├── library.db              — full SQLite database
 ├── config.toml             — config with secrets stripped
 ├── playlists/
@@ -27,7 +27,7 @@ Export functions
 Import functions
 ────────────────
     import_favorites_toml()  — load favorites from an exported TOML file
-    import_playlist_toml()   — load a single qobuz-playlist TOML into the store
+    import_playlist_toml()   — load a single kabooz-playlist TOML into the store
     restore_from_tar()       — selective or full restore from a backup archive
 """
 from __future__ import annotations
@@ -79,7 +79,7 @@ def backup_to_tar(
     Create a full backup archive at output_path (.tar.gz).
 
     If output_path is None, writes to the store's parent directory as
-    qobuz-backup-{YYYY-MM-DD}.tar.gz.
+    kabooz-backup-{YYYY-MM-DD}.tar.gz.
 
     Parameters:
         store:         An open LocalStore instance.
@@ -90,7 +90,7 @@ def backup_to_tar(
     Returns the path of the written archive.
     """
     db_path = store._path
-    prefix  = f"qobuz-backup-{_now_date()}"
+    prefix  = f"kabooz-backup-{_now_date()}"
 
     if output_path is None:
         output_path = db_path.parent / f"{prefix}.tar.gz"
@@ -184,7 +184,7 @@ def backup_to_tar(
                         isrc=t.get("isrc") or "",
                     ))
 
-                body = "# qobuz-playlist v1\n" + tomli_w.dumps(pl.to_dict())
+                body = "# kabooz-playlist v1\n" + tomli_w.dumps(pl.to_dict())
                 safe_name = "".join(
                     c if c.isalnum() or c in "._- " else "_"
                     for c in pl_name
@@ -243,7 +243,7 @@ def export_favorites_toml(
             data[f"{t}s"] = clean
 
     output_path.write_text(
-        "# qobuz-py favorites export\n" + tomli_w.dumps(data),
+        "# kabooz favorites export\n" + tomli_w.dumps(data),
         encoding="utf-8",
     )
     return output_path
@@ -321,11 +321,11 @@ def import_playlist_toml(
     overwrite: bool = False,
 ) -> Optional[str]:
     """
-    Import a single qobuz-playlist TOML file into the local store.
+    Import a single kabooz-playlist TOML file into the local store.
 
     Parameters:
         store:     An open LocalStore instance.
-        path:      Path to a qobuz-playlist TOML file (saved by save_playlist).
+        path:      Path to a kabooz-playlist TOML file (saved by save_playlist).
         overwrite: If True, delete any existing playlist with the same name
                    before importing so the new tracks replace the old ones.
                    If False (default), a playlist with the same name is left
@@ -333,7 +333,7 @@ def import_playlist_toml(
 
     Returns the playlist_id string of the newly created playlist,
     or None if the playlist was skipped because it already exists.
-    Raises ValueError if the file is not a valid qobuz-playlist TOML.
+    Raises ValueError if the file is not a valid kabooz-playlist TOML.
     Raises FileNotFoundError if path does not exist.
     """
     from .playlist import load_playlist

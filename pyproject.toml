@@ -9,6 +9,21 @@ description = "Unofficial Qobuz API client with CLI, local library, and download
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
+authors = [
+    { name = "sherlockholmesat221b", email = "sherlockholmesat221b@proton.me"},
+]
+keywords = ["qobuz", "music", "audio", "download", "hi-res", "flac", "audiophile", "kabooz"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+]
 
 dependencies = [
     "httpx>=0.27",
@@ -24,11 +39,14 @@ cli = [
 dev = [
     "pytest>=8",
     "respx>=0.21",
-    "httpx>=0.27",
 ]
 all = [
-    "qobuz-py[cli,dev]",
+    "kabooz[cli,dev]",
 ]
+
+[project.urls]
+Repository = "https://github.com/sherlockholmesat21bREBORN/kabooz"
+Issues = "https://github.com/sherlockholmesat221bREBORN/kabooz/issues"
 
 [project.scripts]
 kabooz = "kabooz.cli:app"

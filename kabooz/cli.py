@@ -17,7 +17,7 @@ try:
 except ImportError:
     print(
         "CLI dependencies are not installed.\n"
-        "Run: pip install 'qobuz-py[cli]'",
+        "Run: pip install 'kabooz[cli]'",
         file=sys.stderr,
     )
     sys.exit(1)
