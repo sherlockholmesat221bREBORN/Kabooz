@@ -939,6 +939,102 @@ class QobuzSession:
                         agg.goodies_failed += 1
 
         return agg
+        
+    def download_album_goodies(
+        self,
+        url_or_id: str,
+        dest_dir:  Optional[Path] = None,
+        on_progress_each: Optional[Callable[[str, int, int], None]] = None,
+    ) -> list:
+        """
+        Download only the bonus files (goodies) for an album.
+
+        Goodies are non-audio extras bundled with an album — typically a
+        booklet PDF, but may also be hi-res videos or other digital files.
+        They are placed in ``<dest_dir>/<Album [Format] [Year]>/``.
+
+        Parameters:
+            on_progress_each: Called for each goodie as it downloads:
+                              (filename, bytes_done, total_bytes).
+
+        Returns a list of GoodieResult objects. Empty list if no goodies.
+        """
+        from .download.downloader import Downloader
+        from .download.naming import quality_tag
+
+        cfg = self.config
+        _, album_id = self.resolve_id(url_or_id, "album")
+        dest = dest_dir or Path(cfg.download.output_dir)
+
+        album_obj = self.client.get_album(album_id)
+        if not album_obj.goodies:
+            return []
+
+        # Mirror the folder name that download_album would create so goodies
+        # land next to any already-downloaded audio files.
+        qtag = quality_tag(
+            album_obj.maximum_bit_depth,
+            album_obj.maximum_sampling_rate,
+        )
+        year = (
+            f" [{album_obj.release_date_original[:4]}]"
+            if album_obj.release_date_original else ""
+        )
+        album_dir = dest / sanitize(
+            f"{album_obj.display_title} [{qtag}]{year}"
+        )
+        album_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Pre-compute deduplicated filenames ─────────────────────────────
+        # On case-insensitive filesystems (Android, macOS) two goodies whose
+        # sanitized names differ only in case would collide.  We resolve
+        # clashes upfront so every goodie gets a unique path.
+        def _goodie_filename(goodie) -> str:
+            url = goodie.original_url or goodie.url or ""
+            url_filename = url.split("?")[0].rstrip("/").split("/")[-1]
+            ext = ""
+            if "." in url_filename:
+                ext = "." + url_filename.rsplit(".", 1)[-1].lower()
+            base = sanitize(goodie.name) if goodie.name else (
+                sanitize(url_filename) if url_filename else f"goodie_{goodie.id}"
+            )
+            return base + ext
+
+        used: dict[str, int] = {}
+        dest_paths: list[Path] = []
+        for goodie in album_obj.goodies:
+            name = _goodie_filename(goodie)
+            stem, _, ext = name.rpartition(".")
+            ext = ("." + ext) if ext else ""
+            key = stem.lower()
+            if key in used:
+                used[key] += 1
+                unique_name = f"{stem} ({used[key]}){ext}"
+            else:
+                used[key] = 1
+                unique_name = name
+            dest_paths.append(album_dir / unique_name)
+
+        # ── Download ───────────────────────────────────────────────────────
+        results = []
+        with Downloader(
+            read_timeout=cfg.download.read_timeout,
+            connect_timeout=cfg.download.connect_timeout,
+            dev=self._dev,
+        ) as dl:
+            for goodie, path in zip(album_obj.goodies, dest_paths):
+                progress_cb = None
+                if on_progress_each:
+                    name = path.name
+                    progress_cb = lambda done, total, n=name: on_progress_each(n, done, total)
+                gr = dl.download_goodie(
+                    goodie, album_dir,
+                    on_progress=progress_cb,
+                    dest_path=path,
+                )
+                results.append(gr)
+
+        return results    
 
     def download_artist_discography(
         self,
