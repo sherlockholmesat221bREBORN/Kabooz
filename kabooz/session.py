@@ -25,7 +25,7 @@ from typing import Any, Callable, Generator, Optional
 
 from .client import QobuzClient
 from .config import QobuzConfig, _CONFIG_PATH, _SESSION_PATH, load_config
-from .download.downloader import Downloader, DownloadResult
+from .download.downloader import Downloader, DownloadResult, GoodieResult
 from .download.lyrics import fetch_lyrics
 from .download.musicbrainz import lookup_isrc, apply_mb_tags
 from .download.naming import sanitize
@@ -1027,12 +1027,21 @@ class QobuzSession:
                 if on_progress_each:
                     name = path.name
                     progress_cb = lambda done, total, n=name: on_progress_each(n, done, total)
-                gr = dl.download_goodie(
-                    goodie, album_dir,
-                    on_progress=progress_cb,
-                    dest_path=path,
-                )
-                results.append(gr)
+                url = goodie.original_url or goodie.url
+                if not url:
+                    results.append(GoodieResult(
+                        path=path, goodie=goodie, error="No URL available",
+                    ))
+                    continue
+                try:
+                    r = dl._download_goodie_to_path(url, path, progress_cb)
+                    results.append(GoodieResult(
+                        path=r.path, goodie=goodie, skipped=r.skipped,
+                    ))
+                except Exception as exc:
+                    results.append(GoodieResult(
+                        path=path, goodie=goodie, error=str(exc),
+                    ))
 
         return results    
 
