@@ -160,6 +160,7 @@ class PlaylistDownloadResult:
 ProgressCallback   = Callable[[int, int], None]           # (bytes_done, total_bytes)
 TrackStartCallback = Callable[[str, int, int], None]       # (title, index, total)
 TrackDoneCallback  = Callable[[TrackDownloadResult], None]
+TrackFailCallback  = Callable[[str, str], None]           # (title, reason)
 AlbumStartCallback = Callable[[str, int, int], None]       # (title, index, total)
 
 
@@ -837,6 +838,7 @@ class QobuzSession:
         download_goodies:  bool              = True,
         on_track_start:    Optional[TrackStartCallback] = None,
         on_track_done:     Optional[TrackDoneCallback]  = None,
+        on_track_fail:     Optional[TrackFailCallback]  = None,
         on_progress:       Optional[ProgressCallback]   = None,
         workers:           Optional[int]     = None,
         external_downloader: Optional[str]   = None,
@@ -892,15 +894,21 @@ class QobuzSession:
                 try:
                     track_obj = self.client.get_track(str(summary.id))
                     url_info  = self.client.get_track_url(str(track_obj.id), quality=q)
-                except NotStreamableError as exc:
+                except (NotStreamableError, NotFoundError) as exc:
                     _title = getattr(summary, "display_title", getattr(summary, "title", str(summary.id)))
-                    dev_log(f"[yellow]track {summary.id} not streamable: {exc}[/yellow]")
-                    agg.failed.append(f"{_title} — not streamable")
+                    dev_log(f"[yellow]track {summary.id} not streamable/found: {exc}[/yellow]")
+                    _reason = str(exc)
+                    agg.failed.append(f"{_title} — {_reason}")
+                    if on_track_fail:
+                        on_track_fail(_title, _reason)
                     continue
                 except APIError as exc:
                     _title = getattr(summary, "display_title", getattr(summary, "title", str(summary.id)))
                     dev_log(f"[red]track {summary.id} API error: {exc}[/red]")
-                    agg.failed.append(f"{_title} — API error: {exc}")
+                    _reason = f"API error: {exc}"
+                    agg.failed.append(f"{_title} — {_reason}")
+                    if on_track_fail:
+                        on_track_fail(_title, _reason)
                     continue
 
                 try:
@@ -910,7 +918,10 @@ class QobuzSession:
                     )
                 except Exception as exc:
                     dev_log(f"[red]track {track_obj.id} download error: {exc}[/red]")
-                    agg.failed.append(f"{track_obj.display_title} — {type(exc).__name__}: {exc}")
+                    _reason = f"{type(exc).__name__}: {exc}"
+                    agg.failed.append(f"{track_obj.display_title} — {_reason}")
+                    if on_track_fail:
+                        on_track_fail(track_obj.display_title, _reason)
                     continue
 
                 track_results.append(dl_result)
@@ -1057,6 +1068,7 @@ class QobuzSession:
         on_album_start: Optional[AlbumStartCallback] = None,
         on_track_start: Optional[TrackStartCallback] = None,
         on_track_done:  Optional[TrackDoneCallback]  = None,
+        on_track_fail:  Optional[TrackFailCallback]  = None,
         workers:        Optional[int]    = None,
     ) -> list[AlbumDownloadResult]:
         """
@@ -1140,6 +1152,7 @@ class QobuzSession:
                     template=effective_template,
                     on_track_start=on_track_start,
                     on_track_done=on_track_done,
+                    on_track_fail=on_track_fail,
                     workers=workers,
                 )
                 results.append(agg)
@@ -1166,6 +1179,7 @@ class QobuzSession:
         save_cover_file:   Optional[bool]    = None,
         on_track_start:    Optional[TrackStartCallback] = None,
         on_track_done:     Optional[TrackDoneCallback]  = None,
+        on_track_fail:     Optional[TrackFailCallback]  = None,
         on_progress:       Optional[ProgressCallback]   = None,
         workers:           Optional[int]     = None,
         external_downloader: Optional[str]   = None,
@@ -1208,7 +1222,10 @@ class QobuzSession:
                             pass
                     url_info = self.client.get_track_url(str(track_obj.id), quality=q)
                 except (NotStreamableError, APIError) as exc:
-                    agg.failed.append(f"{summary.title} — {exc}")
+                    _reason = str(exc)
+                    agg.failed.append(f"{summary.title} — {_reason}")
+                    if on_track_fail:
+                        on_track_fail(summary.title, _reason)
                     continue
 
                 try:
@@ -1218,7 +1235,10 @@ class QobuzSession:
                         playlist_name=pl.name, playlist_index=i,
                     )
                 except Exception as exc:
-                    agg.failed.append(f"{track_obj.display_title} — {type(exc).__name__}: {exc}")
+                    _reason = f"{type(exc).__name__}: {exc}"
+                    agg.failed.append(f"{track_obj.display_title} — {_reason}")
+                    if on_track_fail:
+                        on_track_fail(track_obj.display_title, _reason)
                     continue
 
                 tdr = self._post_download(

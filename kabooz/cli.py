@@ -549,6 +549,12 @@ def album(
                 prog.add_task(f"  [dim]{title[:60]}[/dim]", total=None)
             )
 
+        def on_track_fail(title: str, reason: str) -> None:
+            if current_task:
+                prog.remove_task(current_task[0])
+                current_task.clear()
+            prog.console.print(f"    [red]✗ {reason}[/red]")
+
         try:
             result = sess.download_album(
                 url_or_id,
@@ -561,6 +567,7 @@ def album(
                 download_goodies=goodies if goodies is not None else True,
                 on_track_start=on_track_start,
                 on_track_done=_on_track_done,
+                on_track_fail=on_track_fail,
                 on_progress=on_progress,
                 workers=workers,
             )
@@ -575,7 +582,6 @@ def album(
         f"{result.succeeded} downloaded, {result.skipped} skipped"
         + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
-    _print_failed(result.failed)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -937,7 +943,6 @@ def playlist(
         f"{result.succeeded} downloaded, {result.skipped} skipped"
         + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
-    _print_failed(result.failed)
 
 
 @app.command()
@@ -1065,7 +1070,6 @@ def favorites(
         f"{result.succeeded} downloaded, {result.skipped} skipped"
         + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
-    _print_failed(result.failed)
 
 
 @app.command()
@@ -1105,7 +1109,6 @@ def purchases(
         f"{result.succeeded} downloaded, {result.skipped} skipped"
         + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
-    _print_failed(result.failed)
 
 
 @app.command()
@@ -1581,8 +1584,8 @@ def lpl_download(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, "
-        f"{result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped"
+        + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
 
 
