@@ -121,6 +121,14 @@ def _on_album_start(title: str, index: int, total: int) -> None:
     )
 
 
+def _print_failed(failed: list[str], label: str = "Failed") -> None:
+    if not failed:
+        return
+    err_console.print(f"\n[red]{label} ({len(failed)}):[/red]")
+    for item in failed:
+        err_console.print(f"  [dim]·[/dim] {item}")
+
+
 # ── Global callback ────────────────────────────────────────────────────────
 
 def _version_callback(value: bool) -> None:
@@ -565,8 +573,9 @@ def album(
     console.print(
         f"\n[green]Done.[/green] "
         f"{result.succeeded} downloaded, {result.skipped} skipped"
-        + (f", [yellow]{result.failed} failed[/yellow]" if result.failed else "") + "."
+        + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
+    _print_failed(result.failed)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -925,9 +934,10 @@ def playlist(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, "
-        f"{result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped"
+        + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
+    _print_failed(result.failed)
 
 
 @app.command()
@@ -991,7 +1001,7 @@ def artist(
             on_track_done=on_done,
             workers=workers,
         )
-        grand_fail = sum(r.failed for r in results)
+        grand_fail = sum(len(r.failed) for r in results)
     except (TokenExpiredError, InvalidCredentialsError, NoAuthError) as exc:
         _handle_auth_error(exc)
     except Exception as exc:
@@ -1002,8 +1012,10 @@ def artist(
         f"\n[green]Done.[/green] "
         f"{len(results)} albums · {grand_ok} tracks downloaded · "
         f"{grand_skip} skipped"
-        + (f" · [yellow]{grand_fail} failed[/yellow]" if grand_fail else "") + "."
+        + (f" · [red]{grand_fail} failed[/red]" if grand_fail else "") + "."
     )
+    for r in results:
+        _print_failed(r.failed, label=f"Failed in {r.album.display_title}")
 
 
 @app.command()
@@ -1050,9 +1062,10 @@ def favorites(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, "
-        f"{result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped"
+        + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
+    _print_failed(result.failed)
 
 
 @app.command()
@@ -1089,9 +1102,10 @@ def purchases(
 
     console.print(
         f"\n[green]Done.[/green] "
-        f"{result.succeeded} downloaded, {result.skipped} skipped, "
-        f"{result.failed} failed."
+        f"{result.succeeded} downloaded, {result.skipped} skipped"
+        + (f", [red]{len(result.failed)} failed[/red]" if result.failed else "") + "."
     )
+    _print_failed(result.failed)
 
 
 @app.command()

@@ -128,7 +128,7 @@ class TrackDownloadResult:
 class AlbumDownloadResult:
     album:          Album
     tracks:         list[TrackDownloadResult] = field(default_factory=list)
-    failed:         int = 0
+    failed:         list[str] = field(default_factory=list)
     goodies_ok:     int = 0
     goodies_failed: int = 0
 
@@ -145,7 +145,7 @@ class AlbumDownloadResult:
 class PlaylistDownloadResult:
     name:   str
     tracks: list[TrackDownloadResult] = field(default_factory=list)
-    failed: int = 0
+    failed: list[str] = field(default_factory=list)
 
     @property
     def succeeded(self) -> int:
@@ -893,12 +893,14 @@ class QobuzSession:
                     track_obj = self.client.get_track(str(summary.id))
                     url_info  = self.client.get_track_url(str(track_obj.id), quality=q)
                 except NotStreamableError as exc:
+                    _title = getattr(summary, "display_title", getattr(summary, "title", str(summary.id)))
                     dev_log(f"[yellow]track {summary.id} not streamable: {exc}[/yellow]")
-                    agg.failed += 1
+                    agg.failed.append(f"{_title} — not streamable")
                     continue
                 except APIError as exc:
+                    _title = getattr(summary, "display_title", getattr(summary, "title", str(summary.id)))
                     dev_log(f"[red]track {summary.id} API error: {exc}[/red]")
-                    agg.failed += 1
+                    agg.failed.append(f"{_title} — API error: {exc}")
                     continue
 
                 try:
@@ -908,7 +910,7 @@ class QobuzSession:
                     )
                 except Exception as exc:
                     dev_log(f"[red]track {track_obj.id} download error: {exc}[/red]")
-                    agg.failed += 1
+                    agg.failed.append(f"{track_obj.display_title} — {type(exc).__name__}: {exc}")
                     continue
 
                 track_results.append(dl_result)
@@ -1205,8 +1207,8 @@ class QobuzSession:
                         except Exception:
                             pass
                     url_info = self.client.get_track_url(str(track_obj.id), quality=q)
-                except (NotStreamableError, APIError):
-                    agg.failed += 1
+                except (NotStreamableError, APIError) as exc:
+                    agg.failed.append(f"{summary.title} — {exc}")
                     continue
 
                 try:
@@ -1215,8 +1217,8 @@ class QobuzSession:
                         dest_dir=dest, album=None, on_progress=on_progress,
                         playlist_name=pl.name, playlist_index=i,
                     )
-                except Exception:
-                    agg.failed += 1
+                except Exception as exc:
+                    agg.failed.append(f"{track_obj.display_title} — {type(exc).__name__}: {exc}")
                     continue
 
                 tdr = self._post_download(
@@ -1317,8 +1319,8 @@ class QobuzSession:
                     )
                     agg.tracks.extend(r.tracks)
                     agg.failed += r.failed
-                except Exception:
-                    agg.failed += 1
+                except Exception as exc:
+                    agg.failed.append(f"{album_obj.display_title} — {exc}")
             return agg
 
         with Downloader(
@@ -1338,8 +1340,8 @@ class QobuzSession:
                     dl_result = dl.download_track(
                         track=track_obj, url_info=url_info, dest_dir=dest, album=None,
                     )
-                except Exception:
-                    agg.failed += 1; continue
+                except Exception as exc:
+                    agg.failed.append(f"{getattr(track_obj, 'display_title', '?')} — {exc}"); continue
                 tdr = self._post_download(dl_result, track_obj)
                 agg.tracks.append(tdr)
                 if on_track_done:
@@ -1370,8 +1372,8 @@ class QobuzSession:
                     )
                     agg.tracks.extend(r.tracks)
                     agg.failed += r.failed
-                except Exception:
-                    agg.failed += 1
+                except Exception as exc:
+                    agg.failed.append(f"{album_obj.display_title} — {exc}")
             return agg
 
         with Downloader(
@@ -1393,8 +1395,8 @@ class QobuzSession:
                     dl_result = dl.download_track(
                         track=track_obj, url_info=url_info, dest_dir=dest, album=None,
                     )
-                except Exception:
-                    agg.failed += 1; continue
+                except Exception as exc:
+                    agg.failed.append(f"{getattr(track_obj, 'display_title', '?')} — {exc}"); continue
                 tdr = self._post_download(dl_result, track_obj)
                 agg.tracks.append(tdr)
                 if on_track_done:
